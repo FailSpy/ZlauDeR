@@ -71,15 +71,17 @@ impl Category {
             ],
             Category::Financial => &[
                 "CREDIT_CARD",
-                "IBAN",
-                "CRYPTO_WALLET",
-                "CRYPTO_ADDRESS",
-                // Canonical `EntityType` Display for a US bank account is
-                // `US_BANK_NUMBER` (`US_BANK_ACCOUNT` is only a parse alias); the
-                // ML model's `account_number` label maps here, so this must be the
-                // canonical string or those detections would be silently dropped.
+                // These MUST be the canonical `EntityType` Display strings, NOT the
+                // parse aliases — the category gate matches on `Display`, so an alias
+                // here silently drops every detection of that entity. The aliases are
+                // `IBAN` (→ `IBAN_CODE`), `CRYPTO_WALLET`/`CRYPTO_ADDRESS` (→ `CRYPTO`),
+                // `US_ROUTING_NUMBER` (→ `ABA_ROUTING_NUMBER`), and `US_BANK_ACCOUNT`
+                // (→ `US_BANK_NUMBER`). The IbanRecognizer / CryptoRecognizer are in
+                // the default `en` set, so the alias bug was masking nothing for them.
+                "IBAN_CODE",
+                "CRYPTO",
                 "US_BANK_NUMBER",
-                "US_ROUTING_NUMBER",
+                "ABA_ROUTING_NUMBER",
             ],
             Category::Identity => &[
                 "US_SSN",
@@ -91,7 +93,10 @@ impl Category {
                 "DRIVER_LICENSE",
                 "US_DRIVER_LICENSE",
                 "UK_DRIVING_LICENCE",
-                "US_MEDICAL_LICENSE",
+                // Canonical Display is `MEDICAL_LICENSE` (`US_MEDICAL_LICENSE` is a
+                // parse alias). The UsMedicalLicenseRecognizer IS in the default set,
+                // so the alias was silently dropping every hit.
+                "MEDICAL_LICENSE",
                 "US_NPI",
                 "US_MBI",
                 "UK_NHS",

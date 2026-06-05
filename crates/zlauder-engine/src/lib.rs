@@ -1104,6 +1104,12 @@ mod tests {
             ("PHONE_NUMBER", "PHONE_NUMBER", Category::Contact),
             ("US_BANK_ACCOUNT", "US_BANK_NUMBER", Category::Financial),
             ("API_KEY", "API_KEY", Category::Secrets),
+            // Regression guard for the alias-vs-Display silent-drop bug: each LHS is a
+            // parse alias; the category must list the canonical Display (RHS).
+            ("IBAN", "IBAN_CODE", Category::Financial),
+            ("CRYPTO_WALLET", "CRYPTO", Category::Financial),
+            ("US_ROUTING_NUMBER", "ABA_ROUTING_NUMBER", Category::Financial),
+            ("US_MEDICAL_LICENSE", "MEDICAL_LICENSE", Category::Identity),
         ] {
             let et: EntityType = parsed.parse().unwrap();
             assert_eq!(et.to_string(), expected, "Display drift for {parsed}");

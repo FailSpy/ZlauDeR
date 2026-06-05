@@ -17,7 +17,11 @@ use crate::surface::Surface;
 /// starts with an empty cache) and any future on-disk backend. BUMP THIS whenever
 /// the presidio recognizer set or this module's detection logic changes in a way
 /// that alters output for unchanged input.
-pub const DETECTOR_VERSION: u64 = 1;
+// v2: fixed the Category entity strings that used parse aliases instead of canonical
+// `EntityType` Display names (IBAN_CODE / CRYPTO / MEDICAL_LICENSE / ABA_ROUTING_NUMBER),
+// which had been silently dropping those detections at the category gate. This changes
+// detection output for unchanged text, so the bump invalidates stale cache entries.
+pub const DETECTOR_VERSION: u64 = 2;
 
 /// A custom rule compiled to a regex (literal rules are escaped). Matching via
 /// regex on the original text gives correct byte offsets for any case folding.
