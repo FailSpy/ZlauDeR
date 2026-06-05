@@ -122,6 +122,9 @@ the separate **routing** layer.
 /zlauder:privacy profile strict         # threshold + categories + default operator preset
 /zlauder:privacy category contact off   # toggle one category
 /zlauder:privacy threshold 0.3
+/zlauder:privacy model download         # fetch the openai/privacy-filter model (once)
+/zlauder:privacy model on               # turn the ML recognizer on (loads in background)
+/zlauder:privacy model status           # disabled | loading | ready | failed
 /zlauder:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local audit)
 ```
 
@@ -153,6 +156,37 @@ See [`zlauder.toml`](./zlauder.toml). Highlights:
 - `allow_list` (exact / case-insensitive / regex) — never tokenize these.
 - `custom_replacements` — your own literal or regex rules (e.g. project
   codenames, employee IDs).
+- `[engine.ml]` — the optional ML recognizer (below).
+
+### Optional: `openai/privacy-filter` on CPU
+
+The regex recognizers can't find free-text PII — **names, locations,
+organizations** (the `personal` category, off by default). For that, zlauder can
+run the [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter)
+token classifier in-process via `presidio-classifier`'s native-Rust **Candle CPU**
+backend (no Python, no network at inference time). It is **always compiled in**,
+but **off by default** and runs only after you download the model:
+
+```
+/zlauder:privacy model download     # cache the weights (large/slow on the first run)
+/zlauder:privacy model on           # turn it on
+/zlauder:privacy category personal on   # so PERSON/LOCATION actually mask
+```
+
+- **Hot-load.** `model on` loads the model in the **background**; the status goes
+  `loading → ready`. While loading, masking keeps running **regex-only** — your
+  text is *not* filtered through the ML model yet, so you can keep working or wait.
+  The status line shows `⏳ml` (loading) → `🧠` (ready). `model off` is instant.
+- **CPU.** Inference runs on CPU (`prefer_gpu = false`); the `cuda`/`metal` Candle
+  features are out of scope here. Request masking is offloaded to a blocking pool
+  and capped so concurrent requests don't oversubscribe the CPU.
+- **Model.** Defaults to `openai/privacy-filter`; override with `[engine.ml].model`
+  or `model download <repo>` for a privacy-filter–compatible checkpoint. Weights
+  cache under the standard HuggingFace location (`HF_HOME` / `~/.cache/huggingface`;
+  set `HF_TOKEN` for gated repos).
+
+> Note: because the Candle stack is always compiled in, the build is heavier and
+> the binaries are larger than a regex-only build — a deliberate trade-off.
 
 ## Audit / reveal
 

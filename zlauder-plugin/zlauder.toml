@@ -16,11 +16,26 @@ score_threshold = 0.5
 language = "en"
 # Default reversible operator. Alternatives below under [engine.entity_operators].
 default_operator = { kind = "token" }
-# Which entity categories to mask. "personal" (PERSON/LOCATION/ORG) needs an NLP
-# model and is off by default.
+# Which entity categories to mask. "personal" (PERSON/LOCATION/ORG) is free-text
+# and needs the ML recognizer below — once that is on, add "personal" here (or run
+# `/zlauder:privacy category personal on`).
 enabled_categories = ["secrets", "financial", "identity", "contact"]
 # If true, a detection error refuses the request instead of forwarding plaintext.
 fail_closed = false
+
+# Optional ML recognizer: openai/privacy-filter on a native-Rust Candle CPU
+# backend. Adds free-text detection (names, locations, …) the regex recognizers
+# can't do. Off by default; the model must be downloaded once.
+#   1) /zlauder:privacy model download     (caches the weights — large/slow first run)
+#   2) set enabled = true  (or /zlauder:privacy model on) — loads in the BACKGROUND;
+#      masking stays regex-only until the model reports `ready`.
+#   3) enable the "personal" category to actually mask names/locations.
+[engine.ml]
+enabled = false
+model = "openai/privacy-filter"
+# revision   = "main"     # pin a branch/tag/commit
+# min_score  = 0.5        # recognizer score floor (separate from score_threshold)
+# prefer_gpu = false      # CPU by default; GPU backends are not compiled in
 
 # Per-entity-type operator overrides (optional).
 [engine.entity_operators]

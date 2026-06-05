@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod config;
 pub mod headers;
+pub mod ml;
 pub mod routes;
 pub mod sse;
 pub mod state;

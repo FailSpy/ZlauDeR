@@ -1,6 +1,6 @@
 ---
-description: View or change zlauder PII-masking for this project — status, on/off, profile, category, threshold, and token reveal
-argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1> | reveal <token>] [--scope session|project|user|local]"
+description: View or change zlauder PII-masking for this project — status, on/off, profile, category, threshold, ML model, and token reveal
+argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token>] [--scope session|project|user|local]"
 allowed-tools: Bash(bash:*)
 ---
 
@@ -29,6 +29,17 @@ Report the result concisely:
 - For a change (`on`/`off`/`profile`/`category`/`threshold`): confirm what changed
   and at which `--scope` (default `session`, i.e. live-only and lost on restart;
   `project`/`local`/`user` persist to a TOML layer).
+- For `model …` (the optional `openai/privacy-filter` ML recognizer, CPU): this adds
+  free-text detection (names, locations) on top of the regex recognizers.
+  - `model download [<repo>]`: fetches + caches the model (can be large/slow on the
+    first run). Relay success or the error verbatim.
+  - `model on [--scope …]`: turns the recognizer on. **It loads in the background** —
+    the model status goes `loading → ready`, and **text is NOT filtered through the
+    ML model until it reports `ready`** (regex masking keeps working meanwhile, so the
+    user can continue or wait). Remind them that names/locations also need
+    `/zlauder:privacy category personal on`.
+  - `model off`: turns it off live. `model status`: shows the model + lifecycle
+    (`disabled`/`loading`/`ready`/`failed`). Surface the loading/failed state plainly.
 - For `reveal <token>`: present the decoded plaintext. If it failed (unknown token,
   proxy down, binary unavailable), relay the error verbatim and explain the likely
   cause.

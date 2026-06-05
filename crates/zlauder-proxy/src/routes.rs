@@ -26,6 +26,8 @@ pub fn router(state: AppState) -> Router {
         .route("/zlauder/enable", post(admin::enable))
         .route("/zlauder/disable", post(admin::disable))
         .route("/zlauder/reload", post(admin::reload))
+        .route("/zlauder/ml/enable", post(admin::ml_enable))
+        .route("/zlauder/ml/disable", post(admin::ml_disable))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .fallback(passthrough)
@@ -56,7 +58,7 @@ async fn messages(State(st): State<AppState>, req: Request) -> Response {
         Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
 
-    let (masked, manifest) = match mask_body(&st, &body_bytes) {
+    let (masked, manifest) = match mask_body(&st, &body_bytes).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -103,7 +105,7 @@ async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
         Ok(b) => b,
         Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
-    let (masked, _manifest) = match mask_body(&st, &body_bytes) {
+    let (masked, _manifest) = match mask_body(&st, &body_bytes).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -163,8 +165,38 @@ async fn passthrough(State(st): State<AppState>, req: Request) -> Response {
 // The `Err` variant is an axum `Response` (an early-return short-circuit), which
 // is intentionally large; boxing it would just add an allocation on the error path.
 #[allow(clippy::result_large_err)]
-fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifest), Response> {
-    match walk::mask_request(st.engine.as_ref(), body) {
+async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifest), Response> {
+    // When a model is Ready OR Loading, offload the whole request walk to a blocking
+    // thread. This upholds the engine invariant that ML inference ONLY ever runs on a
+    // `spawn_blocking` thread, so the engine's per-inference `ml_gate` (a std mutex)
+    // never blocks the async executor. Serialization now lives in that gate
+    // (per-inference, default max-inflight 1), NOT a per-walk permit — so with the
+    // detection cache an all-hits turn and the one-time Ready-rescan no longer freeze
+    // a second same-project window (the rescan interleaves per-leaf instead of holding
+    // a walk-wide permit). Pure regex-only masking (ML Disabled/Failed) is cheap and
+    // stays inline (zero spawn overhead — the common path).
+    //
+    // We offload on `Loading` too (cheap: no inference runs yet, so the gate is never
+    // taken) specifically to CLOSE the `Loading -> Ready` race: were we to gate on
+    // `Ready` only, a model flipping live mid-walk would run inference inline on the
+    // executor thread. The remaining inline edge is the rarer `Disabled -> Loading`
+    // user-initiated flip, bounded to one request, and the gate still serializes it.
+    let result = if st.engine.ml_should_offload() {
+        let engine = st.engine.clone();
+        let body = body.to_vec();
+        match tokio::task::spawn_blocking(move || walk::mask_request(engine.as_ref(), &body)).await {
+            Ok(r) => r,
+            Err(join) => {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("masking task failed: {join}"),
+                ));
+            }
+        }
+    } else {
+        walk::mask_request(st.engine.as_ref(), body)
+    };
+    match result {
         Ok(x) => Ok(x),
         // Body wasn't even valid JSON (anomalous for /v1/messages). Refuse rather
         // than forward an unparsed, potentially PII-bearing body upstream.

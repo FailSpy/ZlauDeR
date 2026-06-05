@@ -14,7 +14,7 @@ use anthropic_wire::{
     ToolResultBlock, ToolResultContent,
 };
 use serde_json::{Map, Value};
-use zlauder_engine::{EngineError, MaskEngine, Surface, UnmaskManifest};
+use zlauder_engine::{EngineError, MaskEngine, MaskStats, Surface, UnmaskManifest};
 
 // ---------------------------------------------------------------------------
 // Request — mask
@@ -35,31 +35,56 @@ pub fn mask_request(
     let mut manifest = UnmaskManifest::new();
     match serde_json::from_slice::<ApiRequest>(body) {
         Ok(mut req) => {
-            {
+            let stats = {
                 let mut w = MaskWalker {
                     engine,
                     manifest: &mut manifest,
+                    stats: MaskStats::default(),
                 };
                 w.request(&mut req).map_err(MaskError::Engine)?;
-            }
+                w.stats
+            };
+            log_mask_stats(&stats);
             let bytes = serde_json::to_vec(&req).map_err(MaskError::Json)?;
             Ok((bytes, manifest))
         }
         Err(typed_err) => {
             tracing::warn!("typed request parse failed ({typed_err}); using fail-safe value-walk");
             let mut value: Value = serde_json::from_slice(body).map_err(MaskError::Json)?;
-            {
+            let stats = {
                 let mut w = MaskWalker {
                     engine,
                     manifest: &mut manifest,
+                    stats: MaskStats::default(),
                 };
                 w.value_safe(&mut value, Surface::UserMessage)
                     .map_err(MaskError::Engine)?;
-            }
+                w.stats
+            };
+            log_mask_stats(&stats);
             let bytes = serde_json::to_vec(&value).map_err(MaskError::Json)?;
             Ok((bytes, manifest))
         }
     }
+}
+
+/// Emit the per-request detection-cache instrumentation once (Component 2). On a
+/// steady turn deep in a session `fresh_misses` must collapse to single digits
+/// while `hits` tracks the (growing) leaf count — the falsifiable caching-win
+/// observable. `ml_misses` are the inferences actually run this turn.
+fn log_mask_stats(s: &MaskStats) {
+    let ml_misses = s.ml_ran;
+    let regex_misses = s.fresh_miss.saturating_sub(s.ml_ran);
+    tracing::debug!(
+        leaves = s.leaves,
+        hits = s.hit,
+        fresh_misses = s.fresh_miss,
+        ml_misses,
+        regex_misses,
+        fail_open = s.fail_open,
+        disabled = s.disabled,
+        "mask walk detection-cache stats"
+    );
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -73,6 +98,8 @@ pub enum MaskError {
 struct MaskWalker<'a> {
     engine: &'a MaskEngine,
     manifest: &'a mut UnmaskManifest,
+    /// Accumulated detection-cache stats across every leaf this walk masks.
+    stats: MaskStats,
 }
 
 impl MaskWalker<'_> {
@@ -177,6 +204,7 @@ impl MaskWalker<'_> {
         let outcome = self.engine.mask(text, surface)?;
         *text = outcome.masked_text;
         self.manifest.merge(outcome.manifest);
+        self.stats.merge(&outcome.stats);
         Ok(())
     }
 
@@ -186,6 +214,7 @@ impl MaskWalker<'_> {
                 let outcome = self.engine.mask(s, surface)?;
                 *s = outcome.masked_text;
                 self.manifest.merge(outcome.manifest);
+                self.stats.merge(&outcome.stats);
             }
             Value::Array(a) => {
                 for item in a.iter_mut() {
@@ -218,6 +247,7 @@ impl MaskWalker<'_> {
                 let outcome = self.engine.mask(s, surface)?;
                 *s = outcome.masked_text;
                 self.manifest.merge(outcome.manifest);
+                self.stats.merge(&outcome.stats);
             }
             Value::Array(a) => {
                 for item in a.iter_mut() {

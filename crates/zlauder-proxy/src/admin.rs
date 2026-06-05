@@ -19,9 +19,10 @@ use axum::response::Response;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zlauder_engine::{AllowList, EngineConfig};
+use zlauder_engine::{AllowList, EngineConfig, MlStatus};
 
 use crate::config;
+use crate::ml::reconcile_ml;
 use crate::state::AppState;
 
 /// Allow-list in its raw, serializable form (the live [`AllowList`] holds compiled
@@ -83,16 +84,26 @@ impl WireConfig {
     }
 }
 
-/// `{ enabled, project_root, port, token_count, config }` — the full live state.
+/// `{ enabled, project_root, port, token_count, config, ml }` — the full live
+/// state. `ml.enabled` is the desired flag; `ml.status` is the live runtime
+/// lifecycle (`disabled`/`loading`/`ready`/`failed`) — the latter is what tells
+/// the user whether their text is actually being filtered through the model yet.
 fn snapshot(st: &AppState) -> serde_json::Value {
     let cfg = st.engine.config_snapshot();
     let wire = WireConfig::from_engine(&cfg);
+    let ml = st.engine.ml_snapshot();
     json!({
         "enabled": cfg.enabled,
         "project_root": st.project_root.as_str(),
         "port": st.port,
         "token_count": st.engine.token_count(),
         "config": wire,
+        "ml": {
+            "enabled": cfg.ml.enabled,
+            "model": cfg.ml.model,
+            "status": ml.status,
+            "error": ml.error,
+        },
     })
 }
 
@@ -136,9 +147,53 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
             ),
         );
     }
+    // `ml.enabled` is live-owned: ONLY `/zlauder/ml/{enable,disable}` flip it. A
+    // generic PUT (even a stale/older client's) must not — so we override the posted
+    // value with the live one and reconcile model-param changes only. Serialized
+    // against the ml/enable|disable handlers.
+    let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
+    let mut engine_cfg = engine_cfg;
+    engine_cfg.ml.enabled = st.engine.ml_snapshot().status != MlStatus::Disabled;
+    let new_ml = engine_cfg.ml.clone();
     if let Err(e) = st.engine.set_config(engine_cfg) {
         return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
     }
+    reconcile_ml(&st, &new_ml, false);
+    json_ok(&snapshot(&st))
+}
+
+/// `POST /zlauder/ml/enable` — turn the ML recognizer on. The model loads in the
+/// background; masking stays regex-only until it is `Ready`.
+pub async fn ml_enable(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    // Serialize against a concurrent enable/disable (held only across sync code).
+    let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
+    let mut cfg = st.engine.config_snapshot();
+    cfg.ml.enabled = true;
+    let ml = cfg.ml.clone();
+    if let Err(e) = st.engine.set_config(cfg) {
+        return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
+    }
+    // An explicit enable retries a previously-failed load.
+    reconcile_ml(&st, &ml, true);
+    json_ok(&snapshot(&st))
+}
+
+/// `POST /zlauder/ml/disable` — turn the ML recognizer off live (drops the model
+/// from the detection path immediately; any in-flight load is invalidated).
+pub async fn ml_disable(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
+    let mut cfg = st.engine.config_snapshot();
+    cfg.ml.enabled = false;
+    if let Err(e) = st.engine.set_config(cfg) {
+        return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
+    }
+    st.engine.ml_disable();
     json_ok(&snapshot(&st))
 }
 
@@ -179,12 +234,22 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     // Only the explicit enable/disable endpoints change it; the file's `enabled`
     // value applies on a cold start (when the proxy reads the files fresh).
     cfg.enabled = st.engine.is_enabled();
+    // `ml.enabled` is live-owned for the same reason — only `/zlauder/ml/{enable,
+    // disable}` flip it. We still pick up model-param changes from the files below.
+    // Serialized against the ml/enable|disable handlers.
+    let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
+    cfg.ml.enabled = st.engine.ml_snapshot().status != MlStatus::Disabled;
+    let new_ml = cfg.ml.clone();
     if let Err(e) = st.engine.set_config(cfg) {
         return text(
             StatusCode::BAD_REQUEST,
             &format!("reloaded config rejected: {e}"),
         );
     }
+    // Apply any model/revision/min_score/prefer_gpu change from the files. With
+    // `enabled` preserved above, this never flips ML on/off — and `retry_failed =
+    // false` means an unrelated edit won't re-stall a previously-failed load.
+    reconcile_ml(&st, &new_ml, false);
     json_ok(&snapshot(&st))
 }
 

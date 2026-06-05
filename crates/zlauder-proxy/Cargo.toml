@@ -12,7 +12,9 @@ name = "zlauder-proxy"
 path = "src/main.rs"
 
 [dependencies]
-zlauder-engine = { path = "../zlauder-engine", version = "0.1.0" }
+# `features = ["ml"]` is explicit (not just relying on engine's default) so the
+# proxy always carries the openai/privacy-filter download + recognizer paths.
+zlauder-engine = { path = "../zlauder-engine", version = "0.1.0", features = ["ml"] }
 zlauder-state  = { path = "../zlauder-state",  version = "0.1.0" }
 
 anthropic-wire = { workspace = true }

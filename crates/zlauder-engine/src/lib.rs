@@ -6,54 +6,197 @@
 //! vs unmask. This crate is runtime-free (synchronous); the proxy calls it from
 //! async handlers.
 
+mod cache;
 mod config;
 mod detect;
 mod error;
 mod manifest;
+#[cfg(feature = "ml")]
+pub mod ml;
 mod store;
 mod surface;
 mod token;
 
-pub use config::{AllowList, Category, CustomReplacement, EngineConfig, Operator, Profile};
+pub use config::{
+    AllowList, Category, CustomReplacement, EngineConfig, ExposureRedactionScope, MlConfig,
+    Operator, Profile, SaltScope,
+};
 pub use error::EngineError;
-pub use manifest::{ManifestEntry, MaskOutcome, UnmaskManifest};
+pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
 pub use surface::{Direction, Surface};
 pub use token::{MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, make_token, token_regex};
 
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use detect::{CompiledCustom, compile_customs, run_detection};
+use cache::{CacheKey, CachedDetection, DetectionCache, hash_text};
+use detect::{CompiledCustom, compile_customs, resolve_operator, run_detection};
 use store::SessionStore;
 use token::hash_value;
 
-/// The mutable masking *policy*: the config plus its compiled custom rules. Held
-/// behind an `RwLock` so the proxy can hot-swap it (e.g. a `/privacy` toggle)
-/// without dropping the session store — token determinism (and the prompt-cache
-/// prefix) therefore survives a config change.
+/// The masking *policy*: the config, its compiled custom rules, and a precomputed
+/// fingerprint of every detection-affecting input. Stored as an immutable
+/// `Arc<Policy>` behind an `RwLock` so the proxy can hot-swap it (e.g. a `/privacy`
+/// toggle) without dropping the session store — token determinism (and the
+/// prompt-cache prefix) survives a config change. `mask()` clones the `Arc` under a
+/// brief lock and runs detection/apply against the snapshot, so a slow inference or
+/// Ready-rescan never holds the lock and never starves a live `set_config` (audit
+/// #2).
+#[derive(Clone)]
 struct Policy {
     config: EngineConfig,
     customs: Vec<CompiledCustom>,
+    /// Fingerprint of all detection-affecting config (see
+    /// [`EngineConfig::detection_fingerprint`]); folded into the cache key.
+    policy_fp: u64,
+}
+
+impl Policy {
+    fn new(config: EngineConfig) -> Result<Self, EngineError> {
+        let customs = compile_customs(&config.custom_replacements)?;
+        let policy_fp = config.detection_fingerprint();
+        Ok(Self {
+            config,
+            customs,
+            policy_fp,
+        })
+    }
+}
+
+/// Lifecycle of the optional ML recognizer (`openai/privacy-filter`). The proxy
+/// loads the model in the *background*; this is what the status line and
+/// `/zlauder:privacy status` report. While `Loading`, masking keeps running
+/// regex-only — outbound text is NOT yet filtered through the ML model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MlStatus {
+    /// Not requested (or turned off live).
+    #[default]
+    Disabled,
+    /// Requested; the model is downloading/loading. Masking is regex-only.
+    Loading,
+    /// Loaded and active.
+    Ready,
+    /// A load attempt failed (see the snapshot's error).
+    Failed,
+}
+
+/// The live ML slot: status + the loaded recognizer, plus a generation counter
+/// that makes stale background loads safe to discard.
+struct MlRuntime {
+    status: MlStatus,
+    recognizer: Option<Arc<dyn presidio_core::Recognizer>>,
+    error: Option<String>,
+    /// Params of the load that is desired / in-flight / loaded, so a reconcile can
+    /// tell whether a config change requires rebuilding the recognizer.
+    desired: Option<MlConfig>,
+    /// Bumped by every [`MaskEngine::ml_begin_load`] / [`MaskEngine::ml_disable`].
+    /// A load task captures the generation at begin and only installs its result
+    /// if it still matches — so a load that finishes AFTER an off / model-change
+    /// can't resurrect a recognizer contrary to current config.
+    generation: u64,
+    /// Precomputed fingerprint of the ACTIVE ML recognizer identity (present?,
+    /// model, revision, min_score), folded into the cache key. Recomputed by every
+    /// mutator so it stays consistent with `status`/`recognizer`/`desired`, and read
+    /// together with the recognizer under one `ml.read()` (audit #1). When the
+    /// recognizer flips `Ready`, this changes → the whole transcript re-detects with
+    /// ML coverage (the intended rescan).
+    ml_fp: u64,
+}
+
+impl Default for MlRuntime {
+    fn default() -> Self {
+        let mut rt = Self {
+            status: MlStatus::Disabled,
+            recognizer: None,
+            error: None,
+            desired: None,
+            generation: 0,
+            ml_fp: 0,
+        };
+        rt.ml_fp = compute_ml_fp(&rt);
+        rt
+    }
+}
+
+/// Fingerprint of the active ML recognizer identity. Only a `Ready` recognizer
+/// contributes its params; every non-active state shares the single "no ML" key
+/// space (so regex-only results computed while `Loading`/`Disabled` are reused
+/// across those states and abandoned the instant ML becomes `Ready`).
+fn compute_ml_fp(rt: &MlRuntime) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"zlauder-ml-fp-v1");
+    if rt.status == MlStatus::Ready && rt.recognizer.is_some() {
+        h.update(&[1]);
+        if let Some(d) = &rt.desired {
+            h.update(d.model.as_bytes());
+            h.update(&[0]);
+            match &d.revision {
+                Some(r) => {
+                    h.update(&[1]);
+                    h.update(r.as_bytes());
+                }
+                None => {
+                    h.update(&[0]);
+                }
+            };
+            match d.min_score {
+                Some(s) => {
+                    h.update(&[1]);
+                    h.update(&s.to_bits().to_le_bytes());
+                }
+                None => {
+                    h.update(&[0]);
+                }
+            };
+            // `prefer_gpu` is a recognizer-identity param: `MlConfig::same_model_params`
+            // (the single source of truth for "this is a DIFFERENT recognizer") includes
+            // it, so a `prefer_gpu` flip rebuilds the recognizer — `ml_fp` MUST move with
+            // it or a byte-identical leaf would be served stale cross-backend detections
+            // (inert today since the GPU backends aren't compiled in, but the fingerprint
+            // must stay complete). Keep this set in sync with `same_model_params`.
+            h.update(&[d.prefer_gpu as u8]);
+        }
+    } else {
+        h.update(&[0]);
+    }
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("32-byte digest"))
+}
+
+/// Public snapshot of the ML slot for status reporting.
+#[derive(Clone, Debug)]
+pub struct MlSnapshot {
+    pub status: MlStatus,
+    pub error: Option<String>,
+    /// The model params currently desired/loaded (`None` when disabled).
+    pub desired: Option<MlConfig>,
 }
 
 /// The masking engine. Cheap to share behind an `Arc`; interior mutability via an
-/// `RwLock` on the hot-swappable policy and a `Mutex` on the session store. The
-/// analyzer is fixed at construction (a `language` change needs a rebuild).
+/// `RwLock` on the hot-swappable policy, an `RwLock` on the hot-swappable ML
+/// recognizer slot, and a `Mutex` on the session store. The regex analyzer is
+/// fixed at construction (a `language` change needs a rebuild); the ML recognizer
+/// is loaded/dropped live.
 pub struct MaskEngine {
     analyzer: presidio_analyzer::AnalyzerEngine,
-    policy: RwLock<Policy>,
+    policy: RwLock<Arc<Policy>>,
+    ml: RwLock<MlRuntime>,
     store: Mutex<SessionStore>,
+    /// Content-addressed detection memoization (Component 1).
+    cache: DetectionCache,
+    /// Serializes ML inference per leaf (default max-inflight 1): CPU
+    /// token-classification already saturates the cores, so concurrent inferences
+    /// just thrash. A `std::sync::Mutex` because ML inference ONLY ever runs inside
+    /// a `spawn_blocking` thread (the proxy guarantees it — invariant #5), so the
+    /// synchronous acquire never blocks the async executor; it serializes
+    /// blocking-pool threads, which is exactly the intent. Acquired per-inference
+    /// (not per-walk) so a Ready-rescan can't freeze a second window (Component 2).
+    ml_gate: Mutex<()>,
 }
 
 impl MaskEngine {
     /// Build the analyzer (offline regex recognizers) and a fresh random session.
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
-        let analyzer = presidio_analyzer::default_analyzer(&config.language);
-        let customs = compile_customs(&config.custom_replacements)?;
-        Ok(Self {
-            analyzer,
-            policy: RwLock::new(Policy { config, customs }),
-            store: Mutex::new(SessionStore::new()),
-        })
+        Self::from_parts(config, SessionStore::new)
     }
 
     /// Build with an explicit session key + salt (proxy passes the SessionStart
@@ -63,13 +206,7 @@ impl MaskEngine {
         key: [u8; 32],
         salt: [u8; 16],
     ) -> Result<Self, EngineError> {
-        let analyzer = presidio_analyzer::default_analyzer(&config.language);
-        let customs = compile_customs(&config.custom_replacements)?;
-        Ok(Self {
-            analyzer,
-            policy: RwLock::new(Policy { config, customs }),
-            store: Mutex::new(SessionStore::with_key_and_salt(key, salt)),
-        })
+        Self::from_parts(config, move || SessionStore::with_key_and_salt(key, salt))
     }
 
     /// Build reusing only a `salt` (token determinism across a proxy restart) with
@@ -77,12 +214,25 @@ impl MaskEngine {
     /// never holds the AES key — the control token (see [`Self::control_token`]) is
     /// what gates the control plane, decoupling control access from decryption.
     pub fn with_salt(config: EngineConfig, salt: [u8; 16]) -> Result<Self, EngineError> {
+        Self::from_parts(config, move || SessionStore::with_salt(salt))
+    }
+
+    /// Shared constructor: build the analyzer + policy + detection cache, deferring
+    /// the (differently-seeded) session store to `make_store`.
+    fn from_parts(
+        config: EngineConfig,
+        make_store: impl FnOnce() -> SessionStore,
+    ) -> Result<Self, EngineError> {
         let analyzer = presidio_analyzer::default_analyzer(&config.language);
-        let customs = compile_customs(&config.custom_replacements)?;
+        let cache_cap = config.detection_cache_cap;
+        let policy = Policy::new(config)?;
         Ok(Self {
             analyzer,
-            policy: RwLock::new(Policy { config, customs }),
-            store: Mutex::new(SessionStore::with_salt(salt)),
+            policy: RwLock::new(Arc::new(policy)),
+            ml: RwLock::new(MlRuntime::default()),
+            store: Mutex::new(make_store()),
+            cache: DetectionCache::new(cache_cap),
+            ml_gate: Mutex::new(()),
         })
     }
 
@@ -116,30 +266,139 @@ impl MaskEngine {
             .enabled
     }
 
-    /// Flip the master switch live (cheap; doesn't recompile custom rules).
+    /// Flip the master switch live. `enabled` is NOT part of `policy_fp` (the
+    /// disabled path is an un-cached early return), so the cache survives the toggle
+    /// and determinism holds. Cheap: clones the small policy to swap one bool.
     pub fn set_enabled(&self, enabled: bool) {
-        self.policy
-            .write()
-            .expect("policy rwlock poisoned")
-            .config
-            .enabled = enabled;
+        let mut slot = self.policy.write().expect("policy rwlock poisoned");
+        if slot.config.enabled == enabled {
+            return;
+        }
+        let mut next = (**slot).clone();
+        next.config.enabled = enabled;
+        *slot = Arc::new(next);
     }
 
-    /// Hot-swap the whole policy. Recompiles custom rules; the session store
-    /// (key/salt/minted tokens) is untouched, so already-minted tokens keep
-    /// resolving and determinism is preserved across the swap. A change to
-    /// `config.language` does NOT rebuild the analyzer — that needs a restart.
+    /// Hot-swap the whole policy. Recompiles custom rules and recomputes
+    /// `policy_fp`; the session store (key/salt/minted tokens) is untouched, so
+    /// already-minted tokens keep resolving and determinism is preserved across the
+    /// swap. The detection cache is NOT flushed — any detection-affecting change
+    /// moves `policy_fp`, so stale entries become unreachable and age out via LRU
+    /// (fingerprint invalidation, not a flush). The cache cap is applied live. A
+    /// change to `config.language` does NOT rebuild the analyzer — that needs a
+    /// restart.
     pub fn set_config(&self, config: EngineConfig) -> Result<(), EngineError> {
-        let customs = compile_customs(&config.custom_replacements)?;
-        let mut policy = self.policy.write().expect("policy rwlock poisoned");
-        policy.config = config;
-        policy.customs = customs;
+        let cache_cap = config.detection_cache_cap;
+        let policy = Policy::new(config)?;
+        {
+            let mut slot = self.policy.write().expect("policy rwlock poisoned");
+            *slot = Arc::new(policy);
+        }
+        // Live cap (audit #10): `0` clears + disables the cache without a restart.
+        self.cache.set_cap(cache_cap);
         Ok(())
     }
 
     /// Number of distinct tokens minted so far this session.
     pub fn token_count(&self) -> usize {
         self.store.lock().expect("store mutex poisoned").len()
+    }
+
+    // --- ML recognizer slot (hot-loaded in the background by the proxy) -------
+
+    /// Begin (or restart) a background load for `desired`. Bumps the generation
+    /// (invalidating any in-flight load), sets [`MlStatus::Loading`], and returns
+    /// the new generation token the caller passes back to [`Self::ml_set_ready`] /
+    /// [`Self::ml_set_failed`].
+    pub fn ml_begin_load(&self, desired: MlConfig) -> u64 {
+        let mut ml = self.ml.write().expect("ml rwlock poisoned");
+        ml.generation += 1;
+        ml.status = MlStatus::Loading;
+        ml.recognizer = None;
+        ml.error = None;
+        ml.desired = Some(desired);
+        ml.ml_fp = compute_ml_fp(&ml);
+        ml.generation
+    }
+
+    /// Install a freshly-loaded recognizer — but ONLY if `generation` is still
+    /// current (else the load was superseded by an off / model-change and is
+    /// dropped).
+    pub fn ml_set_ready(&self, generation: u64, recognizer: Arc<dyn presidio_core::Recognizer>) {
+        let mut ml = self.ml.write().expect("ml rwlock poisoned");
+        if ml.generation != generation {
+            return;
+        }
+        ml.status = MlStatus::Ready;
+        ml.recognizer = Some(recognizer);
+        ml.error = None;
+        ml.ml_fp = compute_ml_fp(&ml);
+    }
+
+    /// Record a failed load — ONLY if `generation` is still current.
+    pub fn ml_set_failed(&self, generation: u64, error: String) {
+        let mut ml = self.ml.write().expect("ml rwlock poisoned");
+        if ml.generation != generation {
+            return;
+        }
+        ml.status = MlStatus::Failed;
+        ml.recognizer = None;
+        ml.error = Some(error);
+        ml.ml_fp = compute_ml_fp(&ml);
+    }
+
+    /// Turn ML off live: invalidate any in-flight load (bump generation) and drop
+    /// the recognizer, so it stops affecting detection immediately.
+    pub fn ml_disable(&self) {
+        let mut ml = self.ml.write().expect("ml rwlock poisoned");
+        ml.generation += 1;
+        ml.status = MlStatus::Disabled;
+        ml.recognizer = None;
+        ml.error = None;
+        ml.desired = None;
+        ml.ml_fp = compute_ml_fp(&ml);
+    }
+
+    /// Snapshot the ML slot (status + last error + desired params) for reporting.
+    pub fn ml_snapshot(&self) -> MlSnapshot {
+        let ml = self.ml.read().expect("ml rwlock poisoned");
+        MlSnapshot {
+            status: ml.status,
+            error: ml.error.clone(),
+            desired: ml.desired.clone(),
+        }
+    }
+
+    /// Whether ML inference is currently live (model `Ready`). Cheap.
+    pub fn ml_active(&self) -> bool {
+        self.ml.read().expect("ml rwlock poisoned").status == MlStatus::Ready
+    }
+
+    /// Whether the proxy should offload the mask walk to a blocking thread: true
+    /// when a model is `Ready` OR `Loading`. Offloading while `Loading` is now cheap
+    /// (no inference runs yet, so the per-inference `ml_gate` is never taken) and it
+    /// CLOSES the `Loading -> Ready` race where inference could otherwise flip live
+    /// mid-walk and run inline on the async executor thread (which would also acquire
+    /// the std `ml_gate` off a blocking thread). The only residual inline edge is the
+    /// rarer, user-initiated `Disabled -> Loading` flip, bounded to one request.
+    pub fn ml_should_offload(&self) -> bool {
+        matches!(
+            self.ml.read().expect("ml rwlock poisoned").status,
+            MlStatus::Loading | MlStatus::Ready
+        )
+    }
+
+    /// The active recognizer (if `Ready`) together with the matching `ml_fp`, read
+    /// under ONE `ml.read()` so the recognizer and the fingerprint keying its
+    /// results can never tear across an ML transition (audit #1).
+    fn ml_snapshot_with_fp(&self) -> (Option<Arc<dyn presidio_core::Recognizer>>, u64) {
+        let ml = self.ml.read().expect("ml rwlock poisoned");
+        let rec = if ml.status == MlStatus::Ready {
+            ml.recognizer.clone()
+        } else {
+            None
+        };
+        (rec, ml.ml_fp)
     }
 
     /// Mask `text` (request path). Detect -> filter -> mint tokens -> splice.
@@ -150,36 +409,67 @@ impl MaskEngine {
     /// plaintext) and unmasks every inbound field. Determinism makes the
     /// round-trip reproduce the original token form exactly.
     pub fn mask(&self, text: &str, surface: Surface) -> Result<MaskOutcome, EngineError> {
-        let policy = self.policy.read().expect("policy rwlock poisoned");
+        // Snapshot the policy as a cheap `Arc` clone, then RELEASE the lock before
+        // any detection/inference/apply work (audit #2): a slow miss or Ready-rescan
+        // must never hold a read lock that could starve a live `set_config` write.
+        let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
+
         // Master switch off, or this surface disabled by policy → transparent
-        // passthrough on the mask path (unmask still runs on the response side).
+        // passthrough on the mask path (unmask still runs on the response side). This
+        // early return is NOT cached (so `enabled`/`disabled_surfaces` need not be in
+        // `policy_fp`).
         if !policy.config.enabled || !policy.config.surface_enabled(surface) {
-            return Ok(MaskOutcome {
-                masked_text: text.to_string(),
-                manifest: UnmaskManifest::new(),
-            });
+            return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
         }
 
-        let dets = match run_detection(
-            &self.analyzer,
-            &policy.config,
-            &policy.customs,
-            text,
+        // Snapshot the ML recognizer + its fingerprint together (atomic across an ML
+        // transition). `None` while loading/disabled ⇒ regex-only key space.
+        let (ml, ml_fp) = self.ml_snapshot_with_fp();
+        let key = CacheKey {
+            text_hash: hash_text(text),
             surface,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                if policy.config.fail_closed {
-                    return Err(e);
-                }
-                tracing::warn!("detection failed, passing text through unmasked: {e}");
-                return Ok(MaskOutcome {
-                    masked_text: text.to_string(),
-                    manifest: UnmaskManifest::new(),
-                });
-            }
+            policy_fp: policy.policy_fp,
+            ml_fp,
         };
 
+        let mut stats = MaskStats {
+            leaves: 1,
+            ..Default::default()
+        };
+
+        // Resolve the detection list: cache hit, or a miss that runs detection.
+        let dets: Arc<Vec<CachedDetection>> = match self.cache.get(&key) {
+            Some(hit) => {
+                stats.hit = 1;
+                hit
+            }
+            None if ml.is_some() => {
+                // ML miss: serialize inference through the engine gate (held only on
+                // a `spawn_blocking` thread per invariant #5), and RE-CHECK the cache
+                // under it so concurrent same-leaf misses single-flight (audit #6).
+                // The gate guards a unit `()` (pure serialization, no protected data),
+                // so we RECOVER a poisoned guard rather than propagate: a panic inside
+                // a single ML inference must not permanently wedge all future masking.
+                let _gate = self
+                    .ml_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match self.cache.get(&key) {
+                    Some(hit) => {
+                        stats.hit = 1;
+                        hit
+                    }
+                    None => self.detect_and_cache(&policy, ml.as_deref(), text, surface, key, &mut stats)?,
+                }
+            }
+            None => self.detect_and_cache(&policy, None, text, surface, key, &mut stats)?,
+        };
+
+        // Apply loop — runs EVERY call (hit or miss): resolve operators from the LIVE
+        // policy snapshot, slice plaintext from the LIVE text, mint/redact, and
+        // rebuild the per-call manifest. The replay is REQUIRED, not just for stats:
+        // custom literal tokens unmask only via this manifest, so the masked string
+        // cannot itself be cached.
         let mut manifest = UnmaskManifest::new();
         let mut out = text.to_string();
         // Splice back-to-front so original byte offsets stay valid.
@@ -191,7 +481,7 @@ impl MaskEngine {
             // panic, and never leave it as plaintext, which skipping the span would).
             let (start, end) = snap_to_char_boundary(text, d.start, d.end);
             let slice = &text[start..end];
-            let replacement = match d.operator {
+            let replacement = match resolve_operator(&policy.config, d) {
                 Operator::Keep => continue,
                 Operator::Redact => "[REDACTED]".to_string(),
                 Operator::Mask { char, from_end } => mask_value(slice, char, from_end),
@@ -222,7 +512,43 @@ impl MaskEngine {
         Ok(MaskOutcome {
             masked_text: out,
             manifest,
+            stats,
         })
+    }
+
+    /// Run detection for a cache miss and (on success) populate the cache. A
+    /// detection error is NEVER cached (invariant #2): under `fail_closed` it
+    /// propagates (the proxy refuses the request); otherwise it is a fail-OPEN
+    /// passthrough (empty detection list, `fail_open` counted) that is recomputed
+    /// next turn rather than freezing a wrong "clean" result.
+    fn detect_and_cache(
+        &self,
+        policy: &Policy,
+        ml: Option<&dyn presidio_core::Recognizer>,
+        text: &str,
+        surface: Surface,
+        key: CacheKey,
+        stats: &mut MaskStats,
+    ) -> Result<Arc<Vec<CachedDetection>>, EngineError> {
+        if ml.is_some() {
+            stats.ml_ran = 1;
+        }
+        match run_detection(&self.analyzer, &policy.config, &policy.customs, ml, text, surface) {
+            Ok(d) => {
+                stats.fresh_miss = 1;
+                let d = Arc::new(d);
+                self.cache.insert(key, Arc::clone(&d));
+                Ok(d)
+            }
+            Err(e) => {
+                if policy.config.fail_closed {
+                    return Err(e);
+                }
+                tracing::warn!("detection failed, passing text through unmasked: {e}");
+                stats.fail_open = 1;
+                Ok(Arc::new(Vec::new()))
+            }
+        }
     }
 
     /// Unmask an UNMASK-direction surface (Arrow 2 / Arrow 3). Replaces every known
@@ -597,6 +923,197 @@ mod tests {
         );
     }
 
+    // ----- ML recognizer wiring (driven via the public slot API; no model) -----
+
+    use presidio_core::{EntityType, NlpArtifacts, Recognizer, RecognizerResult};
+
+    /// A stand-in `Recognizer` that flags a fixed name as a `PERSON` — lets us
+    /// exercise the ML detection path without loading a real model.
+    struct MockPerson {
+        entities: Vec<EntityType>,
+        name: &'static str,
+    }
+    impl MockPerson {
+        fn new(name: &'static str) -> Self {
+            Self {
+                entities: vec!["PERSON".parse().unwrap()],
+                name,
+            }
+        }
+    }
+    impl Recognizer for MockPerson {
+        fn name(&self) -> &str {
+            "mock-person"
+        }
+        fn supported_entities(&self) -> &[EntityType] {
+            &self.entities
+        }
+        fn supported_languages(&self) -> &[&str] {
+            &["en"]
+        }
+        fn analyze(
+            &self,
+            text: &str,
+            _e: Option<&[EntityType]>,
+            _n: Option<&NlpArtifacts>,
+        ) -> Vec<RecognizerResult> {
+            match text.find(self.name) {
+                Some(pos) => vec![
+                    RecognizerResult::new(
+                        "PERSON".parse().unwrap(),
+                        pos,
+                        pos + self.name.len(),
+                        0.99,
+                    )
+                    .with_recognizer("mock-person"),
+                ],
+                None => Vec::new(),
+            }
+        }
+    }
+
+    fn engine_personal_on() -> MaskEngine {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(Category::Personal);
+        MaskEngine::new(cfg).unwrap()
+    }
+
+    // A Ready recognizer masks its entity (when the category is on) and round-trips;
+    // disabling it live makes the same text pass through unmasked.
+    #[test]
+    fn ml_recognizer_masks_when_ready_then_off() {
+        let e = engine_personal_on();
+        let generation = e.ml_begin_load(MlConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        e.ml_set_ready(generation, Arc::new(MockPerson::new("Alice Johnson")));
+        assert!(e.ml_active());
+
+        let original = "please call Alice Johnson today";
+        let out = e.mask(original, Surface::UserMessage).unwrap();
+        assert!(
+            out.masked_text.contains("[PERSON_"),
+            "ml PERSON not masked: {}",
+            out.masked_text
+        );
+        assert!(!out.masked_text.contains("Alice Johnson"));
+        assert_eq!(e.unmask(&out.masked_text, &out.manifest).unwrap(), original);
+
+        // Live off: recognizer dropped, name flows through.
+        e.ml_disable();
+        assert!(!e.ml_active());
+        let off = e.mask(original, Surface::UserMessage).unwrap();
+        assert!(
+            off.masked_text.contains("Alice Johnson"),
+            "ml off should not mask: {}",
+            off.masked_text
+        );
+    }
+
+    // Loading state (not Ready) ⇒ recognizer is NOT consulted yet (regex-only).
+    #[test]
+    fn ml_loading_does_not_mask_yet() {
+        let e = engine_personal_on();
+        e.ml_begin_load(MlConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(!e.ml_active(), "Loading is not active");
+        let out = e.mask("call Alice Johnson", Surface::UserMessage).unwrap();
+        assert!(
+            out.masked_text.contains("Alice Johnson"),
+            "must be regex-only while loading: {}",
+            out.masked_text
+        );
+    }
+
+    // Generation guard: a load that completes AFTER an off / model change must not
+    // resurrect a recognizer (the critical race from the adversarial review).
+    #[test]
+    fn ml_stale_load_completion_is_discarded() {
+        let e = engine_personal_on();
+        let stale_gen = e.ml_begin_load(MlConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        // User turns it off (or changes the model) while the first load is in flight.
+        e.ml_disable();
+        // The stale load now finishes and tries to install its recognizer.
+        e.ml_set_ready(stale_gen, Arc::new(MockPerson::new("Alice Johnson")));
+        assert!(
+            !e.ml_active(),
+            "stale load must not become active after disable"
+        );
+        let out = e.mask("call Alice Johnson", Surface::UserMessage).unwrap();
+        assert!(out.masked_text.contains("Alice Johnson"), "stale load leaked");
+    }
+
+    // DATE_TIME (the ML model's `private_date`) is intentionally unmapped to any
+    // category — dates are noisy — so it's dropped by default but opt-in via an
+    // explicit per-type operator. Lock that decision (review follow-up).
+    #[test]
+    fn date_time_unmapped_by_default_but_opt_in() {
+        let cfg = EngineConfig::default();
+        assert!(
+            !cfg.entity_enabled("DATE_TIME"),
+            "DATE_TIME must be off by default"
+        );
+        for c in [
+            Category::Secrets,
+            Category::Financial,
+            Category::Identity,
+            Category::Contact,
+            Category::Personal,
+        ] {
+            assert!(
+                !c.entity_types().contains(&"DATE_TIME"),
+                "{c:?} unexpectedly lists DATE_TIME"
+            );
+        }
+        // Opt-in escape hatch: an explicit per-type operator enables it.
+        let mut cfg = EngineConfig::default();
+        cfg.entity_operators
+            .insert("DATE_TIME".into(), Operator::Token);
+        assert!(
+            cfg.entity_enabled("DATE_TIME"),
+            "an entity_operator should enable DATE_TIME"
+        );
+    }
+
+    // Lock the ML status wire strings — the status line and the hooks CLI match on
+    // exactly these (a rename here would silently break the indicator).
+    #[test]
+    fn ml_status_serializes_to_stable_strings() {
+        use serde_json::json;
+        assert_eq!(serde_json::to_value(MlStatus::Disabled).unwrap(), json!("disabled"));
+        assert_eq!(serde_json::to_value(MlStatus::Loading).unwrap(), json!("loading"));
+        assert_eq!(serde_json::to_value(MlStatus::Ready).unwrap(), json!("ready"));
+        assert_eq!(serde_json::to_value(MlStatus::Failed).unwrap(), json!("failed"));
+    }
+
+    // Lock the catalog mapping target strings: the ML model maps its labels to
+    // `EntityType`s whose `Display` MUST equal the category entity strings, else ML
+    // detections would be silently dropped by the category gate.
+    #[test]
+    fn entity_type_display_matches_category_strings() {
+        for (parsed, expected, cat) in [
+            ("PERSON", "PERSON", Category::Personal),
+            ("LOCATION", "LOCATION", Category::Personal),
+            ("EMAIL_ADDRESS", "EMAIL_ADDRESS", Category::Contact),
+            ("PHONE_NUMBER", "PHONE_NUMBER", Category::Contact),
+            ("US_BANK_ACCOUNT", "US_BANK_NUMBER", Category::Financial),
+            ("API_KEY", "API_KEY", Category::Secrets),
+        ] {
+            let et: EntityType = parsed.parse().unwrap();
+            assert_eq!(et.to_string(), expected, "Display drift for {parsed}");
+            assert!(
+                cat.entity_types().contains(&expected),
+                "{expected} missing from its category"
+            );
+        }
+    }
+
     // Any surface label can be masked (no direction gate); unmask round-trips.
     #[test]
     fn assistant_surface_masks_and_round_trips() {
@@ -605,5 +1122,252 @@ mod tests {
         let out = e.mask(original, Surface::AssistantText).unwrap();
         assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
         assert_eq!(e.unmask(&out.masked_text, &out.manifest).unwrap(), original);
+    }
+
+    // ----- Detection cache (Component 1) — committed-scope verification --------
+
+    // A repeated identical leaf hits the cache, reproduces the masked text, and
+    // REPLAYS the manifest (not a cached-empty) so it still unmasks.
+    #[test]
+    fn cache_hit_is_deterministic_and_replays_manifest() {
+        let e = engine();
+        let text = "email alice@example.com and bob@example.com";
+        let a = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(a.stats.fresh_miss, 1, "first mask is a miss");
+        assert_eq!(a.stats.hit, 0);
+        let b = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(b.stats.hit, 1, "second identical mask is a cache hit");
+        assert_eq!(b.stats.fresh_miss, 0);
+        assert_eq!(a.masked_text, b.masked_text, "hit reproduces the masked text");
+        assert!(
+            !b.manifest.is_empty(),
+            "manifest is REPLAYED on a hit, not cached empty"
+        );
+        assert_eq!(a.manifest.len(), b.manifest.len());
+        assert_eq!(e.unmask(&b.masked_text, &b.manifest).unwrap(), text);
+    }
+
+    // Manifest-replay regression: a custom literal token (which does NOT match
+    // `token_regex`) unmasks ONLY via the replayed per-call manifest, so it must
+    // survive a cache hit.
+    #[test]
+    fn literal_token_round_trips_through_a_cache_hit() {
+        let mut cfg = EngineConfig::default();
+        cfg.custom_replacements.push(CustomReplacement {
+            pattern: "ACME-CODENAME".into(),
+            entity_type: "CODENAME".into(),
+            is_regex: false,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: true,
+            token: Some("[CODENAME_acme]".into()),
+            apply_to_surfaces: None,
+        });
+        let e = MaskEngine::new(cfg).unwrap();
+        let text = "deploy ACME-CODENAME now";
+        let first = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(first.stats.fresh_miss, 1);
+        let second = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(second.stats.hit, 1, "second mask is a hit");
+        assert!(second.masked_text.contains("[CODENAME_acme]"));
+        assert_eq!(e.unmask(&second.masked_text, &second.manifest).unwrap(), text);
+    }
+
+    // Operators are resolved at APPLY time: swapping an operator VALUE (same key)
+    // takes effect on the same text WITHOUT a detection re-run (cache hit).
+    #[test]
+    fn operator_value_swap_applies_without_redetection() {
+        let mut cfg = EngineConfig::default();
+        // Pre-establish the EMAIL operator KEY so a later value swap leaves the
+        // detection fingerprint intact.
+        cfg.entity_operators
+            .insert("EMAIL_ADDRESS".into(), Operator::Token);
+        let e = MaskEngine::new(cfg).unwrap();
+        let text = "mail carol@example.com";
+        let first = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(first.stats.fresh_miss, 1);
+        assert!(first.masked_text.contains("[EMAIL_ADDRESS_"));
+
+        let mut cfg2 = e.config_snapshot();
+        cfg2.entity_operators
+            .insert("EMAIL_ADDRESS".into(), Operator::Redact);
+        e.set_config(cfg2).unwrap();
+
+        let second = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(
+            second.stats.hit, 1,
+            "an operator VALUE change must NOT bust the cache"
+        );
+        assert_eq!(second.stats.fresh_miss, 0);
+        assert!(
+            second.masked_text.contains("[REDACTED]"),
+            "the new operator resolves at apply-time: {}",
+            second.masked_text
+        );
+    }
+
+    // A detection-affecting change (category off) moves `policy_fp` → fresh
+    // detection, and the previously-masked EMAIL is no longer masked.
+    #[test]
+    fn category_change_invalidates_via_fingerprint() {
+        let e = engine();
+        let text = "mail dave@example.com";
+        let on = e.mask(text, Surface::UserMessage).unwrap();
+        assert!(on.masked_text.contains("[EMAIL_ADDRESS_"));
+        assert_eq!(on.stats.fresh_miss, 1);
+        assert_eq!(e.mask(text, Surface::UserMessage).unwrap().stats.hit, 1);
+
+        let mut cfg = e.config_snapshot();
+        cfg.enabled_categories.remove(&Category::Contact);
+        e.set_config(cfg).unwrap();
+
+        let off = e.mask(text, Surface::UserMessage).unwrap();
+        assert_eq!(
+            off.stats.fresh_miss, 1,
+            "category change must bust the cache (fresh detection)"
+        );
+        assert_eq!(off.stats.hit, 0);
+        assert!(
+            off.masked_text.contains("dave@example.com"),
+            "EMAIL no longer masked once Contact is off: {}",
+            off.masked_text
+        );
+    }
+
+    // LRU (not FIFO) eviction, and a live `cap = 0` that clears + disables.
+    #[test]
+    fn lru_evicts_least_recently_used_and_live_cap_zero_disables() {
+        let cfg = EngineConfig {
+            detection_cache_cap: 2,
+            ..Default::default()
+        };
+        let e = MaskEngine::new(cfg).unwrap();
+        let (t1, t2, t3) = (
+            "one alice@example.com",
+            "two bob@example.com",
+            "three carol@example.com",
+        );
+        e.mask(t1, Surface::UserMessage).unwrap();
+        e.mask(t2, Surface::UserMessage).unwrap();
+        assert_eq!(e.cache.len(), 2);
+        // Touch t1 → t2 becomes the least-recently-used.
+        assert_eq!(e.mask(t1, Surface::UserMessage).unwrap().stats.hit, 1);
+        // Insert t3 → evicts the LRU (t2), NOT t1 (which FIFO would have dropped).
+        e.mask(t3, Surface::UserMessage).unwrap();
+        assert_eq!(e.cache.len(), 2);
+        assert_eq!(
+            e.mask(t1, Surface::UserMessage).unwrap().stats.hit,
+            1,
+            "t1 stayed resident (recently used)"
+        );
+        assert_eq!(
+            e.mask(t2, Surface::UserMessage).unwrap().stats.fresh_miss,
+            1,
+            "t2 was evicted as the LRU → miss"
+        );
+
+        // Live disable.
+        let mut cfg0 = e.config_snapshot();
+        cfg0.detection_cache_cap = 0;
+        e.set_config(cfg0).unwrap();
+        assert_eq!(e.cache.len(), 0, "cap 0 clears the cache");
+        assert_eq!(
+            e.mask(t1, Surface::UserMessage).unwrap().stats.fresh_miss,
+            1,
+            "disabled cache always misses"
+        );
+        assert_eq!(e.cache.len(), 0, "disabled cache never inserts");
+    }
+
+    // Two (here four) concurrent misses on the SAME new leaf run detection exactly
+    // once — the ML gate's re-check gives single-flight (audit #6).
+    #[test]
+    fn concurrent_misses_single_flight_through_ml_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct CountingPerson {
+            calls: Arc<AtomicUsize>,
+            entities: Vec<EntityType>,
+        }
+        impl Recognizer for CountingPerson {
+            fn name(&self) -> &str {
+                "counting-person"
+            }
+            fn supported_entities(&self) -> &[EntityType] {
+                &self.entities
+            }
+            fn supported_languages(&self) -> &[&str] {
+                &["en"]
+            }
+            fn analyze(
+                &self,
+                text: &str,
+                _e: Option<&[EntityType]>,
+                _n: Option<&NlpArtifacts>,
+            ) -> Vec<RecognizerResult> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Hold the gate long enough that all racers reach the first (gateless)
+                // cache probe and miss before this insert lands.
+                std::thread::sleep(Duration::from_millis(80));
+                match text.find("Dana Scully") {
+                    Some(pos) => vec![
+                        RecognizerResult::new("PERSON".parse().unwrap(), pos, pos + 11, 0.99)
+                            .with_recognizer("counting-person"),
+                    ],
+                    None => Vec::new(),
+                }
+            }
+        }
+
+        let e = Arc::new(engine_personal_on());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let generation = e.ml_begin_load(MlConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        e.ml_set_ready(
+            generation,
+            Arc::new(CountingPerson {
+                calls: calls.clone(),
+                entities: vec!["PERSON".parse().unwrap()],
+            }),
+        );
+
+        let text = "call Dana Scully";
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let e = e.clone();
+                s.spawn(move || {
+                    let out = e.mask(text, Surface::UserMessage).unwrap();
+                    assert!(out.masked_text.contains("[PERSON_"));
+                });
+            }
+        });
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "single-flight: 4 concurrent identical misses run detection once"
+        );
+    }
+
+    // Detection is deterministic and carries a stable per-source tag (the field the
+    // deferred Component-3 burn keys off; also exercises the literal marker).
+    #[test]
+    fn detection_is_deterministic_and_source_tagged() {
+        use crate::cache::Source;
+        let analyzer = presidio_analyzer::default_analyzer("en");
+        let cfg = EngineConfig::default();
+        let customs = detect::compile_customs(&cfg.custom_replacements).unwrap();
+        let text = "ping bob@example.com";
+        let a = run_detection(&analyzer, &cfg, &customs, None, text, Surface::UserMessage).unwrap();
+        let b = run_detection(&analyzer, &cfg, &customs, None, text, Surface::UserMessage).unwrap();
+        assert_eq!(a.len(), 1, "one EMAIL detection");
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a[0].start, b[0].start);
+        assert_eq!(a[0].end, b[0].end);
+        assert_eq!(a[0].entity_type, b[0].entity_type);
+        assert_eq!(a[0].source, Source::Regex, "presidio email is regex-sourced");
+        assert!(!a[0].literal);
     }
 }

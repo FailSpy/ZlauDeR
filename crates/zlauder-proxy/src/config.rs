@@ -219,6 +219,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_engine_ml_section() {
+        let dir = std::env::temp_dir().join(format!("zlauder-ml-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let project = dir.join("zlauder.toml");
+        std::fs::write(
+            &project,
+            "[engine.ml]\nenabled = true\nmodel = \"acme/privacy\"\nmin_score = 0.7\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded unit test.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
+
+        let cfg = load(Some(&project)).expect("ml section load");
+        assert!(cfg.engine.ml.enabled);
+        assert_eq!(cfg.engine.ml.model, "acme/privacy");
+        assert_eq!(cfg.engine.ml.min_score, Some(0.7));
+        // A config without `[engine.ml]` still defaults cleanly (off).
+        assert!(!EngineConfig::default().ml.enabled);
+
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn local_layer_overrides_project() {
         let dir = std::env::temp_dir().join(format!("zlauder-layer-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

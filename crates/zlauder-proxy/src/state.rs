@@ -21,6 +21,12 @@ pub struct AppState {
     pub project_root: Arc<String>,
     /// The port this proxy is bound to (reported by the config endpoint).
     pub port: u16,
+    /// Serializes ML state transitions (`/zlauder/ml/{enable,disable}`, and the ML
+    /// reconcile in `put`/`reload`). Without it, two concurrent `model on`/`off`
+    /// requests can interleave their config-write and runtime-toggle so a stale
+    /// reconcile resurrects a load after the last intent was *off*. Held only across
+    /// the sync critical section (never across an `.await`).
+    pub ml_control: Arc<std::sync::Mutex<()>>,
 }
 
 impl AppState {

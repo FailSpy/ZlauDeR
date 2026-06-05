@@ -23,8 +23,11 @@ authors = ["failspy <failspy@exonull.com>"]
 # For local co-development against ../jcc checkouts, add a gitignored
 # .cargo/config.toml `paths` override (see .cargo/config.toml.example) — cargo
 # then uses your local trees with no network and no manifest edits.
-presidio-core     = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
-presidio-analyzer = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
+presidio-core       = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
+presidio-analyzer   = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
+# Optional ML recognizer (openai/privacy-filter on a native-Rust Candle CPU
+# backend). Pulled in only by zlauder-engine's `ml` feature.
+presidio-classifier = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
 
 anthropic-wire = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
 sse-core       = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
@@ -36,6 +39,9 @@ rand     = "0.8"
 regex    = "1.11"
 smallvec = { version = "1.13", features = ["serde"] }
 uuid     = { version = "1.11", features = ["v4", "serde"] }
+# Bounded LRU for the detection cache (correct recency eviction; FIFO would evict
+# hot early leaves that Claude Code re-sends every turn).
+lru      = "0.12"
 
 # serde / common
 serde       = { version = "1.0", features = ["derive"] }

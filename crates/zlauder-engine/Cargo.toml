@@ -10,6 +10,10 @@ description = "PII masking/unmasking engine: deterministic blake3 session tokens
 [dependencies]
 presidio-core     = { workspace = true }
 presidio-analyzer = { workspace = true }
+# ML recognizer (openai/privacy-filter, Candle CPU backend). Optional, but ON by
+# default (the `ml` feature is in `default`) so normal builds are "ML-capable".
+# `zlauder-hooks` opts OUT with `default-features = false` to stay lean.
+presidio-classifier = { workspace = true, features = ["backend-candle"], optional = true }
 
 blake3   = { workspace = true }
 aes-gcm  = { workspace = true }
@@ -17,10 +21,20 @@ rand     = { workspace = true }
 regex    = { workspace = true }
 smallvec = { workspace = true }
 uuid     = { workspace = true }
+lru      = { workspace = true }
 
 serde     = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
+
+[features]
+# `ml` is ON by default so a normal `cargo build` is ML-capable ("always compiled
+# in"). The candle-touching code lives behind `cfg(feature = "ml")` in `ml.rs`;
+# the rest of the engine (the MlRuntime slot, detection wiring) is candle-free, so
+# a `--no-default-features` build is a lean regex-only engine that still parses the
+# `[engine.ml]` config (it just never loads a model).
+default = ["ml"]
+ml = ["dep:presidio-classifier"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

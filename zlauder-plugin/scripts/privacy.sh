@@ -62,8 +62,42 @@ case "$sub" in
     # Masking verbs (and any --scope flag) pass straight through to the CLI.
     exec zlauder-hooks "${PORT_ARGS[@]}" config "$@"
     ;;
+  model)
+    # ML recognizer (openai/privacy-filter, CPU): download | status | on | off.
+    shift || true
+    msub="${1:-status}"
+    case "$msub" in
+      download)
+        # Download needs the zlauder-proxy binary (built with the ml backend).
+        # Unlike status/reveal, this path MAY build — re-resolve allowing it.
+        shift || true
+        zlauder_resolve_bins || {
+          echo "error: could not resolve/build zlauder-proxy for the model download." >&2
+          exit 1
+        }
+        if ! command -v zlauder-proxy >/dev/null 2>&1; then
+          echo "error: zlauder-proxy is not available for this project yet." >&2
+          exit 1
+        fi
+        CFG_ARGS=()
+        proj_cfg="${CLAUDE_PROJECT_DIR:-.}/zlauder.toml"
+        [ -f "$proj_cfg" ] && CFG_ARGS=(--config "$proj_cfg")
+        MODEL_ARGS=()
+        [ -n "${1:-}" ] && MODEL_ARGS=(--model "$1")
+        exec zlauder-proxy "${CFG_ARGS[@]}" --download-model "${MODEL_ARGS[@]}"
+        ;;
+      on | off | status | "")
+        # status / on / off go through the lean control CLI (no ml deps needed).
+        exec zlauder-hooks "${PORT_ARGS[@]}" config ml "$@"
+        ;;
+      *)
+        echo "usage: /zlauder:privacy model [status | download [<repo>] | on | off] [--scope session|project|user|local]" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   *)
-    echo "unknown subcommand '$sub'. usage: /zlauder:privacy [status | on | off | profile <name> | category <name> on|off | threshold <0-1> | reveal <token>] [--scope session|project|user|local]" >&2
+    echo "unknown subcommand '$sub'. usage: /zlauder:privacy [status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token>] [--scope session|project|user|local]" >&2
     exit 2
     ;;
 esac

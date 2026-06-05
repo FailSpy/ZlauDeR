@@ -29,6 +29,7 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         }),
         project_root: Arc::new("/tmp/zlauder-test-project".into()),
         port: 0,
+        ml_control: Arc::new(std::sync::Mutex::new(())),
     }
 }
 
@@ -289,6 +290,91 @@ async fn config_endpoints_gated_and_toggle_masking() {
         "re-enabled should mask: {body_on}"
     );
     assert!(body_on.contains("[EMAIL_ADDRESS_"));
+}
+
+// The ML control plane: the snapshot exposes an `ml` block (so the status line /
+// `model status` can read it), the endpoints are key-gated, and `ml/disable` is a
+// safe no-network operation. We deliberately do NOT exercise `ml/enable` with the
+// key here — that would kick off a real model download.
+#[tokio::test]
+async fn ml_endpoints_gated_and_snapshot_shape() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "mlkey");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // Snapshot carries the ml block: off + default model + status "disabled".
+    let cfg: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "mlkey")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg["ml"]["enabled"], serde_json::json!(false));
+    assert_eq!(cfg["ml"]["status"], serde_json::json!("disabled"));
+    assert_eq!(cfg["ml"]["model"], serde_json::json!("openai/privacy-filter"));
+
+    // Enabling is key-gated (no key → 403, and crucially triggers no load).
+    let unauth = client
+        .post(format!("http://{proxy_addr}/zlauder/ml/enable"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 403);
+
+    // Disable with the key is a safe no-network op → 200, still "disabled".
+    let off: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/zlauder/ml/disable"))
+        .header("x-zlauder-key", "mlkey")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(off["ml"]["status"], serde_json::json!("disabled"));
+    assert_eq!(off["ml"]["enabled"], serde_json::json!(false));
+}
+
+// Live-ownership: a generic `PUT /zlauder/config` must NOT enable ML even if the
+// posted config says `ml.enabled = true` — only `/zlauder/ml/{enable,disable}` flip
+// it. (Otherwise a stale/older client could turn the model on via the wrong path,
+// and crucially trigger a model load.)
+#[tokio::test]
+async fn put_config_cannot_flip_ml_enabled() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "k2");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let mut cfg: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "k2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Forge `config.ml.enabled = true` and PUT it.
+    let mut wire = cfg["config"].take();
+    wire["ml"]["enabled"] = serde_json::json!(true);
+    let put: serde_json::Value = client
+        .put(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "k2")
+        .json(&wire)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // ML stays disabled — no load was triggered through the generic PUT.
+    assert_eq!(put["ml"]["status"], serde_json::json!("disabled"));
+    assert_eq!(put["ml"]["enabled"], serde_json::json!(false));
 }
 
 // PUT /zlauder/config swaps the live policy (here: turn EMAIL into redaction).

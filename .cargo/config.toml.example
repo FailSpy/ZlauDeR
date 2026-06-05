@@ -11,6 +11,7 @@
 paths = [
     "../jcc/presidio-rs/presidio-core",
     "../jcc/presidio-rs/presidio-analyzer",
+    "../jcc/presidio-rs/presidio-classifier",
     "../jcc/llm-wires/anthropic-wire",
     "../jcc/llm-wires/sse-core",
 ]

@@ -15,4 +15,6 @@ pub enum EngineError {
         pattern: String,
         source: regex::Error,
     },
+    #[error("ml model: {0}")]
+    Ml(String),
 }

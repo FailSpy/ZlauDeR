@@ -102,6 +102,30 @@ enum ConfigAction {
         #[arg(long, value_enum, default_value_t = Scope::Session)]
         scope: Scope,
     },
+    /// View or toggle the optional ML recognizer (openai/privacy-filter, CPU).
+    Ml {
+        #[command(subcommand)]
+        action: Option<MlAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MlAction {
+    /// Show the ML model status (default).
+    Status,
+    /// Turn the ML recognizer ON (the model loads in the background).
+    On {
+        /// Override the model repo id (persisted only with a file scope).
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_enum, default_value_t = Scope::Session)]
+        scope: Scope,
+    },
+    /// Turn the ML recognizer OFF (live; drops the model from the detection path).
+    Off {
+        #[arg(long, value_enum, default_value_t = Scope::Session)]
+        scope: Scope,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -280,13 +304,31 @@ fn statusline(port: Option<u16>) -> Result<()> {
     // never a false shield (review finding C5).
     match key_for(port).and_then(|k| admin_get(port, &k)) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
-            Ok(s) if s.enabled => println!("\u{1f6e1} zlauder :{port} {}", s.config.profile),
+            Ok(s) if s.enabled => {
+                println!(
+                    "\u{1f6e1} zlauder :{port} {}{}",
+                    s.config.profile,
+                    ml_indicator(s.ml.as_ref())
+                )
+            }
             Ok(_) => println!("\u{26a0} zlauder OFF :{port}"),
             Err(_) => println!("\u{2754} zlauder :{port} (unverified)"),
         },
         Err(_) => println!("\u{2754} zlauder :{port} (unverified)"),
     }
     Ok(())
+}
+
+/// Compact ML indicator appended to the status line when masking is on: a brain
+/// when the model is filtering, an hourglass while it loads (the user's cue that
+/// their text is NOT yet filtered through it), a warning if a load failed.
+fn ml_indicator(ml: Option<&MlSnap>) -> &'static str {
+    match ml.map(|m| m.status.as_str()) {
+        Some("ready") => " \u{1f9e0}",      // 🧠 filtering
+        Some("loading") => " \u{23f3}ml",   // ⏳ml loading — not filtered yet
+        Some("failed") => " \u{26a0}ml",    // ⚠ml load failed
+        _ => "",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +352,118 @@ fn config_cmd(port: Option<u16>, action: Option<ConfigAction>) -> Result<()> {
             apply_category(port, &root, scope, &name, matches!(state, OnOff::On))?
         }
         ConfigAction::Threshold { value, scope } => apply_threshold(port, &root, scope, value)?,
+        ConfigAction::Ml { action } => ml_cmd(port, &root, action.unwrap_or(MlAction::Status))?,
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// config ml (/zlauder:privacy model …)
+// ---------------------------------------------------------------------------
+
+fn ml_cmd(port: u16, root: &str, action: MlAction) -> Result<()> {
+    match action {
+        MlAction::Status => {
+            let snap = live_snapshot(port).context(
+                "could not reach this project's proxy (is a `claude` session running?)",
+            )?;
+            print_ml_line(&parse_snapshot(&snap)?, port);
+            Ok(())
+        }
+        MlAction::On { model, scope } => apply_ml(port, root, scope, true, model),
+        MlAction::Off { scope } => apply_ml(port, root, scope, false, None),
+    }
+}
+
+/// Turn the ML recognizer on/off. Session scope hits the dedicated control
+/// endpoint (live, not persisted); file scopes persist `[engine.ml]` then apply
+/// live (a `reload` first so a model change is picked up, then the toggle).
+fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>) -> Result<()> {
+    let endpoint = if on { "ml/enable" } else { "ml/disable" };
+
+    if scope == Scope::Session {
+        let key =
+            key_for(port).context("proxy not running; use --scope project/user to persist")?;
+        let snap = admin_post(port, &key, endpoint)?;
+        print_ml_applied(&snap, port, "session", on);
+        return Ok(());
+    }
+
+    edit_scope_file(scope, root, |doc| {
+        doc["engine"]["ml"]["enabled"] = toml_edit::value(on);
+        if let Some(m) = &model {
+            doc["engine"]["ml"]["model"] = toml_edit::value(m.as_str());
+        }
+    })?;
+
+    let path = scope_path(scope, root);
+    let applied = match key_for(port) {
+        Ok(key) => {
+            // For ON, reload first so a `--model` change in the file is loaded into
+            // the live config before we flip the toggle (which starts the load).
+            if on {
+                let _ = admin_post(port, &key, "reload");
+            }
+            admin_post(port, &key, endpoint).ok()
+        }
+        Err(_) => None,
+    };
+    match applied {
+        Some(snap) => print_ml_applied(&snap, port, scope_label(scope), on),
+        None => println!(
+            "saved to {} ({} scope). The proxy isn't running, so ML will apply on the next session.",
+            path.display(),
+            scope_label(scope)
+        ),
+    }
+    Ok(())
+}
+
+fn print_ml_applied(snap: &Value, port: u16, scope: &str, on: bool) {
+    if on {
+        println!(
+            "openai-privacy requested ON ({scope} scope). The model loads in the BACKGROUND — \
+             your text is NOT filtered through it until status is `ready`; you can keep working \
+             (regex-only) or wait."
+        );
+    } else {
+        println!("openai-privacy turned OFF ({scope} scope).");
+    }
+    if let Ok(s) = parse_snapshot(snap) {
+        print_ml_line(&s, port);
+    }
+}
+
+/// Print the ML model line(s) of a snapshot.
+fn print_ml_line(s: &Snapshot, port: u16) {
+    let Some(ml) = &s.ml else {
+        println!("openai-privacy: not reported by this proxy (older build?).");
+        return;
+    };
+    println!("openai-privacy (port {port}):");
+    println!("  model   : {}", ml.model);
+    println!("  desired : {}", if ml.enabled { "on" } else { "off" });
+    let status = match ml.status.as_str() {
+        "ready" => "ready — filtering active".to_string(),
+        "loading" => {
+            "loading — NOT filtering through the model yet; wait, or continue regex-only".to_string()
+        }
+        "failed" => format!(
+            "failed{}",
+            ml.error
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        ),
+        "disabled" => "disabled".to_string(),
+        other => other.to_string(),
+    };
+    println!("  status  : {status}");
+    if ml.status == "disabled" {
+        println!(
+            "  tip: run `/zlauder:privacy model download` once, then `/zlauder:privacy model on`."
+        );
+    }
 }
 
 fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
@@ -686,6 +838,9 @@ struct Snapshot {
     #[serde(default)]
     token_count: u64,
     config: SnapConfig,
+    /// Optional ML runtime block (absent on older proxies).
+    #[serde(default)]
+    ml: Option<MlSnap>,
 }
 
 #[derive(serde::Deserialize)]
@@ -693,6 +848,20 @@ struct SnapConfig {
     profile: String,
     score_threshold: f64,
     enabled_categories: Vec<String>,
+}
+
+/// The proxy's `ml` runtime block: desired flag + model + live lifecycle.
+#[derive(serde::Deserialize)]
+struct MlSnap {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    model: String,
+    /// `disabled` | `loading` | `ready` | `failed` (see `zlauder_engine::MlStatus`).
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 fn parse_snapshot(snap: &Value) -> Result<Snapshot> {
@@ -727,6 +896,25 @@ fn print_snapshot(s: &Snapshot, port: u16) {
     println!("  categories : {}", s.config.enabled_categories.join(", "));
     println!("  threshold  : {:.2}", s.config.score_threshold);
     println!("  tokens this session : {}", s.token_count);
+    if let Some(ml) = &s.ml {
+        let ml_state = match ml.status.as_str() {
+            "ready" => format!("ON — {} ready (filtering active)", ml.model),
+            "loading" => format!(
+                "LOADING {} — NOT filtering through it yet (continue regex-only, or wait)",
+                ml.model
+            ),
+            "failed" => format!(
+                "FAILED {}{}",
+                ml.model,
+                ml.error
+                    .as_deref()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            ),
+            _ => "off".to_string(),
+        };
+        println!("  ml model   : {ml_state}");
+    }
     if !s.enabled {
         println!("  NOTE: masking is OFF — outbound text reaches the model unmasked.");
     }

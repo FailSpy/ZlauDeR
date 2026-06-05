@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use zlauder_engine::{EngineConfig, MaskEngine};
-use zlauder_proxy::{config, routes, state::AppState};
+use zlauder_engine::{EngineConfig, MaskEngine, MlConfig};
+use zlauder_proxy::{config, ml, routes, state::AppState};
 
 #[derive(Parser, Debug)]
 #[command(name = "zlauder-proxy", version, about)]
@@ -32,6 +32,14 @@ struct Args {
     /// Absolute project root this proxy serves (for the state record / config GET).
     #[arg(long, env = "ZLAUDER_PROJECT_ROOT")]
     project_root: Option<PathBuf>,
+    /// Download + cache the ML model, then exit (do NOT start the server). Pre-warms
+    /// the HuggingFace cache so a later `/zlauder:privacy model on` is fast.
+    #[arg(long)]
+    download_model: bool,
+    /// Override the ML model repo id for `--download-model` (else the config's
+    /// `[engine.ml].model`, default `openai/privacy-filter`).
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[tokio::main]
@@ -45,11 +53,19 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let cfg = config::load(args.config.as_deref())?;
+
+    // One-shot model download mode: fetch/cache the weights and exit.
+    if args.download_model {
+        return download_model(cfg.engine.ml, args.model).await;
+    }
+
     let port = args.port.unwrap_or(cfg.port);
     let bind = args.bind.unwrap_or(cfg.bind);
     let upstream = args.upstream.unwrap_or(cfg.upstream_base_url);
     let project_root = resolve_project_root(args.project_root);
 
+    // Keep the ML config to drive the background load once we're serving.
+    let ml_cfg = cfg.engine.ml.clone();
     let engine = build_engine(cfg.engine)?;
     let (_key, salt) = engine.session_handle();
     let salt_hex = hex_encode(&salt);
@@ -69,8 +85,12 @@ async fn main() -> anyhow::Result<()> {
         layers: Arc::new(cfg.layers),
         project_root: Arc::new(project_root.clone()),
         port,
+        ml_control: Arc::new(std::sync::Mutex::new(())),
     };
 
+    // Hold an engine handle so we can kick off the background model load after we
+    // start serving (the router consumes `state`).
+    let engine_for_ml = state.engine.clone();
     let app = routes::router(state);
     let addr = format!("{bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -93,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("zlauder-proxy listening on http://{addr} -> {upstream}");
+
+    // We're serving (bound above). Kick off the ML model load in the background if
+    // it's enabled in config — masking runs regex-only until it reports `Ready`.
+    if ml_cfg.enabled {
+        ml::spawn_ml_load(engine_for_ml, ml_cfg);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -126,6 +152,38 @@ fn build_engine(cfg: EngineConfig) -> anyhow::Result<MaskEngine> {
             MaskEngine::with_salt(cfg, salt).context("building engine")
         }
         None => MaskEngine::new(cfg).context("building engine"),
+    }
+}
+
+/// `--download-model`: fetch + cache the model weights, then exit. Heavy +
+/// blocking, so it runs on a blocking thread (the loader drives hf-hub on its own
+/// runtime). Independent of `[engine.ml].enabled` — it only pre-warms the cache.
+async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> anyhow::Result<()> {
+    if let Some(m) = model_override {
+        ml.model = m;
+    }
+    println!(
+        "zlauder: downloading ML model '{}' for CPU inference. The first run can be \
+         large and slow; it caches under the HuggingFace cache (HF_HOME / \
+         ~/.cache/huggingface).",
+        ml.model
+    );
+    let model = ml.model.clone();
+    let res = tokio::task::spawn_blocking(move || zlauder_engine::ml::download(&ml))
+        .await
+        .context("download task panicked")?;
+    match res {
+        Ok(()) => {
+            println!(
+                "zlauder: model '{model}' downloaded and cached. Enable it with \
+                 `/zlauder:privacy model on`."
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "downloading model '{model}': {e}. Check the repo id, network / HF_TOKEN, \
+             and free disk space."
+        )),
     }
 }
 

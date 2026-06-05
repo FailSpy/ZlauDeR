@@ -65,9 +65,64 @@ impl UnmaskManifest {
     }
 }
 
+/// Per-`mask()`-call detection-cache instrumentation (Component 2). Exactly one
+/// leaf per `mask()` call, so each field is 0/1 there; `MaskWalker` sums them
+/// across a request's leaves and logs once (the falsifiable `fresh_misses`
+/// observable for the caching win). Definitions (audit #12):
+/// - `leaves`: leaves that reached `mask()` (incl. disabled passthroughs).
+/// - `hit`: served from cache (incl. a single-flight gate re-check hit).
+/// - `fresh_miss`: ran `run_detection` successfully (its result is now cached).
+/// - `ml_ran`: the ML recognizer was consulted on this leaf (⊆ misses).
+/// - `fail_open`: detection errored and the leaf passed through (NOT cached).
+/// - `disabled`: master-switch-off / surface-disabled passthrough (no detection).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MaskStats {
+    pub leaves: u32,
+    pub hit: u32,
+    pub fresh_miss: u32,
+    pub ml_ran: u32,
+    pub fail_open: u32,
+    pub disabled: u32,
+}
+
+impl MaskStats {
+    /// Stats for an un-detected passthrough leaf (master off / surface disabled).
+    pub fn disabled() -> Self {
+        Self {
+            leaves: 1,
+            disabled: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Accumulate another leaf's stats (one request masks many leaves).
+    pub fn merge(&mut self, o: &MaskStats) {
+        self.leaves += o.leaves;
+        self.hit += o.hit;
+        self.fresh_miss += o.fresh_miss;
+        self.ml_ran += o.ml_ran;
+        self.fail_open += o.fail_open;
+        self.disabled += o.disabled;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MaskOutcome {
     pub masked_text: String,
     /// Tokens minted in this `mask()` call.
     pub manifest: UnmaskManifest,
+    /// Detection-cache instrumentation for this call.
+    pub stats: MaskStats,
+}
+
+impl MaskOutcome {
+    /// A transparent passthrough outcome (text unchanged, empty manifest) carrying
+    /// the given stats.
+    pub fn passthrough(text: &str, stats: MaskStats) -> Self {
+        Self {
+            masked_text: text.to_string(),
+            manifest: UnmaskManifest::new(),
+            stats,
+        }
+    }
 }
