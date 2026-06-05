@@ -33,16 +33,16 @@ if zlauder_resolve_bins; then bins_ok=1; fi
 
 # Resolve the proxy port. The live per-project proxy listens on a port DERIVED from
 # the project root (range 18000..20000), NOT a static default. The authoritative
-# source is zlauder-hooks: `session-start` ensures the proxy is up (atomically
-# reserving the derived port on first launch) and emits the resolved port in its hook
-# JSON's env block. We parse that, never guess.
+# source is zlauder-hooks `reserve-port`, which atomically reserves the derived port
+# and prints it — WITHOUT launching the proxy or emitting SessionStart JSON (that hook
+# is gated on the session already being routed, which a first-time enable is not). We
+# parse that, never guess.
 port=""
 if [ -n "${ZLAUDER_PORT:-}" ]; then
   # User pinned an explicit port; honor it.
   port="$ZLAUDER_PORT"
 elif [ "$bins_ok" -eq 1 ]; then
-  hook_json="$(zlauder-hooks session-start 2>/dev/null < /dev/null || true)"
-  port="$(printf '%s' "$hook_json" | jq -r '.env.ZLAUDER_PORT // empty' 2>/dev/null || true)"
+  port="$(zlauder-hooks reserve-port 2>/dev/null < /dev/null || true)"
 fi
 
 if [ -z "$port" ]; then

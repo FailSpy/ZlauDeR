@@ -42,23 +42,6 @@ config_path() {
   fi
 }
 
-# Warn when the proxy is up but ANTHROPIC_BASE_URL does not route through it.
-# The port is the one the proxy actually launched on (parsed from the hook JSON),
-# not a guessed default.
-route_guard() {
-  local port="$1"
-  if [ -z "$port" ]; then
-    # No resolved port to compare against; cannot reliably check routing.
-    return 0
-  fi
-  local want="http://127.0.0.1:${port}"
-  local have="${ANTHROPIC_BASE_URL:-}"
-  case "$have" in
-    "$want"|"$want"/*) return 0 ;;
-  esac
-  warn "⚠ zlauder proxy is up but ANTHROPIC_BASE_URL is not set to ${want} — traffic is NOT masked. Run /zlauder:enable then restart Claude Code."
-}
-
 # Resolve (and, on first run, build) the binaries; this also prepends their dir
 # to PATH so the bare `zlauder-hooks` calls below and session-start's default
 # --proxy-bin "zlauder-proxy" both resolve.
@@ -69,41 +52,23 @@ fi
 
 CFG="$(config_path)"
 
-# Hand off to the real control plane. It drains our stdin (the SessionStart
-# payload), ensures the proxy is up, and prints the hook JSON. Capture that
-# JSON so we can emit it byte-for-byte while still running the route guard
-# afterward (the guard writes to stderr only, so it never touches the JSON).
-HOOK_OUT="$(mktemp "${TMPDIR:-/tmp}/zlauder-sessionstart.XXXXXX")"
-trap 'rm -f "$HOOK_OUT"' EXIT
-
+# Hand off to the real control plane and emit its hook JSON byte-for-byte. zlauder-hooks
+# owns the routing decision now: it checks whether THIS session's ANTHROPIC_BASE_URL is
+# actually pointed at the proxy and, only then, launches/recycles it and announces that
+# masking is active — otherwise it stays a silent no-op (and nudges, on stderr, if the
+# project is configured but awaiting a restart). Single source of truth, no shell guard.
 set +e
 if [ -n "$CFG" ]; then
-  zlauder-hooks "${PORT_ARGS[@]}" session-start --config "$CFG" >"$HOOK_OUT"
+  zlauder-hooks "${PORT_ARGS[@]}" session-start --config "$CFG"
 else
-  zlauder-hooks "${PORT_ARGS[@]}" session-start >"$HOOK_OUT"
+  zlauder-hooks "${PORT_ARGS[@]}" session-start
 fi
 rc=$?
 set -e
-
-# Pass the hook JSON through UNCHANGED, regardless of the guard outcome.
-cat "$HOOK_OUT"
 
 if [ "$rc" -ne 0 ]; then
   warn "zlauder: zlauder-hooks session-start exited $rc."
   exit "$rc"
 fi
-
-# Resolve the port the proxy actually launched on from the hook JSON. session-start
-# emits {"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:<port>","ZLAUDER_PORT":"<port>"}};
-# this is the derived per-project port, not a guess. Fall back to $ZLAUDER_PORT if
-# parsing fails. jq is already a hard dependency (enable.sh/disable.sh).
-real_port=""
-if command -v jq >/dev/null 2>&1; then
-  real_port="$(jq -r '.env.ZLAUDER_PORT // empty' "$HOOK_OUT" 2>/dev/null)"
-fi
-real_port="${real_port:-${ZLAUDER_PORT:-}}"
-
-# Now that the proxy is up, warn if traffic isn't actually routed through it.
-route_guard "$real_port"
 
 exit 0

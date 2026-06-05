@@ -55,6 +55,11 @@ enum Cmd {
         #[arg(long, default_value = "zlauder-proxy")]
         proxy_bin: String,
     },
+    /// Reserve (O_EXCL) this project's derived proxy port and print it. Used by
+    /// `/zlauder:enable` to learn the port to bake into settings.json WITHOUT launching
+    /// the proxy or emitting SessionStart output — the proxy launches on the next
+    /// SessionStart that is actually routed through it (i.e. after the user restarts).
+    ReservePort,
     /// Print a one-line status indicator for the Claude Code status line.
     Statusline,
     /// View or change privacy settings (backs the `/zlauder:privacy` command).
@@ -169,6 +174,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::SessionStart { config, proxy_bin } => session_start(cli.port, config, proxy_bin),
+        Cmd::ReservePort => reserve_port_cmd(cli.port),
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(cli.port, action),
         Cmd::Reveal { token } => reveal(cli.port, token),
@@ -198,6 +204,41 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         None => reserve_port(&root)?,
     };
     let base_url = format!("http://127.0.0.1:{port}");
+
+    // Route gate (the load-bearing accuracy check). The SessionStart hook fires in
+    // EVERY project, because the plugin is installed globally — but the proxy is only
+    // relevant where `/zlauder:enable` wired `ANTHROPIC_BASE_URL` into the project's
+    // settings.json AND the user restarted, at which point Claude Code applies it and
+    // this hook subprocess inherits it. Announcing "masking active" or launching a
+    // proxy when this session is NOT actually pointed at us would be a lie (the exact
+    // misleading-status bug). So gate every side effect on the session's real base URL.
+    if !session_routed_through(&base_url) {
+        // Configured-but-not-applied (enabled, restart pending) gets a nudge; a project
+        // that never enabled zlauder stays a silent no-op.
+        if project_configures(&root, &base_url) {
+            eprintln!(
+                "zlauder: this project is configured for masking but ANTHROPIC_BASE_URL is \
+                 not {base_url} yet — RESTART Claude Code to route through the proxy. \
+                 Traffic is currently NOT masked."
+            );
+            println!(
+                "{}",
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext":
+                            "zlauder is configured for this project but masking is NOT active \
+                             this session: Claude Code must be restarted to route through the \
+                             proxy. Until then, outbound text reaches the model unmasked."
+                    }
+                })
+            );
+        } else {
+            println!("{}", json!({}));
+        }
+        return Ok(());
+    }
+
     let config = config.or_else(|| {
         let p = Path::new(&root).join("zlauder.toml");
         p.exists().then_some(p)
@@ -306,6 +347,24 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         "env": { "ANTHROPIC_BASE_URL": base_url, "ZLAUDER_PORT": port.to_string() }
     });
     println!("{out}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// reserve-port
+// ---------------------------------------------------------------------------
+
+/// Reserve this project's derived proxy port and print it (bare integer on stdout).
+/// `/zlauder:enable` calls this to learn the port to bake into settings.json. Unlike
+/// `session-start` it never launches the proxy or emits hook JSON — so it works during
+/// a first-time enable, where the session is not yet routed through the proxy.
+fn reserve_port_cmd(port: Option<u16>) -> Result<()> {
+    let root = canonical(&project_root());
+    let port = match port {
+        Some(p) => p,
+        None => reserve_port(&root)?,
+    };
+    println!("{port}");
     Ok(())
 }
 
@@ -954,6 +1013,51 @@ fn project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Does the current session's `ANTHROPIC_BASE_URL` (inherited from Claude Code, which
+/// applies it from the project's settings.json at startup) point at OUR proxy
+/// endpoint? Ground truth for "is this session actually masked through us?" — far more
+/// reliable than the mere presence of the globally-installed plugin. Accepts an exact
+/// match or a base-with-path (`{base}/…`) variant.
+fn session_routed_through(base_url: &str) -> bool {
+    match std::env::var("ANTHROPIC_BASE_URL") {
+        Ok(have) => base_url_matches(&have, base_url),
+        Err(_) => false,
+    }
+}
+
+/// Does `have` (an `ANTHROPIC_BASE_URL` value) route through our `want` proxy endpoint?
+/// Exact match, or `want` with a trailing path (`{want}/v1`), ignoring a trailing `/`.
+fn base_url_matches(have: &str, want: &str) -> bool {
+    let have = have.trim_end_matches('/');
+    let want = want.trim_end_matches('/');
+    have == want || have.starts_with(&format!("{want}/"))
+}
+
+/// Does the project's `.claude/settings.json` (or `settings.local.json`) wire
+/// `env.ANTHROPIC_BASE_URL` to our proxy `base_url`? True ⇒ `/zlauder:enable` ran here
+/// but the routing isn't applied to the live session yet (a restart is pending). Used
+/// only to pick a helpful "restart" nudge over silence when we are not routed.
+fn project_configures(root: &str, base_url: &str) -> bool {
+    for name in [".claude/settings.json", ".claude/settings.local.json"] {
+        let path = Path::new(root).join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if let Some(url) = v
+            .get("env")
+            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+            .and_then(|u| u.as_str())
+            && base_url_matches(url, base_url)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn canonical(p: &Path) -> String {
     std::fs::canonicalize(p)
         .unwrap_or_else(|_| p.to_path_buf())
@@ -1067,5 +1171,36 @@ fn clear_reservation_if_ours(port: u16, root: &str) {
         && let Ok(path) = zlauder_state::state_path(port)
     {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::base_url_matches;
+
+    #[test]
+    fn matches_exact_and_trailing_slash() {
+        let want = "http://127.0.0.1:18394";
+        assert!(base_url_matches("http://127.0.0.1:18394", want));
+        assert!(base_url_matches("http://127.0.0.1:18394/", want));
+        assert!(base_url_matches("http://127.0.0.1:18394", "http://127.0.0.1:18394/"));
+    }
+
+    #[test]
+    fn matches_base_with_path() {
+        let want = "http://127.0.0.1:18394";
+        assert!(base_url_matches("http://127.0.0.1:18394/v1", want));
+    }
+
+    #[test]
+    fn rejects_other_endpoints() {
+        let want = "http://127.0.0.1:18394";
+        // Different port (another project's proxy, or an unrelated gateway).
+        assert!(!base_url_matches("http://127.0.0.1:18395", want));
+        // Real Anthropic API (not routed through us).
+        assert!(!base_url_matches("https://api.anthropic.com", want));
+        // A different host that merely shares the port number as a prefix substring.
+        assert!(!base_url_matches("http://127.0.0.1:183940", want));
+        assert!(!base_url_matches("", want));
     }
 }
