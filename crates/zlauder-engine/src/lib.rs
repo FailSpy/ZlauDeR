@@ -51,7 +51,11 @@ struct Policy {
 }
 
 impl Policy {
-    fn new(config: EngineConfig) -> Result<Self, EngineError> {
+    fn new(mut config: EngineConfig) -> Result<Self, EngineError> {
+        // Detection failures are never allowed to pass plaintext upstream. Keep the
+        // old config field parseable for compatibility, but do not let persisted
+        // `fail_closed = false` or stale control-plane clients weaken the policy.
+        config.fail_closed = true;
         let customs = compile_customs(&config.custom_replacements)?;
         let policy_fp = config.detection_fingerprint();
         Ok(Self {
@@ -575,10 +579,10 @@ impl MaskEngine {
     }
 
     /// Run detection for a cache miss and (on success) populate the cache. A
-    /// detection error is NEVER cached (invariant #2): under `fail_closed` it
-    /// propagates (the proxy refuses the request); otherwise it is a fail-OPEN
-    /// passthrough (empty detection list, `fail_open` counted) that is recomputed
-    /// next turn rather than freezing a wrong "clean" result.
+    /// detection error is NEVER cached (invariant #2) and always propagates so the
+    /// proxy refuses the request rather than forwarding plaintext. This is distinct
+    /// from ML `Loading`, where no ML recognizer is active yet and regex-only
+    /// detection is the intended successful path.
     fn detect_and_cache(
         &self,
         policy: &Policy,
@@ -599,12 +603,8 @@ impl MaskEngine {
                 Ok(d)
             }
             Err(e) => {
-                if policy.config.fail_closed {
-                    return Err(e);
-                }
-                tracing::warn!("detection failed, passing text through unmasked: {e}");
-                stats.fail_open = 1;
-                Ok(Arc::new(Vec::new()))
+                tracing::warn!("detection failed, refusing request: {e}");
+                Err(e)
             }
         }
     }
@@ -1100,6 +1100,26 @@ mod tests {
             after.masked_text.contains("************1111"),
             "got: {}",
             after.masked_text
+        );
+    }
+
+    #[test]
+    fn fail_closed_false_is_ignored_for_live_policy() {
+        let mut cfg = EngineConfig {
+            fail_closed: false,
+            ..EngineConfig::default()
+        };
+        let e = MaskEngine::new(cfg.clone()).unwrap();
+        assert!(
+            e.config_snapshot().fail_closed,
+            "constructor must normalize deprecated fail_closed=false"
+        );
+
+        cfg.fail_closed = false;
+        e.set_config(cfg).unwrap();
+        assert!(
+            e.config_snapshot().fail_closed,
+            "live config swap must not weaken detection-error policy"
         );
     }
 

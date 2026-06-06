@@ -46,8 +46,9 @@ enabled_categories = ["secrets", "financial", "identity", "contact"]
 #   { kind = "keep" }                          detect but leave plaintext
 default_operator = { kind = "token" }
 
-# If true, a detection failure rejects the request instead of forwarding plaintext.
-fail_closed = false
+# Deprecated compatibility field. Detection failures always reject the request
+# instead of forwarding plaintext; `false` is ignored.
+fail_closed = true
 
 # Disable masking/unmasking on selected traffic surfaces. Usually leave empty.
 # Values: "user_message", "system_prompt", "tool_result", "assistant_text",

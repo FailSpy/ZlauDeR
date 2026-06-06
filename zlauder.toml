@@ -15,7 +15,7 @@ score_threshold = 0.5
 language = "en"
 enabled_categories = ["secrets", "financial", "identity", "contact"]
 default_operator = { kind = "token" }
-fail_closed = false
+fail_closed = true
 
 [engine.ml]
 enabled = false

@@ -10,7 +10,7 @@ score_threshold = 0.5
 language = "en"
 default_operator = { kind = "token" }
 enabled_categories = ["secrets", "financial", "identity", "contact"]
-fail_closed = false
+fail_closed = true
 
 [engine.allow_list]
 exact = ["Anthropic", "Claude"]

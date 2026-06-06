@@ -91,7 +91,7 @@ fn log_mask_stats(s: &MaskStats) {
 pub enum MaskError {
     #[error("request JSON error: {0}")]
     Json(#[source] serde_json::Error),
-    #[error("masking refused (fail_closed): {0}")]
+    #[error("masking refused: {0}")]
     Engine(#[source] EngineError),
 }
 

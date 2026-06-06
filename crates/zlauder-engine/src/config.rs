@@ -416,7 +416,9 @@ pub struct EngineConfig {
     pub entity_operators: HashMap<String, Operator>,
     #[serde(default = "default_language")]
     pub language: String,
-    #[serde(default)]
+    /// Deprecated compatibility field. Detection errors are always fail-closed;
+    /// config values of `false` are ignored at policy-install time.
+    #[serde(default = "default_true")]
     pub fail_closed: bool,
     #[serde(default)]
     pub disabled_surfaces: HashSet<Surface>,
@@ -496,7 +498,7 @@ impl Default for EngineConfig {
             default_operator: Operator::Token,
             entity_operators: HashMap::new(),
             language: "en".to_string(),
-            fail_closed: false,
+            fail_closed: true,
             disabled_surfaces: HashSet::new(),
             allow_list: AllowList::with_common_words(),
             custom_replacements: Vec::new(),
@@ -560,7 +562,7 @@ impl EngineConfig {
     /// EXCLUDES (so these apply WITHOUT a cache miss): operator VALUES and
     /// `default_operator` (resolved at apply time), the `enabled` master switch and
     /// `disabled_surfaces` (their effect is the un-cached early-return passthrough),
-    /// `fail_closed` (error policy, not detection), `profile` (only a seed for the
+    /// `fail_closed` (deprecated/no-op error policy), `profile` (only a seed for the
     /// derived fields), `ml` (covered by the separate `ml_fp`), `reveal_marker`
     /// (a display/apply-time decoration; the marker strip happens before this
     /// fingerprint is consulted, so the cache key already reflects its effect), and

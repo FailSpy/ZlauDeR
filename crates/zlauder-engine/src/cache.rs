@@ -137,8 +137,8 @@ impl DetectionCache {
         inner.get(k).cloned()
     }
 
-    /// Insert a SUCCESSFUL detection result (callers never insert a fail-open
-    /// passthrough — invariant #2). No-op when disabled. `cap` is re-read INSIDE the
+    /// Insert a SUCCESSFUL detection result (callers never insert detection-error
+    /// passthroughs — invariant #2). No-op when disabled. `cap` is re-read INSIDE the
     /// lock so a concurrent `set_cap(0)` (which clears under the same lock) can never
     /// be straddled by a late insert that resurrects an entry (audit #10).
     pub(crate) fn insert(&self, k: CacheKey, v: Arc<Vec<CachedDetection>>) {

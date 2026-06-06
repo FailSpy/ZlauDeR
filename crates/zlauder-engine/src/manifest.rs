@@ -73,7 +73,7 @@ impl UnmaskManifest {
 /// - `hit`: served from cache (incl. a single-flight gate re-check hit).
 /// - `fresh_miss`: ran `run_detection` successfully (its result is now cached).
 /// - `ml_ran`: the ML recognizer was consulted on this leaf (⊆ misses).
-/// - `fail_open`: detection errored and the leaf passed through (NOT cached).
+/// - `fail_open`: deprecated; detection errors now refuse the request.
 /// - `disabled`: master-switch-off / surface-disabled passthrough (no detection).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MaskStats {

@@ -206,8 +206,8 @@ async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifes
             StatusCode::BAD_REQUEST,
             &format!("unparseable request body, refusing to forward: {e}"),
         )),
-        // The engine refused to mask (fail_closed detection error, or an encryption
-        // failure). Either way we do NOT forward — refusing is the safe outcome.
+        // The engine refused to mask (detection error, or an encryption failure).
+        // Either way we do NOT forward — refusing is the safe outcome.
         Err(walk::MaskError::Engine(e)) => Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("masking error, request refused: {e}"),

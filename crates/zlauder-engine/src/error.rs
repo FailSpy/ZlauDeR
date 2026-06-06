@@ -8,7 +8,7 @@ pub enum EngineError {
     DecryptionFailed(String),
     #[error("mask() called with an unmask surface {0:?}")]
     WrongDirection(Surface),
-    #[error("detection failed (fail_closed): {0}")]
+    #[error("detection failed: {0}")]
     DetectionFailed(String),
     #[error("invalid custom regex {pattern:?}: {source}")]
     BadCustomRegex {
