@@ -110,7 +110,7 @@ impl MaskWalker<'_> {
                 SystemContent::Blocks(blocks) => {
                     for b in blocks.iter_mut() {
                         self.str(&mut b.text, Surface::SystemPrompt)?;
-                        self.map_safe(&mut b.extra, Surface::SystemPrompt)?;
+                        warn_unknown_map(&b.extra, "system block");
                     }
                 }
                 _ => {}
@@ -121,13 +121,14 @@ impl MaskWalker<'_> {
             for block in msg.content.iter_mut() {
                 self.block(block, &role)?;
             }
-            self.map_safe(&mut msg.extra, surface_for_role(&role))?;
+            warn_unknown_map(&msg.extra, "message");
         }
         if let Some(tools) = req.tools.as_mut() {
             for tool in tools.iter_mut() {
                 self.str(&mut tool.description, Surface::SystemPrompt)?;
                 // input_schema is left verbatim: masking schema constraints could
                 // break the model's tool-call validation.
+                warn_unknown_map(&tool.extra, "tool");
             }
         }
         if let Some(meta) = req.metadata.as_mut() {
@@ -136,7 +137,7 @@ impl MaskWalker<'_> {
         if let Some(ctx) = req.context_management.as_mut() {
             self.context_management(ctx)?;
         }
-        self.map_safe(&mut req.extra, Surface::UserMessage)?;
+        warn_unknown_map(&req.extra, "request");
         Ok(())
     }
 
@@ -227,20 +228,6 @@ impl MaskWalker<'_> {
                 }
             }
             _ => {}
-        }
-        Ok(())
-    }
-
-    fn map_safe(
-        &mut self,
-        m: &mut Map<String, Value>,
-        surface: Surface,
-    ) -> Result<(), EngineError> {
-        for (_k, val) in m.iter_mut() {
-            if preserves_contract_key(_k) {
-                continue;
-            }
-            self.value_safe(val, surface)?;
         }
         Ok(())
     }
@@ -380,6 +367,18 @@ fn is_context_management_protocol_key(key: &str) -> bool {
             | "clear_tool_inputs"
             | "exclude_tools"
     )
+}
+
+fn warn_unknown_map(m: &Map<String, Value>, location: &'static str) {
+    if m.is_empty() {
+        return;
+    }
+    let keys = m.keys().map(String::as_str).collect::<Vec<_>>().join(",");
+    tracing::warn!(
+        location,
+        keys = %keys,
+        "preserving unknown Anthropic request fields without masking"
+    );
 }
 
 fn surface_for_role(role: &str) -> Surface {
@@ -547,12 +546,11 @@ mod tests {
         let v: Value = serde_json::from_slice(&masked).unwrap();
         let s = String::from_utf8(masked.clone()).unwrap();
 
-        // R2 — unknown top-level key survives, and the unknown nested `extra`
-        // map is still walked (its PII is masked).
+        // R2 — unknown fields are preserved verbatim and not inspected/mutated.
         assert_eq!(v["x_future_flag"], serde_json::json!(true));
         assert!(
-            !s.contains("carol@example.com"),
-            "unknown-field PII leaked: {s}"
+            s.contains("carol@example.com"),
+            "unknown-field value should pass through unchanged: {s}"
         );
 
         // Arrow 1 — user text masked.
@@ -560,7 +558,7 @@ mod tests {
         // Arrow 4 — tool_result content masked.
         assert!(!s.contains("bob@example.com"), "tool_result email leaked");
         assert!(s.contains("[EMAIL_ADDRESS_"));
-        assert_eq!(manifest.len(), 3, "three distinct emails minted");
+        assert_eq!(manifest.len(), 2, "only known text-bearing fields are masked");
 
         // The masked tool_result round-trips back to plaintext.
         let masked_tr = v["messages"][1]["content"][0]["content"].as_str().unwrap();
