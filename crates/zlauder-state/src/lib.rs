@@ -128,8 +128,9 @@ pub fn read_state_opt(port: u16) -> Option<ProxyState> {
     read_state(port).ok()
 }
 
-/// Is `pid` (probably) a live process? Linux uses `/proc/<pid>`; elsewhere we
-/// conservatively assume alive (never steal a port we can't prove is dead).
+/// Is `pid` (probably) a live process? Linux uses `/proc/<pid>`, Windows asks the
+/// OS process table, and other platforms conservatively assume alive (never steal a
+/// port we can't prove is dead).
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -138,7 +139,30 @@ fn pid_alive(pid: u32) -> bool {
     {
         Path::new(&format!("/proc/{pid}")).exists()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let pid_s = pid.to_string();
+        let Ok(out) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return true;
+        };
+        if !out.status.success() {
+            return true;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .any(|line| {
+                line.split(',')
+                    .nth(1)
+                    .map(|field| field.trim_matches('"') == pid_s)
+                    .unwrap_or(false)
+            })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         true
     }

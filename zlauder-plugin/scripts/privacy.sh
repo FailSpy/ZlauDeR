@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/_resolve-bins.sh"
 zlauder_resolve_bins --no-build || true
 
-if ! command -v zlauder-hooks >/dev/null 2>&1; then
+if ! command -v "$ZLAUDER_HOOKS_BIN" >/dev/null 2>&1; then
   echo "error: zlauder-hooks is not available for this project yet (the ZlauDeR proxy is built and launched on session start). Start a Claude Code session in this project — or put the binaries on PATH — then retry." >&2
   exit 1
 fi
@@ -40,12 +40,12 @@ case "$sub" in
       echo "usage: /zlauder:privacy reveal <TOKEN>   (e.g. [EMAIL_ADDRESS_xxxx])" >&2
       exit 2
     fi
-    exec zlauder-hooks "${PORT_ARGS[@]}" reveal "$tok"
+    exec "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" reveal "$tok"
     ;;
   status | "")
     # One unified "where do I stand": proxy health, then routing, then masking config.
     echo "Proxy health:"
-    zlauder-hooks "${PORT_ARGS[@]}" statusline || true
+    "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" statusline || true
     echo
     echo "Routing (ANTHROPIC_BASE_URL in this project's .claude/settings.json):"
     settings="${CLAUDE_PROJECT_DIR:-.}/.claude/settings.json"
@@ -56,11 +56,11 @@ case "$sub" in
     fi
     echo
     echo "Masking:"
-    zlauder-hooks "${PORT_ARGS[@]}" config || true
+    "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config || true
     ;;
   on | off | profile | category | threshold)
     # Masking verbs (and any --scope flag) pass straight through to the CLI.
-    exec zlauder-hooks "${PORT_ARGS[@]}" config "$@"
+    exec "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config "$@"
     ;;
   model)
     # ML recognizer (openai/privacy-filter, CPU): download | status | on | off.
@@ -75,7 +75,7 @@ case "$sub" in
           echo "error: could not resolve/build zlauder-proxy for the model download." >&2
           exit 1
         }
-        if ! command -v zlauder-proxy >/dev/null 2>&1; then
+        if ! command -v "$ZLAUDER_PROXY_BIN" >/dev/null 2>&1; then
           echo "error: zlauder-proxy is not available for this project yet." >&2
           exit 1
         fi
@@ -84,11 +84,11 @@ case "$sub" in
         [ -f "$proj_cfg" ] && CFG_ARGS=(--config "$proj_cfg")
         MODEL_ARGS=()
         [ -n "${1:-}" ] && MODEL_ARGS=(--model "$1")
-        exec zlauder-proxy "${CFG_ARGS[@]}" --download-model "${MODEL_ARGS[@]}"
+        exec "$ZLAUDER_PROXY_BIN" "${CFG_ARGS[@]}" --download-model "${MODEL_ARGS[@]}"
         ;;
       on | off | status | "")
         # status / on / off go through the lean control CLI (no ml deps needed).
-        exec zlauder-hooks "${PORT_ARGS[@]}" config ml "$@"
+        exec "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config ml "$@"
         ;;
       *)
         echo "usage: /zlauder:privacy model [status | download [<repo>] | on | off] [--scope session|project|user|local]" >&2

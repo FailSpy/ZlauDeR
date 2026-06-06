@@ -93,6 +93,11 @@ Then, per project:
    are **shipped prebuilt per-platform** with the plugin (precedence: PATH →
    shipped `bin/<triple>` → cached/in-repo build), so a marketplace install needs
    **no compile and no download** — see [docs/RELEASING.md](./docs/RELEASING.md).
+   Shipped targets are `x86_64-unknown-linux-gnu`,
+   `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+   `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`.
+   Release assets use `zlauder-<triple>.tar.gz` for Linux/macOS and
+   `zlauder-x86_64-pc-windows-msvc.zip` for Windows.
 2. **Restart Claude Code** — `ANTHROPIC_BASE_URL` is read once at startup.
 3. **`/zlauder:privacy`** — confirm routing + masking.
 
@@ -100,6 +105,8 @@ A plugin cannot set `ANTHROPIC_BASE_URL` itself (only `agent`/`subagentStatusLin
 are honored from a plugin's settings.json, and there is no install-time hook), so
 the one-time `/zlauder:enable` patch and the restart are required. See
 [`zlauder-plugin/`](./zlauder-plugin/) for the full rationale and command reference.
+On Windows, plugin runtime support assumes Claude Code can run the plugin's existing
+bash scripts; native PowerShell/cmd wrappers are not included.
 
 The proxy can also be run standalone (no Claude Code, no per-project derivation):
 

@@ -96,7 +96,8 @@ session and no-ops once a working binary is found. Precedence:
 1. **On `PATH`** — an already-installed `zlauder-proxy` / `zlauder-hooks`.
 2. **`${CLAUDE_PLUGIN_ROOT}/bin/<triple>/`** — the prebuilt binary shipped for
    *your* platform (the normal marketplace path). `<triple>` is your Rust target
-   triple, e.g. `x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`.
+   triple, e.g. `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, or
+   `x86_64-pc-windows-msvc`.
 3. **`${CLAUDE_PLUGIN_ROOT}/bin/`** — a flat, hand-dropped binary.
 4. **`${CLAUDE_PLUGIN_DATA}/bin/`** — a binary this hook built on a prior session.
 5. **`<workspace>/target/release/`** — an in-repo `cargo build --release`.
@@ -109,11 +110,17 @@ session and no-ops once a working binary is found. Precedence:
 If none can produce a binary, the hook prints a clear error and exits non-zero.
 
 **Supported platforms (shipped binaries):** `x86_64` / `aarch64` Linux
-(glibc ≥ 2.35) and `x86_64` / `aarch64` macOS. On any other platform there is no
-shipped binary, so the hook falls through to the source build (which needs the
-cargo workspace + toolchain). In that case, put the binaries on your `PATH` —
-e.g. grab a tarball from the [GitHub Release](https://github.com/FailSpy/zlauder/releases)
-and drop them in `~/.local/bin` — or set `$ZLAUDER_WORKSPACE` to a checkout.
+(glibc ≥ 2.35), `x86_64` / `aarch64` macOS, and `x86_64` Windows
+(`x86_64-pc-windows-msvc`). Release assets are named `zlauder-<triple>.tar.gz`
+for Linux/macOS and `zlauder-x86_64-pc-windows-msvc.zip` for Windows. On Windows,
+runtime support assumes Claude Code can run this plugin's existing bash scripts;
+native PowerShell/cmd wrappers are not shipped.
+
+On any other platform there is no shipped binary, so the hook falls through to the
+source build (which needs the cargo workspace + toolchain). In that case, put the
+binaries on your `PATH` — e.g. grab an archive from the
+[GitHub Release](https://github.com/FailSpy/zlauder/releases) and drop them in
+`~/.local/bin` — or set `$ZLAUDER_WORKSPACE` to a checkout.
 
 ## Security and limitations
 

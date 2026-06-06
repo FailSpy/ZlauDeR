@@ -19,7 +19,7 @@
 #                                          network + access to the dep repos)
 #
 # <triple> is this host's Rust target triple (uname-derived), matching the per-
-# platform dirs CI ships and the zlauder-<triple>.tar.gz release assets. Pass
+# platform dirs CI ships and the zlauder-<triple>.tar.gz/.zip release assets. Pass
 # --no-build to stop before step 6 (a heavyweight build never makes a down proxy
 # answer, so read-only callers just report "unavailable").
 #
@@ -27,6 +27,13 @@
 # ZLAUDER_BIN_DIR is set to the resolved dir (empty string when already on PATH).
 
 zlauder__warn() { printf '%s\n' "$*" >&2; }
+
+zlauder__is_windows_bash() {
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # Repair CLAUDE_PLUGIN_ROOT when it isn't in the environment. Claude Code exports
 # it to SessionStart *hook* processes, but a slash-command `!bash` block only
@@ -45,12 +52,16 @@ fi
 
 # This host's Rust target triple, or "" if unsupported (-> falls through to a
 # source build). Must match the bin/<triple> dirs CI publishes on plugin-dist and
-# the zlauder-<triple>.tar.gz release assets (see .github/workflows/release.yml).
+# the zlauder-<triple>.tar.gz/.zip release assets (see .github/workflows/release.yml).
 zlauder__host_triple() {
   local os arch
   os="$(uname -s 2>/dev/null || true)"
   arch="$(uname -m 2>/dev/null || true)"
   case "$os" in
+    MINGW*|MSYS*|CYGWIN*)
+      case "$arch" in
+        x86_64|amd64) printf '%s\n' "x86_64-pc-windows-msvc" ;;
+      esac ;;
     Linux)
       case "$arch" in
         x86_64|amd64)  printf '%s\n' "x86_64-unknown-linux-gnu" ;;
@@ -63,6 +74,16 @@ zlauder__host_triple() {
       esac ;;
   esac
 }
+
+zlauder__exe_suffix() {
+  if zlauder__is_windows_bash; then
+    printf '%s\n' ".exe"
+  fi
+}
+
+export ZLAUDER_EXE_SUFFIX="${ZLAUDER_EXE_SUFFIX:-$(zlauder__exe_suffix)}"
+export ZLAUDER_PROXY_BIN="zlauder-proxy${ZLAUDER_EXE_SUFFIX}"
+export ZLAUDER_HOOKS_BIN="zlauder-hooks${ZLAUDER_EXE_SUFFIX}"
 
 # The cargo workspace root for the in-repo dev paths (steps 5-6): $ZLAUDER_WORKSPACE
 # if set, else ${CLAUDE_PLUGIN_ROOT}/.. (in-repo the plugin lives in the workspace).
@@ -80,9 +101,9 @@ zlauder__workspace() {
 zlauder__has_both() {
   local dir="$1"
   if [ -n "$dir" ]; then
-    [ -x "$dir/zlauder-proxy" ] && [ -x "$dir/zlauder-hooks" ]
+    [ -x "$dir/$ZLAUDER_PROXY_BIN" ] && [ -x "$dir/$ZLAUDER_HOOKS_BIN" ]
   else
-    command -v zlauder-proxy >/dev/null 2>&1 && command -v zlauder-hooks >/dev/null 2>&1
+    command -v "$ZLAUDER_PROXY_BIN" >/dev/null 2>&1 && command -v "$ZLAUDER_HOOKS_BIN" >/dev/null 2>&1
   fi
 }
 
@@ -114,12 +135,12 @@ zlauder__build_bins() {
   fi
 
   local rel="$workspace/target/release"
-  if [ ! -x "$rel/zlauder-proxy" ] || [ ! -x "$rel/zlauder-hooks" ]; then
+  if [ ! -x "$rel/$ZLAUDER_PROXY_BIN" ] || [ ! -x "$rel/$ZLAUDER_HOOKS_BIN" ]; then
     zlauder__warn "ZlauDeR: build reported success but binaries are missing under $rel."
     return 1
   fi
   mkdir -p "$data_dir/bin"
-  install -m 0755 "$rel/zlauder-proxy" "$rel/zlauder-hooks" "$data_dir/bin/"
+  install -m 0755 "$rel/$ZLAUDER_PROXY_BIN" "$rel/$ZLAUDER_HOOKS_BIN" "$data_dir/bin/"
   ZLAUDER_BIN_DIR="$data_dir/bin"
 }
 

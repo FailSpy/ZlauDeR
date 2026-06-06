@@ -42,7 +42,7 @@ if [ -n "${ZLAUDER_PORT:-}" ]; then
   # User pinned an explicit port; honor it.
   port="$ZLAUDER_PORT"
 elif [ "$bins_ok" -eq 1 ]; then
-  port="$(zlauder-hooks reserve-port 2>/dev/null < /dev/null || true)"
+  port="$("$ZLAUDER_HOOKS_BIN" reserve-port 2>/dev/null < /dev/null || true)"
 fi
 
 if [ -z "$port" ]; then
@@ -57,9 +57,9 @@ base_url="http://127.0.0.1:${port}"
 # a bare name when the binary is already on PATH. We set it only if absent (below), so
 # a stale path is refreshed by re-running /zlauder:enable; /zlauder:disable removes it.
 if [ -n "${ZLAUDER_BIN_DIR:-}" ]; then
-  statusline_cmd="${ZLAUDER_BIN_DIR}/zlauder-hooks statusline"
+  statusline_cmd="${ZLAUDER_BIN_DIR}/${ZLAUDER_HOOKS_BIN} statusline"
 else
-  statusline_cmd="zlauder-hooks statusline"
+  statusline_cmd="${ZLAUDER_HOOKS_BIN} statusline"
 fi
 
 project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"

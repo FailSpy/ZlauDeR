@@ -43,8 +43,7 @@ config_path() {
 }
 
 # Resolve (and, on first run, build) the binaries; this also prepends their dir
-# to PATH so the bare `zlauder-hooks` calls below and session-start's default
-# --proxy-bin "zlauder-proxy" both resolve.
+# to PATH so the hooks call below and session-start's default --proxy-bin resolve.
 if ! zlauder_resolve_bins; then
   warn "ZlauDeR: proxy not started this session."
   exit 1
@@ -59,9 +58,9 @@ CFG="$(config_path)"
 # project is configured but awaiting a restart). Single source of truth, no shell guard.
 set +e
 if [ -n "$CFG" ]; then
-  zlauder-hooks "${PORT_ARGS[@]}" session-start --config "$CFG"
+  "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" session-start --config "$CFG"
 else
-  zlauder-hooks "${PORT_ARGS[@]}" session-start
+  "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" session-start
 fi
 rc=$?
 set -e

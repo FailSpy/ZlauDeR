@@ -64,6 +64,7 @@ jobs:
           # `macos-15-intel` label exists until ~Aug 2027.
           - { target: x86_64-apple-darwin,        runner: macos-15 }
           - { target: aarch64-apple-darwin,       runner: macos-15 }
+          - { target: x86_64-pc-windows-msvc,     runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,16 +82,26 @@ jobs:
           t='${{ matrix.target }}'
           rel="target/$t/release"
           mkdir -p out
+          exe=""
+          archive="zlauder-$t.tar.gz"
+          if [[ "$t" == *-windows-msvc ]]; then
+            exe=".exe"
+            archive="zlauder-$t.zip"
+          fi
           # loose binaries -> assembled into plugin-dist bin/<triple>/ by `publish`
-          cp "$rel/zlauder-proxy" "out/zlauder-proxy-$t"
-          cp "$rel/zlauder-hooks" "out/zlauder-hooks-$t"
-          # tarball + checksum -> Release assets (mode preserved from the +x source)
-          tar -C "$rel" -czf "out/zlauder-$t.tar.gz" zlauder-proxy zlauder-hooks
+          cp "$rel/zlauder-proxy$exe" "out/zlauder-proxy-$t$exe"
+          cp "$rel/zlauder-hooks$exe" "out/zlauder-hooks-$t$exe"
+          # archive + checksum -> Release assets (mode preserved from the +x source)
+          if [ -n "$exe" ]; then
+            ( cd "$rel" && 7z a "$GITHUB_WORKSPACE/out/$archive" "zlauder-proxy$exe" "zlauder-hooks$exe" )
+          else
+            tar -C "$rel" -czf "out/$archive" zlauder-proxy zlauder-hooks
+          fi
           ( cd out
             if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "zlauder-$t.tar.gz" > "zlauder-$t.tar.gz.sha256"
+              sha256sum "$archive" > "$archive.sha256"
             else
-              shasum -a 256 "zlauder-$t.tar.gz" > "zlauder-$t.tar.gz.sha256"
+              shasum -a 256 "$archive" > "$archive.sha256"
             fi )
       - uses: actions/upload-artifact@v4
         with:
@@ -152,11 +163,16 @@ jobs:
           found=0
           for proxy in stage/zlauder-proxy-*; do
             found=1
-            t="$(basename "$proxy")"; t="${t#zlauder-proxy-}"
+            name="$(basename "$proxy")"
+            t="${name#zlauder-proxy-}"
+            exe=""
+            case "$t" in
+              *.exe) t="${t%.exe}"; exe=".exe" ;;
+            esac
             mkdir -p "pkg/bin/$t"
-            cp "stage/zlauder-proxy-$t" "pkg/bin/$t/zlauder-proxy"
-            cp "stage/zlauder-hooks-$t"  "pkg/bin/$t/zlauder-hooks"
-            chmod +x "pkg/bin/$t/zlauder-proxy" "pkg/bin/$t/zlauder-hooks"
+            cp "stage/zlauder-proxy-$t$exe" "pkg/bin/$t/zlauder-proxy$exe"
+            cp "stage/zlauder-hooks-$t$exe"  "pkg/bin/$t/zlauder-hooks$exe"
+            chmod +x "pkg/bin/$t/zlauder-proxy$exe" "pkg/bin/$t/zlauder-hooks$exe"
           done
           [ "$found" = 1 ] || { echo "::error::no staged binaries found"; exit 1; }
           # stamp the release tag + keep the shipped plugin.json version aligned to it
@@ -191,7 +207,7 @@ jobs:
         run: |
           set -euo pipefail
           tag='${{ steps.v.outputs.tag }}'
-          assets=(stage/*.tar.gz stage/*.sha256)
+          assets=(stage/*.tar.gz stage/*.zip stage/*.sha256)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --clobber
           else

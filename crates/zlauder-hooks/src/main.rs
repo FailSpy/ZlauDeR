@@ -52,7 +52,7 @@ enum Cmd {
     SessionStart {
         #[arg(long, env = "ZLAUDER_CONFIG")]
         config: Option<PathBuf>,
-        #[arg(long, default_value = "zlauder-proxy")]
+        #[arg(long, default_value_t = default_proxy_bin())]
         proxy_bin: String,
     },
     /// Reserve (O_EXCL) this project's derived proxy port and print it. Used by
@@ -69,6 +69,14 @@ enum Cmd {
     },
     /// Reveal a masked token's plaintext (local audit).
     Reveal { token: String },
+}
+
+fn default_proxy_bin() -> String {
+    if cfg!(windows) {
+        "zlauder-proxy.exe".to_string()
+    } else {
+        "zlauder-proxy".to_string()
+    }
 }
 
 #[derive(Subcommand)]
@@ -1097,20 +1105,32 @@ fn proxy_build_id(port: u16) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Stop the proxy on `port` so a fresh build can take its place. SIGINT to `pid`
-/// (the proxy shuts down gracefully on ctrl_c), wait for the listener to drop, then
-/// escalate to SIGKILL. The state file — and thus the token salt — is left intact,
-/// so the relaunched proxy reuses the same salt and tokens stay prompt-cache stable.
+/// Stop the proxy on `port` so a fresh build can take its place. The state file —
+/// and thus the token salt — is left intact, so the relaunched proxy reuses the same
+/// salt and tokens stay prompt-cache stable.
 fn stop_proxy(port: u16, pid: u32) {
-    let signal = |sig: &str| {
+    #[cfg(windows)]
+    let stop = |force: bool| {
         if pid != 0 {
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.arg("/PID").arg(pid.to_string()).arg("/T");
+            if force {
+                cmd.arg("/F");
+            }
+            let _ = cmd.status();
+        }
+    };
+    #[cfg(not(windows))]
+    let stop = |force: bool| {
+        if pid != 0 {
+            let sig = if force { "-KILL" } else { "-INT" };
             let _ = std::process::Command::new("kill")
                 .arg(sig)
                 .arg(pid.to_string())
                 .status();
         }
     };
-    signal("-INT");
+    stop(false);
     for _ in 0..60 {
         // ~3s graceful
         if !proxy_healthy(port) {
@@ -1118,7 +1138,7 @@ fn stop_proxy(port: u16, pid: u32) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    signal("-KILL");
+    stop(true);
     for _ in 0..40 {
         // ~2s backstop
         if !proxy_healthy(port) {

@@ -23,7 +23,7 @@ fi
 # partial edit), not just when the env keys are present.
 if ! jq -e '
   ((.env? // {}) | (has("ANTHROPIC_BASE_URL") or has("ZLAUDER_PORT")))
-  or (((.statusLine?.command) // "") | test("zlauder-hooks statusline"))
+  or (((.statusLine?.command) // "") | test("zlauder-hooks(\\.exe)? statusline"))
 ' "$settings" >/dev/null 2>&1; then
   echo "ZlauDeR already disabled: no ZlauDeR wiring in $settings"
   exit 0
@@ -37,7 +37,7 @@ jq '
   del(.env.ANTHROPIC_BASE_URL)
   | del(.env.ZLAUDER_PORT)
   | if (.env | type) == "object" and (.env | length) == 0 then del(.env) else . end
-  | if (((.statusLine?.command) // "") | test("zlauder-hooks statusline")) then del(.statusLine) else . end
+  | if (((.statusLine?.command) // "") | test("zlauder-hooks(\\.exe)? statusline")) then del(.statusLine) else . end
 ' "$settings" >"$tmp"
 mv -f "$tmp" "$settings"
 trap - EXIT
