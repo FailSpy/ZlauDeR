@@ -110,7 +110,7 @@ impl MaskWalker<'_> {
                 SystemContent::Blocks(blocks) => {
                     for b in blocks.iter_mut() {
                         self.str(&mut b.text, Surface::SystemPrompt)?;
-                        self.map(&mut b.extra, Surface::SystemPrompt)?;
+                        self.map_safe(&mut b.extra, Surface::SystemPrompt)?;
                     }
                 }
                 _ => {}
@@ -121,7 +121,7 @@ impl MaskWalker<'_> {
             for block in msg.content.iter_mut() {
                 self.block(block, &role)?;
             }
-            self.map(&mut msg.extra, surface_for_role(&role))?;
+            self.map_safe(&mut msg.extra, surface_for_role(&role))?;
         }
         if let Some(tools) = req.tools.as_mut() {
             for tool in tools.iter_mut() {
@@ -134,9 +134,9 @@ impl MaskWalker<'_> {
             self.value(meta, Surface::UserMessage)?;
         }
         if let Some(ctx) = req.context_management.as_mut() {
-            self.value(ctx, Surface::UserMessage)?;
+            self.context_management(ctx)?;
         }
-        self.map(&mut req.extra, Surface::UserMessage)?;
+        self.map_safe(&mut req.extra, Surface::UserMessage)?;
         Ok(())
     }
 
@@ -231,9 +231,50 @@ impl MaskWalker<'_> {
         Ok(())
     }
 
-    fn map(&mut self, m: &mut Map<String, Value>, surface: Surface) -> Result<(), EngineError> {
+    fn map_safe(
+        &mut self,
+        m: &mut Map<String, Value>,
+        surface: Surface,
+    ) -> Result<(), EngineError> {
         for (_k, val) in m.iter_mut() {
-            self.value(val, surface)?;
+            if preserves_contract_key(_k) {
+                continue;
+            }
+            self.value_safe(val, surface)?;
+        }
+        Ok(())
+    }
+
+    fn context_management(&mut self, v: &mut Value) -> Result<(), EngineError> {
+        self.value_skipping_protocol_keys(v, Surface::SystemPrompt)
+    }
+
+    fn value_skipping_protocol_keys(
+        &mut self,
+        v: &mut Value,
+        surface: Surface,
+    ) -> Result<(), EngineError> {
+        match v {
+            Value::String(s) => {
+                let outcome = self.engine.mask(s, surface)?;
+                *s = outcome.masked_text;
+                self.manifest.merge(outcome.manifest);
+                self.stats.merge(&outcome.stats);
+            }
+            Value::Array(a) => {
+                for item in a.iter_mut() {
+                    self.value_skipping_protocol_keys(item, surface)?;
+                }
+            }
+            Value::Object(o) => {
+                for (k, val) in o.iter_mut() {
+                    if is_context_management_protocol_key(k) {
+                        continue;
+                    }
+                    self.value_skipping_protocol_keys(val, surface)?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -260,13 +301,85 @@ impl MaskWalker<'_> {
                     if is_base64 && k == "data" {
                         continue;
                     }
-                    self.value_safe(val, surface)?;
+                    if k == "context_management" {
+                        self.context_management(val)?;
+                    } else if k == "tools" {
+                        self.tools_value_safe(val)?;
+                    } else if preserves_contract_key(k) {
+                        continue;
+                    } else {
+                        self.value_safe(val, surface)?;
+                    }
                 }
             }
             _ => {}
         }
         Ok(())
     }
+
+    fn tools_value_safe(&mut self, v: &mut Value) -> Result<(), EngineError> {
+        match v {
+            Value::Array(tools) => {
+                for tool in tools.iter_mut() {
+                    self.tool_value_safe(tool)?;
+                }
+            }
+            other => self.value_safe(other, Surface::SystemPrompt)?,
+        }
+        Ok(())
+    }
+
+    fn tool_value_safe(&mut self, v: &mut Value) -> Result<(), EngineError> {
+        match v {
+            Value::Object(o) => {
+                for (k, val) in o.iter_mut() {
+                    match k.as_str() {
+                        "description" => self.value_safe(val, Surface::SystemPrompt)?,
+                        "input_schema" | "cache_control" | "name" | "type" => {}
+                        _ if preserves_contract_key(k) => {}
+                        _ => self.value_safe(val, Surface::SystemPrompt)?,
+                    }
+                }
+            }
+            other => self.value_safe(other, Surface::SystemPrompt)?,
+        }
+        Ok(())
+    }
+}
+
+fn preserves_contract_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "tool_choice"
+            | "thinking"
+            | "output_config"
+            | "format"
+            | "json_schema"
+            | "schema"
+            | "input_schema"
+            | "cache_control"
+            | "id"
+            | "tool_use_id"
+            | "signature"
+            | "data"
+            | "media_type"
+            | "type"
+    )
+}
+
+fn is_context_management_protocol_key(key: &str) -> bool {
+    matches!(
+        key,
+        // Anthropic validates these as exact enum/tool-name strings. They are
+        // request-control metadata, not natural-language content.
+        "type"
+            | "keep"
+            | "trigger"
+            | "clear_at_least"
+            | "clear_tool_inputs"
+            | "exclude_tools"
+    )
 }
 
 fn surface_for_role(role: &str) -> Surface {
@@ -453,6 +566,134 @@ mod tests {
         let masked_tr = v["messages"][1]["content"][0]["content"].as_str().unwrap();
         let restored = e.unmask(masked_tr, &manifest).unwrap();
         assert_eq!(restored, "the admin is reachable at bob@example.com");
+    }
+
+    #[test]
+    fn context_management_protocol_tags_are_not_masked() {
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "context_management": {
+                "edits": [
+                    {
+                        "type": "clear_thinking_20251015",
+                        "keep": {"type": "thinking_turns", "value": 1}
+                    },
+                    {
+                        "type": "clear_tool_uses_20250919",
+                        "trigger": {"type": "input_tokens", "value": 150000},
+                        "clear_at_least": {"type": "input_tokens", "value": 50000},
+                        "clear_tool_inputs": ["Read", "Write"],
+                        "exclude_tools": ["Bash"]
+                    }
+                ]
+            },
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "email me at alice@example.com"}
+            ]}]
+        });
+
+        let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+
+        assert_eq!(
+            v["context_management"]["edits"][0]["type"],
+            serde_json::json!("clear_thinking_20251015")
+        );
+        assert_eq!(
+            v["context_management"]["edits"][0]["keep"]["type"],
+            serde_json::json!("thinking_turns")
+        );
+        assert_eq!(
+            v["context_management"]["edits"][1]["clear_tool_inputs"],
+            serde_json::json!(["Read", "Write"])
+        );
+        assert_eq!(
+            v["context_management"]["edits"][1]["exclude_tools"],
+            serde_json::json!(["Bash"])
+        );
+        let s = String::from_utf8(masked).unwrap();
+        assert!(!s.contains("alice@example.com"));
+        assert_eq!(manifest.len(), 1);
+    }
+
+    #[test]
+    fn context_management_protocol_tags_survive_fallback_walk() {
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "context_management": {
+                "edits": [{
+                    "type": "clear_thinking_20251015",
+                    "keep": {"type": "thinking_turns", "value": 1}
+                }]
+            },
+            "messages": [
+                {"role": "system", "content": "ops contact is sue@example.com"}
+            ]
+        });
+
+        let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        let s = String::from_utf8(masked).unwrap();
+
+        assert_eq!(
+            v["context_management"]["edits"][0]["type"],
+            serde_json::json!("clear_thinking_20251015")
+        );
+        assert_eq!(
+            v["context_management"]["edits"][0]["keep"]["type"],
+            serde_json::json!("thinking_turns")
+        );
+        assert!(!s.contains("sue@example.com"));
+        assert_eq!(manifest.len(), 1);
+    }
+
+    #[test]
+    fn fallback_walk_preserves_contract_fields_but_masks_tool_description() {
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "tools": [{
+                "name": "send_email",
+                "description": "Send mail to ops@example.com",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "email": {"type": "string", "format": "email", "const": "schema@example.com"}
+                    }
+                }
+            }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"const": "schema2@example.com"}
+                }
+            },
+            "messages": [
+                {"role": "system", "content": "fallback contact is user@example.com"}
+            ]
+        });
+
+        let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        let s = String::from_utf8(masked).unwrap();
+
+        assert_eq!(v["tools"][0]["name"], serde_json::json!("send_email"));
+        assert_eq!(
+            v["tools"][0]["input_schema"]["properties"]["email"]["const"],
+            serde_json::json!("schema@example.com")
+        );
+        assert_eq!(
+            v["output_config"]["format"]["schema"]["const"],
+            serde_json::json!("schema2@example.com")
+        );
+        assert!(!s.contains("ops@example.com"));
+        assert!(!s.contains("user@example.com"));
+        assert_eq!(manifest.len(), 2);
     }
 
     #[test]
