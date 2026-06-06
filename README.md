@@ -127,7 +127,7 @@ the separate **routing** layer.
 /zlauder:privacy model download         # fetch the openai/privacy-filter model (once)
 /zlauder:privacy model on               # turn the ML recognizer on (loads in background)
 /zlauder:privacy model status           # disabled | loading | ready | failed
-/zlauder:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local audit)
+/zlauder:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local debug/audit)
 ```
 
 Each change takes a `--scope` (default `session`):
@@ -146,6 +146,10 @@ project has its own proxy, a live change here is isolated — it never affects a
 > The control endpoints are gated by the session key (`x-zlauder-key`, from the
 > `0600` state file), so a blind tool-driven `curl …/zlauder/disable` (e.g. via
 > prompt injection) can't silently turn masking off.
+>
+> `reveal <token>` is mainly a local debug/audit escape hatch for tokens found in
+> logs, captured masked payloads, or test output. Normal assistant responses are
+> un-masked automatically.
 
 ### `zlauder.toml`
 
@@ -223,21 +227,6 @@ suffix = "$"   #   (see zlauder.toml; written with the TOML \uXXXX escape)
   like `prefix = suffix = "$"`. Pick markers that don't occur in ordinary prose —
   the strip removes the **exact** literal from re-sent history (the ANSI escapes
   never collide; a backtick or `*` would over-strip code/emphasis).
-
-## Audit / reveal
-
-Normally you never see a token (responses are unmasked). To decode one seen in a
-`thinking` block:
-
-```sh
-zlauder-hooks reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'
-```
-
-The reveal (and `/zlauder:privacy` control) endpoints are gated by a control token
-(`x-zlauder-key`, from the `0600` state file), so they aren't a trivial
-deanonymization/disable oracle for a tool-driven `curl`. The token is *derived*
-from the session key (blake3), not the key itself — the AES key never leaves proxy
-memory, so the state file grants control but not offline decryption.
 
 ## Threat model & limitations
 
