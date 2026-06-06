@@ -30,6 +30,7 @@ presidio-analyzer   = { git = "https://github.com/FailSpy/presidio-rs.git", bran
 presidio-classifier = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
 
 anthropic-wire = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
+openai-wire    = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
 sse-core       = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
 
 # masking engine

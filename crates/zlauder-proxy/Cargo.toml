@@ -18,6 +18,7 @@ zlauder-engine = { path = "../zlauder-engine", version = "0.1.0", features = ["m
 zlauder-state  = { path = "../zlauder-state",  version = "0.1.0" }
 
 anthropic-wire = { workspace = true }
+openai-wire    = { workspace = true }
 sse-core       = { workspace = true }
 
 axum       = { workspace = true }

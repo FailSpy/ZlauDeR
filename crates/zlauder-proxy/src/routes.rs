@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::UnmaskManifest;
 
-use crate::{admin, headers, sse, state::AppState, walk};
+use crate::{admin, headers, openai_chat, openai_responses, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -32,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .route("/zlauder/ml/disable", post(admin::ml_disable))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/chat/completions", post(openai_chat::chat_completions))
+        .route("/v1/responses", post(openai_responses::responses))
         .fallback(passthrough)
         .with_state(state)
 }
@@ -132,6 +134,10 @@ async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
 
 /// Everything else (`/v1/models`, `/v1/files`, batches, …): relay verbatim.
 async fn passthrough(State(st): State<AppState>, req: Request) -> Response {
+    relay_verbatim(&st, req).await
+}
+
+pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -186,7 +192,8 @@ async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifes
     let result = if st.engine.ml_should_offload() {
         let engine = st.engine.clone();
         let body = body.to_vec();
-        match tokio::task::spawn_blocking(move || walk::mask_request(engine.as_ref(), &body)).await {
+        match tokio::task::spawn_blocking(move || walk::mask_request(engine.as_ref(), &body)).await
+        {
             Ok(r) => r,
             Err(join) => {
                 return Err(err(
@@ -216,7 +223,7 @@ async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifes
 }
 
 #[allow(clippy::result_large_err)]
-async fn send_upstream(
+pub(crate) async fn send_upstream(
     st: &AppState,
     parts: &http::request::Parts,
     body: Vec<u8>,
@@ -233,14 +240,14 @@ async fn send_upstream(
         .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("upstream error: {e}")))
 }
 
-fn respond(status: StatusCode, headers: http::HeaderMap, body: Body) -> Response {
+pub(crate) fn respond(status: StatusCode, headers: http::HeaderMap, body: Body) -> Response {
     let mut r = Response::new(body);
     *r.status_mut() = status;
     *r.headers_mut() = headers;
     r
 }
 
-fn err(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn err(status: StatusCode, msg: &str) -> Response {
     let mut r = Response::new(Body::from(msg.to_string()));
     *r.status_mut() = status;
     r

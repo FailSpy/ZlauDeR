@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::response::Json;
+use axum::response::{IntoResponse, Json};
 use axum::routing::post;
-use http::HeaderMap;
+use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::{EngineConfig, MaskEngine, token_regex};
 use zlauder_proxy::{config::ConfigLayers, routes::router as proxy_router, state::AppState};
 
@@ -60,6 +60,77 @@ async fn fake_upstream(
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 1, "output_tokens": 1}
     }))
+}
+
+async fn fake_openai_chat_upstream(
+    State(cap): State<Captured>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Json<serde_json::Value> {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    cap.bodies.lock().unwrap().push(s.clone());
+    *cap.headers.lock().unwrap() = headers;
+    let tok = token_regex()
+        .find(&s)
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "id": "chatcmpl_test",
+        "object": "chat.completion",
+        "model": "gpt-test",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": format!("ack {tok}"),
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "send", "arguments": format!("{{\"email\":\"{tok}\"}}")}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+}
+
+async fn fake_openai_chat_stream_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    cap.bodies.lock().unwrap().push(s.clone());
+    let tok = token_regex()
+        .find(&s)
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    let data1 = serde_json::json!({
+        "id": "chatcmpl_stream",
+        "object": "chat.completion.chunk",
+        "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"content": format!("ack {tok}")}, "finish_reason": null}]
+    });
+    let data2 = serde_json::json!({
+        "id": "chatcmpl_stream",
+        "object": "chat.completion.chunk",
+        "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {data1}\n\ndata: {data2}\n\ndata: [DONE]\n\n");
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+async fn fake_responses_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> Json<serde_json::Value> {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    cap.bodies.lock().unwrap().push(s.clone());
+    Json(serde_json::from_str(&s).unwrap())
 }
 
 async fn spawn(router: Router) -> SocketAddr {
@@ -130,6 +201,133 @@ async fn end_to_end_mask_unmask_and_header_passthrough() {
         !client_text.contains("[EMAIL_ADDRESS_"),
         "token leaked to client: {client_text}"
     );
+}
+
+#[tokio::test]
+async fn openai_chat_completions_mask_unmask_and_header_passthrough() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "test-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer sk-secret-123")
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "write to dana@example.com please"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let client_text = resp.text().await.unwrap();
+
+    let up_body = cap.body.lock().unwrap().clone();
+    assert!(
+        !up_body.contains("dana@example.com"),
+        "plaintext leaked upstream: {up_body}"
+    );
+    assert!(up_body.contains("[EMAIL_ADDRESS_"));
+
+    let up_headers = cap.headers.lock().unwrap().clone();
+    assert_eq!(
+        up_headers.get("authorization").map(|v| v.to_str().unwrap()),
+        Some("Bearer sk-secret-123")
+    );
+
+    assert!(
+        client_text.contains("dana@example.com"),
+        "response not unmasked: {client_text}"
+    );
+    assert!(
+        !client_text.contains("[EMAIL_ADDRESS_"),
+        "token leaked to client: {client_text}"
+    );
+    assert!(
+        client_text.contains("{\\\"email\\\":\\\"dana@example.com\\\"}"),
+        "tool arguments were not unmasked without markers: {client_text}"
+    );
+}
+
+#[tokio::test]
+async fn openai_chat_completions_streaming_unmasks_and_preserves_done() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(fake_openai_chat_stream_upstream),
+        )
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "test-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let text = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "stream": true,
+            "messages": [{"role": "user", "content": "write to stream@example.com please"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let up_body = cap.body.lock().unwrap().clone();
+    assert!(!up_body.contains("stream@example.com"));
+    assert!(up_body.contains("[EMAIL_ADDRESS_"));
+    assert!(text.contains("stream@example.com"), "not unmasked: {text}");
+    assert!(
+        text.contains("data: [DONE]"),
+        "DONE marker not preserved: {text}"
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_routes_through_passthrough_boundary() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "test-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let body = serde_json::json!({
+        "model": "gpt-test",
+        "input": "leave response@example.com unchanged for now"
+    });
+    let client = reqwest::Client::new();
+    let out: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let up_body = cap.body.lock().unwrap().clone();
+    assert!(
+        up_body.contains("response@example.com"),
+        "Responses should currently pass through unchanged: {up_body}"
+    );
+    assert_eq!(out, body);
 }
 
 // Deterministic placeholders within a session: the SAME request masked twice
@@ -315,7 +513,10 @@ async fn ml_endpoints_gated_and_snapshot_shape() {
         .unwrap();
     assert_eq!(cfg["ml"]["enabled"], serde_json::json!(false));
     assert_eq!(cfg["ml"]["status"], serde_json::json!("disabled"));
-    assert_eq!(cfg["ml"]["model"], serde_json::json!("openai/privacy-filter"));
+    assert_eq!(
+        cfg["ml"]["model"],
+        serde_json::json!("openai/privacy-filter")
+    );
 
     // Enabling is key-gated (no key → 403, and crucially triggers no load).
     let unauth = client
