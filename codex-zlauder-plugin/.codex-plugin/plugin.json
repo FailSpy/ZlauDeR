@@ -1,6 +1,6 @@
 {
   "name": "zlauder-openai",
-  "version": "0.1.0",
+  "version": "0.3.3",
   "description": "Launch a per-project ZlauDeR proxy for Codex's OpenAI provider.",
   "author": {
     "name": "failspy",
