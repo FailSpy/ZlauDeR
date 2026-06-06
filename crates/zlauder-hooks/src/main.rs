@@ -35,6 +35,8 @@ use serde_json::{Value, json};
 use zlauder_engine::{EngineConfig, Profile};
 use zlauder_state::{pick_port, read_state, reserve_port};
 
+mod transcript;
+
 #[derive(Parser)]
 #[command(name = "zlauder-hooks", version, about)]
 struct Cli {
@@ -69,6 +71,27 @@ enum Cmd {
     },
     /// Reveal a masked token's plaintext (local audit).
     Reveal { token: String },
+    /// Redact burned plaintext values from a Claude Code transcript JSONL file.
+    Scrub {
+        /// Transcript JSONL file to mutate.
+        #[arg(long)]
+        transcript: PathBuf,
+        /// Plaintext value to redact. Repeat for multiple burned values.
+        #[arg(long = "value")]
+        values: Vec<String>,
+        /// File containing one plaintext value per line.
+        #[arg(long)]
+        values_file: Option<PathBuf>,
+        /// Print the planned mutation but do not write the file.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replacement string for redacted values.
+        #[arg(long, default_value = "[REDACTED]")]
+        replacement: String,
+        /// Keep thinking blocks instead of dropping contaminated thinking.
+        #[arg(long)]
+        keep_thinking: bool,
+    },
 }
 
 fn default_proxy_bin() -> String {
@@ -186,7 +209,72 @@ fn main() -> Result<()> {
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(cli.port, action),
         Cmd::Reveal { token } => reveal(cli.port, token),
+        Cmd::Scrub {
+            transcript,
+            values,
+            values_file,
+            dry_run,
+            replacement,
+            keep_thinking,
+        } => scrub_cmd(
+            transcript,
+            values,
+            values_file,
+            dry_run,
+            replacement,
+            keep_thinking,
+        ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// scrub
+// ---------------------------------------------------------------------------
+
+fn scrub_cmd(
+    path: PathBuf,
+    mut values: Vec<String>,
+    values_file: Option<PathBuf>,
+    dry_run: bool,
+    replacement: String,
+    keep_thinking: bool,
+) -> Result<()> {
+    if let Some(values_file) = values_file {
+        let text = std::fs::read_to_string(&values_file)
+            .with_context(|| format!("reading {}", values_file.display()))?;
+        values.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    let opts = transcript::ScrubOptions {
+        values,
+        replacement,
+        drop_thinking: !keep_thinking,
+    };
+    let report = transcript::scrub_file(&path, &opts, dry_run)?;
+    if dry_run {
+        println!(
+            "dry run: would redact {} string occurrence(s), remove {} thinking record(s), relink {} parent pointer(s).",
+            report.redactions, report.removed_thinking_records, report.relinked_records
+        );
+    } else {
+        println!(
+            "scrubbed {}: redacted {} string occurrence(s), removed {} thinking record(s), relinked {} parent pointer(s). backup: {}",
+            path.display(),
+            report.redactions,
+            report.removed_thinking_records,
+            report.relinked_records,
+            report
+                .backup_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(none)".to_string())
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

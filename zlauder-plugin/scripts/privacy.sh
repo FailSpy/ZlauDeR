@@ -62,6 +62,10 @@ case "$sub" in
     # Masking verbs (and any --scope flag) pass straight through to the CLI.
     exec "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config "$@"
     ;;
+  scrub)
+    shift || true
+    exec "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" scrub "$@"
+    ;;
   model)
     # ML recognizer (openai/privacy-filter, CPU): download | status | on | off.
     shift || true
@@ -97,7 +101,7 @@ case "$sub" in
     esac
     ;;
   *)
-    echo "unknown subcommand '$sub'. usage: /zlauder:privacy [status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token>] [--scope session|project|user|local]" >&2
+    echo "unknown subcommand '$sub'. usage: /zlauder:privacy [status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token> | scrub --transcript <jsonl> (--value <text> | --values-file <file>)] [--scope session|project|user|local]" >&2
     exit 2
     ;;
 esac

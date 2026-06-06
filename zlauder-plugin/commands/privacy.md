@@ -1,6 +1,6 @@
 ---
-description: View or change ZlauDeR PII-masking for this project — status, on/off, profile, category, threshold, ML model, and token reveal
-argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token>] [--scope session|project|user|local]"
+description: View or change ZlauDeR PII-masking for this project — status, on/off, profile, category, threshold, ML model, token reveal, and transcript scrub
+argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token> | scrub --transcript <jsonl> (--value <text> | --values-file <file>)] [--scope session|project|user|local]"
 allowed-tools: Bash(bash:*)
 ---
 
@@ -43,5 +43,9 @@ Report the result concisely:
 - For `reveal <token>`: present the decoded plaintext. If it failed (unknown token,
   proxy down, binary unavailable), relay the error verbatim and explain the likely
   cause.
+- For `scrub --transcript <jsonl> (--value <text> | --values-file <file>)`: report
+  the redaction count, removed thinking records, relinked parent pointers, and
+  backup path. For values containing spaces, prefer `--values-file`; the slash
+  wrapper splits arguments conservatively.
 
 Never print or echo the session/control key.
