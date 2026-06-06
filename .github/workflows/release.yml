@@ -145,7 +145,7 @@ jobs:
           set -euo pipefail
           tag='${{ steps.v.outputs.tag }}'
           rm -rf pkg && mkdir pkg
-          # the plugin itself: manifest, commands, hooks, scripts, zlauder.toml, README
+          # the plugin itself: manifest, commands, hooks, scripts, configs, README
           cp -a zlauder-plugin/. pkg/
           # per-platform binaries: stage/zlauder-{proxy,hooks}-<triple> -> pkg/bin/<triple>/
           shopt -s nullglob

@@ -1,5 +1,5 @@
 ---
-description: Set up + route this project's Claude Code through the ZlauDeR masking proxy (patches .claude/settings.json, seeds zlauder.toml; requires restart)
+description: Set up + route this project's Claude Code through the ZlauDeR masking proxy (patches .claude/settings.json, seeds practical zlauder.toml; requires restart)
 allowed-tools: Bash(bash:*)
 ---
 
@@ -9,7 +9,8 @@ Script output:
 
 This is the per-project setup step (the plugin can't set these itself). It patches
 this project's `.claude/settings.json` with `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`
-(routing) and a `🛡` status line, and seeds a starter `zlauder.toml` if absent.
+(routing) and a `🛡` status line, and seeds a practical starter `zlauder.toml`
+if absent. The exhaustive reference is `zlauder.toml.example`.
 
 Report the result above, then STRONGLY emphasize the one thing that matters: the
 `ANTHROPIC_BASE_URL` patch only takes effect on a fresh harness, so the user MUST

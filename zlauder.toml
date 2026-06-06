@@ -1,5 +1,7 @@
-# zlauder runtime configuration.
-# Passed to the proxy via `--config` (the SessionStart hook does this).
+# ZlauDeR runtime config.
+#
+# This is the practical default used when running the proxy from this checkout.
+# For the full annotated config surface, see zlauder.toml.example.
 
 [proxy]
 port = 8787
@@ -7,70 +9,27 @@ bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 
 [engine]
-# Master on/off switch. `/zlauder:privacy off` (or `zlauder-hooks config off`) flips this.
 enabled = true
-# Detection sensitivity preset is informational; the explicit fields below win.
 profile = "balanced"
-# Presidio confidence floor (0.0–1.0). Lower = more aggressive.
 score_threshold = 0.5
 language = "en"
-# Default reversible operator. Alternatives below under [engine.entity_operators].
-default_operator = { kind = "token" }
-# Which entity categories to mask. "personal" (PERSON/LOCATION/ORG) is free-text
-# and needs the ML recognizer below — once that is on, add "personal" here (or run
-# `/zlauder:privacy category personal on`).
 enabled_categories = ["secrets", "financial", "identity", "contact"]
-# If true, a detection error refuses the request instead of forwarding plaintext.
+default_operator = { kind = "token" }
 fail_closed = false
 
-# Optional ML recognizer: openai/privacy-filter on a native-Rust Candle CPU
-# backend. Adds free-text detection (names, locations, …). Off by default; download
-# the model once with `/zlauder:privacy model download`, then `model on` (it loads
-# in the background — masking stays regex-only until it reports `ready`).
 [engine.ml]
 enabled = false
 model = "openai/privacy-filter"
-# revision   = "main"
-# min_score  = 0.5
-# prefer_gpu = false
 
-# Display-time highlighting of UN-MASKED values in the assistant's replies, so you
-# can see at a glance which spans were restored from a token. Applies ONLY to the
-# assistant's prose (never tool inputs/results), and the marker is stripped back off
-# before the reply is re-sent upstream — so it adds zero noise to API requests and
-# never changes what the model sees. The default prefix/suffix are ANSI escapes
-# (bright-white fg on a blue bg, then reset): out-of-band, so the model can't emit or
-# override them. If your terminal/harness shows literal escape junk instead of color,
-# swap to printable markers — e.g. prefix = suffix = "$" — bearing in mind the strip
-# removes the EXACT literal from re-sent history, so pick markers that don't occur in
-# ordinary prose (avoid backticks/asterisks). `\u001b` is the TOML escape for ESC.
 [engine.reveal_marker]
 enabled = true
-prefix = "\u001b[97;44m"   # ESC[97;44m → bright-white fg on blue bg
-suffix = "\u001b[0m"       # ESC[0m     → reset
+prefix = "\u001b[97;44m"
+suffix = "\u001b[0m"
 
-# Per-entity-type operator overrides (optional).
 [engine.entity_operators]
-CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }   # ************1111
-# PASSWORD  = { kind = "redact" }                            # irreversible
+CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }
 
-# Values that must never be tokenized. `patterns` are regexes.
 [engine.allow_list]
 exact = ["Anthropic", "Claude", "127.0.0.1"]
 exact_ci = ["localhost"]
 patterns = ['^\d{4}$']
-
-# Custom rules. priority: lower = higher precedence. is_regex=false ⇒ literal.
-# literal_token=true emits the fixed `token` verbatim (still reversible).
-# [[engine.custom_replacements]]
-# pattern = "ACME-INTERNAL-CODENAME"
-# entity_type = "CODENAME"
-# is_regex = false
-# literal_token = true
-# token = "[CODENAME_acme]"
-
-# [[engine.custom_replacements]]
-# pattern = '\bEMP-\d{6}\b'
-# entity_type = "EMPLOYEE_ID"
-# is_regex = true
-# priority = 10

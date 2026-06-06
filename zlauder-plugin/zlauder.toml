@@ -1,64 +1,35 @@
-# zlauder runtime configuration.
-# Passed to the proxy via `--config` (the SessionStart hook does this).
+# ZlauDeR project config.
+#
+# This is the practical default seeded by /zlauder:enable. For the full annotated
+# config surface, see zlauder.toml.example in the plugin or main repo.
 
 [proxy]
-# No static `port` here: the SessionStart hook derives a per-project port
-# (18000..20000) and launches the proxy with an explicit --port, so a fixed value
-# would be dead, misleading config. Set $ZLAUDER_PORT to pin one.
+# No static port here: each project gets a derived port, passed as --port.
 bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 
 [engine]
-# Detection sensitivity preset is informational; the explicit fields below win.
+enabled = true
 profile = "balanced"
-# Presidio confidence floor (0.0–1.0). Lower = more aggressive.
 score_threshold = 0.5
 language = "en"
-# Default reversible operator. Alternatives below under [engine.entity_operators].
-default_operator = { kind = "token" }
-# Which entity categories to mask. "personal" (PERSON/LOCATION/ORG) is free-text
-# and needs the ML recognizer below — once that is on, add "personal" here (or run
-# `/zlauder:privacy category personal on`).
 enabled_categories = ["secrets", "financial", "identity", "contact"]
-# If true, a detection error refuses the request instead of forwarding plaintext.
+default_operator = { kind = "token" }
 fail_closed = false
 
-# Optional ML recognizer: openai/privacy-filter on a native-Rust Candle CPU
-# backend. Adds free-text detection (names, locations, …) the regex recognizers
-# can't do. Off by default; the model must be downloaded once.
-#   1) /zlauder:privacy model download     (caches the weights — large/slow first run)
-#   2) set enabled = true  (or /zlauder:privacy model on) — loads in the BACKGROUND;
-#      masking stays regex-only until the model reports `ready`.
-#   3) enable the "personal" category to actually mask names/locations.
 [engine.ml]
 enabled = false
 model = "openai/privacy-filter"
-# revision   = "main"     # pin a branch/tag/commit
-# min_score  = 0.5        # recognizer score floor (separate from score_threshold)
-# prefer_gpu = false      # CPU by default; GPU backends are not compiled in
 
-# Per-entity-type operator overrides (optional).
+[engine.reveal_marker]
+enabled = true
+prefix = "\u001b[97;44m"
+suffix = "\u001b[0m"
+
 [engine.entity_operators]
-CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }   # ************1111
-# PASSWORD  = { kind = "redact" }                            # irreversible
+CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }
 
-# Values that must never be tokenized. `patterns` are regexes.
 [engine.allow_list]
 exact = ["Anthropic", "Claude", "127.0.0.1"]
 exact_ci = ["localhost"]
 patterns = ['^\d{4}$']
-
-# Custom rules. priority: lower = higher precedence. is_regex=false ⇒ literal.
-# literal_token=true emits the fixed `token` verbatim (still reversible).
-# [[engine.custom_replacements]]
-# pattern = "ACME-INTERNAL-CODENAME"
-# entity_type = "CODENAME"
-# is_regex = false
-# literal_token = true
-# token = "[CODENAME_acme]"
-
-# [[engine.custom_replacements]]
-# pattern = '\bEMP-\d{6}\b'
-# entity_type = "EMPLOYEE_ID"
-# is_regex = true
-# priority = 10

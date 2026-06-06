@@ -88,7 +88,7 @@ Then, per project:
 
 1. **`/zlauder:enable`** — picks a free per-project port and writes
    `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a status line)
-   plus a starter `zlauder.toml`. The plugin's `SessionStart` hook resolves the
+   plus a practical starter `zlauder.toml`. The plugin's `SessionStart` hook resolves the
    binaries and launches the proxy automatically. `zlauder-proxy` / `zlauder-hooks`
    are **shipped prebuilt per-platform** with the plugin (precedence: PATH →
    shipped `bin/<triple>` → cached/in-repo build), so a marketplace install needs
@@ -149,7 +149,9 @@ project has its own proxy, a live change here is isolated — it never affects a
 
 ### `zlauder.toml`
 
-See [`zlauder.toml`](./zlauder.toml). Highlights:
+[`zlauder.toml`](./zlauder.toml) is the practical default config. For an
+annotated reference that enumerates optional and advanced fields, see
+[`zlauder.toml.example`](./zlauder.toml.example). Highlights:
 
 - `enabled` — master switch (`/zlauder:privacy on`/`off`).
 - `profile` / `score_threshold` / `enabled_categories` — what to detect.

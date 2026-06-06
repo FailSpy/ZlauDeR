@@ -209,6 +209,46 @@ mod tests {
     }
 
     #[test]
+    fn loads_repo_zlauder_toml_example() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../zlauder.toml.example");
+        let cfg = load(Some(&path)).expect("zlauder.toml.example should parse");
+
+        assert_eq!(cfg.port, 8787);
+        assert!(cfg.engine.enabled);
+        assert_eq!(cfg.engine.detection_cache_cap, 50_000);
+        assert!(cfg.engine.reveal_marker.enabled);
+        assert!(cfg.engine.allow_list.is_allowed("1234"));
+    }
+
+    #[test]
+    fn loads_plugin_seed_zlauder_toml() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../zlauder-plugin/zlauder.toml");
+        let cfg = load(Some(&path)).expect("plugin zlauder.toml should parse");
+
+        assert_eq!(cfg.port, 8787, "plugin seed omits port and uses loader default");
+        assert!(cfg.engine.enabled);
+        assert!(cfg.engine.reveal_marker.enabled);
+        assert!(matches!(
+            cfg.engine.entity_operators.get("CREDIT_CARD"),
+            Some(Operator::Mask { from_end: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn loads_plugin_zlauder_toml_example() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../zlauder-plugin/zlauder.toml.example");
+        let cfg = load(Some(&path)).expect("plugin zlauder.toml.example should parse");
+
+        assert_eq!(cfg.port, 8787);
+        assert!(cfg.engine.enabled);
+        assert_eq!(cfg.engine.detection_cache_cap, 50_000);
+        assert!(cfg.engine.reveal_marker.enabled);
+    }
+
+    #[test]
     fn missing_config_uses_defaults() {
         // Point user-scope at a path that doesn't exist so a real ~/.config file
         // can't perturb the test.

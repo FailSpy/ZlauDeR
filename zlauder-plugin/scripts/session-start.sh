@@ -32,7 +32,7 @@ PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-}"
 
 warn() { printf '%s\n' "$*" >&2; }
 
-# Resolve the config: project zlauder.toml if present, else the bundled template.
+# Resolve the config: project zlauder.toml if present, else the bundled default.
 config_path() {
   local proj="${CLAUDE_PROJECT_DIR:-}"
   if [ -n "$proj" ] && [ -f "$proj/zlauder.toml" ]; then

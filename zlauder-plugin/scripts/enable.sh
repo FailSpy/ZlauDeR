@@ -9,8 +9,8 @@ set -euo pipefail
 #   - env.ANTHROPIC_BASE_URL  (load-bearing: routes Claude Code through the proxy)
 #   - env.ZLAUDER_PORT        (so the CLI/status line target this project's proxy)
 #   - statusLine              (the 🛡 masking indicator; set only if absent)
-# and seeds a starter ./zlauder.toml if the project has none. Idempotent: re-running
-# is a no-op once the values are already present.
+# and seeds a practical starter ./zlauder.toml if the project has none.
+# Idempotent: re-running is a no-op once the values are already present.
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required but not found on PATH. Install jq and re-run /zlauder:enable." >&2
@@ -97,14 +97,15 @@ trap - EXIT
 
 echo "ZlauDeR: set ANTHROPIC_BASE_URL=${base_url} and ZLAUDER_PORT=${port} in ${settings_file}"
 
-# Seed a starter zlauder.toml (commented, tunable) if the project has none. Copy the
-# bundled template; never clobber a config the user has tuned. Persistent settings are
-# edited via `/zlauder:privacy ... --scope project`, which writes this same file.
+# Seed a practical starter zlauder.toml if the project has none. Copy the bundled
+# default; never clobber a config the user has tuned. The exhaustive reference ships
+# as zlauder.toml.example. Persistent settings are edited via
+# `/zlauder:privacy ... --scope project`, which writes this same file.
 proj_cfg="${project_dir}/zlauder.toml"
 tmpl="${CLAUDE_PLUGIN_ROOT:-}/zlauder.toml"
 if [ ! -f "$proj_cfg" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$tmpl" ]; then
   if cp "$tmpl" "$proj_cfg" 2>/dev/null; then
-    echo "ZlauDeR: seeded ${proj_cfg} from the bundled template."
+    echo "ZlauDeR: seeded ${proj_cfg} from the bundled default."
   fi
 fi
 
