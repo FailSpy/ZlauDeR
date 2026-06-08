@@ -21,6 +21,14 @@ if [[ ! -f "$settings" ]]; then
   exit 0
 fi
 
+# Refuse malformed JSON rather than mis-reporting "already disabled" — a corrupt
+# settings file with live ZlauDeR wiring would otherwise slip past the guard below
+# (jq exits nonzero on parse error) and skip cleanup. Mirrors enable.sh's check.
+if ! jq -e . "$settings" >/dev/null 2>&1; then
+  echo "error: $settings is not valid JSON; refusing to edit. Fix it and re-run." >&2
+  exit 1
+fi
+
 # Trigger on ANY zlauder wiring — either routing env key OR our status line — so
 # disable is a true inverse even in asymmetric state (e.g. a key left behind by a
 # partial edit), not just when the env keys are present.

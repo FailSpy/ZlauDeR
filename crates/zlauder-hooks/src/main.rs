@@ -760,8 +760,15 @@ fn read_stdin_bytes() -> Vec<u8> {
 /// stdin, and return its trimmed stdout. Any failure (spawn error, non-UTF8, empty
 /// output) yields `None` so the zlauder segment still stands alone.
 fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // A wrapped status line that hangs (slow git, blocking network, deadlock) must
+    // not stall our own shield indefinitely. Claude Code reaps slow status lines too,
+    // but we bound it ourselves so `🛡 …` still renders promptly on its own.
+    const WRAP_TIMEOUT: Duration = Duration::from_millis(2000);
 
     let (sh, flag) = if cfg!(windows) {
         ("cmd", "/C")
@@ -780,8 +787,28 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
         let _ = si.write_all(stdin);
         // `si` drops here, closing the child's stdin so it can finish.
     }
-    let out = child.wait_with_output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
+    // Drain stdout on a worker thread so the wait never blocks past the timeout.
+    // `child` stays here so we can kill it if it overruns; the thread owns only the
+    // pipe and gets EOF (then exits) once the child dies.
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let buf = match rx.recv_timeout(WRAP_TIMEOUT) {
+        Ok(buf) => {
+            let _ = child.wait();
+            buf
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let s = String::from_utf8_lossy(&buf);
     let s = s.trim_end_matches(['\n', '\r']);
     (!s.is_empty()).then(|| s.to_string())
 }
