@@ -227,7 +227,10 @@ mod tests {
             .join("../../zlauder-plugin/zlauder.toml");
         let cfg = load(Some(&path)).expect("plugin zlauder.toml should parse");
 
-        assert_eq!(cfg.port, 8787, "plugin seed omits port and uses loader default");
+        assert_eq!(
+            cfg.port, 8787,
+            "plugin seed omits port and uses loader default"
+        );
         assert!(cfg.engine.enabled);
         assert!(cfg.engine.reveal_marker.enabled);
         assert!(matches!(
@@ -304,7 +307,11 @@ mod tests {
         assert_eq!(cfg.engine.reveal_marker.prefix, "\u{1b}[97;44m");
         assert_eq!(cfg.engine.reveal_marker.suffix, "\u{1b}[0m");
         // A config without the section defaults cleanly (off).
-        assert!(!zlauder_engine::EngineConfig::default().reveal_marker.enabled);
+        assert!(
+            !zlauder_engine::EngineConfig::default()
+                .reveal_marker
+                .enabled
+        );
 
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
         let _ = std::fs::remove_dir_all(&dir);

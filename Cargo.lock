@@ -3900,6 +3900,7 @@ dependencies = [
  "anthropic-wire",
  "anyhow",
  "axum",
+ "blake3",
  "bytes",
  "clap",
  "futures",

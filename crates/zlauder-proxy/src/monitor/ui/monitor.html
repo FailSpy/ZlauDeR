@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZLAUDER // INTERCEPT</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Bahnschrift&family=Oswald:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* MONITOR_CSS */
+</style>
+</head>
+<body>
+<div class="atmosphere" aria-hidden="true">
+  <div class="grain"></div>
+  <div class="scanlines"></div>
+  <div class="mesh"></div>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">&#9678;</span>
+    <span class="brand-name">ZLAUDER</span>
+    <span class="brand-sub">INTERCEPT STATION</span>
+  </div>
+
+  <div class="carrier" id="carrier" title="live signal">
+    <span class="carrier-line"></span>
+    <span class="carrier-dot" id="liveDot"></span>
+    <span class="carrier-label" id="liveLabel">LINK</span>
+  </div>
+
+  <div class="mode-cluster">
+    <label class="field-label">POSTURE</label>
+    <div class="select-wrap">
+      <select id="mode">
+        <option value="off">OBSERVE ONLY</option>
+        <option value="manual_all_llm">HOLD ALL LLM</option>
+        <option value="manual_on_detection">HOLD ON DETECTION</option>
+      </select>
+    </div>
+    <button id="saveMode" class="btn ghost">SET</button>
+  </div>
+
+  <div class="queue-meter" id="queueMeter" title="pending approval queue">
+    <div class="queue-bar"><span class="queue-fill" id="queueFill"></span></div>
+    <span class="queue-text" id="queue">0 / 0</span>
+  </div>
+</header>
+
+<main class="grid">
+  <aside class="rail rail-convos">
+    <div class="rail-head">
+      <span class="rail-title">CHANNELS</span>
+      <span class="rail-count" id="convoCount">0</span>
+    </div>
+    <div class="rail-search">
+      <input id="convoFilterInput" placeholder="filter channels&hellip;" autocomplete="off">
+    </div>
+    <div class="rail-scroll" id="sessions"></div>
+  </aside>
+
+  <section class="rail rail-records">
+    <div class="rail-head">
+      <span class="rail-title" id="recordsTitle">TRAFFIC</span>
+      <button class="chip-btn" id="clearFilter" hidden>&times; channel</button>
+    </div>
+    <div class="rail-scroll" id="records"></div>
+  </section>
+
+  <section class="review" id="detail">
+    <div class="placeholder">
+      <span class="placeholder-glyph">&#9678;</span>
+      <p>SELECT AN INTERCEPT</p>
+      <small>Review what plaintext leaves this machine before it ships.</small>
+    </div>
+  </section>
+</main>
+
+<div class="toast-stack" id="toasts" aria-live="polite"></div>
+
+<template id="tpl-toast">
+  <div class="toast"><span class="toast-bar"></span><span class="toast-msg"></span></div>
+</template>
+
+<script>
+/* MONITOR_JS */
+</script>
+</body>
+</html>

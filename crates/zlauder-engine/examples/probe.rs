@@ -4,8 +4,8 @@
 //!
 //!   cargo run -q -p zlauder-engine --example probe -- "finance-notes.md" "AKIAIOSFODNN7EXAMPLE"
 
-use zlauder_engine::{EngineConfig, MaskOutcome, Surface};
-use zlauder_engine::MaskEngine; // re-exported at crate root? if not, fall back below
+use zlauder_engine::MaskEngine;
+use zlauder_engine::{EngineConfig, MaskOutcome, Surface}; // re-exported at crate root? if not, fall back below
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,7 +29,11 @@ fn main() {
                 .iter()
                 .map(|e| format!("{}={:?}", e.entity_kind, e.canonical_form))
                 .collect();
-            println!("FLAGGED | {input:?}\n        -> masked: {:?}\n        -> {}", out.masked_text, hits.join(", "));
+            println!(
+                "FLAGGED | {input:?}\n        -> masked: {:?}\n        -> {}",
+                out.masked_text,
+                hits.join(", ")
+            );
         }
     }
     eprintln!("\n{flagged}/{} inputs flagged", inputs.len());

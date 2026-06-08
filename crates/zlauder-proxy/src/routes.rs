@@ -138,7 +138,8 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
 
     if is_sse {
         let body = sse::unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
-        st.monitor.record_response(&record_id, status, None);
+        st.monitor
+            .record_response(&record_id, status.as_u16(), None);
         respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
@@ -152,7 +153,8 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
         };
         let out = walk::unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
-        st.monitor.record_response(&record_id, status, Some(&out));
+        st.monitor
+            .record_response(&record_id, status.as_u16(), Some(&out));
         respond(status, out_headers, Body::from(out))
     }
 }

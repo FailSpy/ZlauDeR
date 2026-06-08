@@ -86,7 +86,8 @@ async fn chat_completions_inner(
 
     if is_sse {
         let body = unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
-        st.monitor.record_response(&record_id, status, None);
+        st.monitor
+            .record_response(&record_id, status.as_u16(), None);
         routes::respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
@@ -100,7 +101,8 @@ async fn chat_completions_inner(
         };
         let out = unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
-        st.monitor.record_response(&record_id, status, Some(&out));
+        st.monitor
+            .record_response(&record_id, status.as_u16(), Some(&out));
         routes::respond(status, out_headers, Body::from(out))
     }
 }
@@ -207,10 +209,10 @@ impl MaskWalker<'_> {
         if let Some(content) = msg.content.as_mut() {
             self.content(content, surface)?;
         }
-        if msg.role == "tool" {
-            if let Some(id) = msg.tool_call_id.as_mut() {
-                self.str(id, Surface::ToolResult)?;
-            }
+        if msg.role == "tool"
+            && let Some(id) = msg.tool_call_id.as_mut()
+        {
+            self.str(id, Surface::ToolResult)?;
         }
         if let Some(name) = msg.name.as_mut() {
             self.str(name, Surface::UserMessage)?;
@@ -577,11 +579,13 @@ mod tests {
     }
 
     fn engine_marked() -> MaskEngine {
-        let mut cfg = EngineConfig::default();
-        cfg.reveal_marker = RevealMarker {
-            enabled: true,
-            prefix: "<".into(),
-            suffix: ">".into(),
+        let cfg = EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: true,
+                prefix: "<".into(),
+                suffix: ">".into(),
+            },
+            ..Default::default()
         };
         MaskEngine::new(cfg).unwrap()
     }

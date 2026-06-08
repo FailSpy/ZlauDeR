@@ -394,11 +394,13 @@ mod tests {
     // split across delta boundaries (it is unmasked once whole, in the safe prefix).
     #[test]
     fn sse_text_delta_wraps_revealed_value_across_split() {
-        let mut cfg = EngineConfig::default();
-        cfg.reveal_marker = zlauder_engine::RevealMarker {
-            enabled: true,
-            prefix: "<".into(),
-            suffix: ">".into(),
+        let cfg = EngineConfig {
+            reveal_marker: zlauder_engine::RevealMarker {
+                enabled: true,
+                prefix: "<".into(),
+                suffix: ">".into(),
+            },
+            ..Default::default()
         };
         let e = MaskEngine::new(cfg).unwrap();
         let m = e.mask("person@example.com", Surface::UserMessage).unwrap();

@@ -163,7 +163,11 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
     } else {
         h.update(&[0]);
     }
-    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("32-byte digest"))
+    u64::from_le_bytes(
+        h.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("32-byte digest"),
+    )
 }
 
 /// Public snapshot of the ML slot for status reporting.
@@ -413,10 +417,10 @@ impl MaskEngine {
     /// plaintext) and unmasks every inbound field. Determinism makes the
     /// round-trip reproduce the original token form exactly.
     pub fn mask(&self, text: &str, surface: Surface) -> Result<MaskOutcome, EngineError> {
-        if surface == Surface::UserMessage {
-            if let Some(outcome) = self.mask_user_bypass(text)? {
-                return Ok(outcome);
-            }
+        if surface == Surface::UserMessage
+            && let Some(outcome) = self.mask_user_bypass(text)?
+        {
+            return Ok(outcome);
         }
 
         // Snapshot the policy as a cheap `Arc` clone, then RELEASE the lock before
@@ -489,7 +493,14 @@ impl MaskEngine {
                         stats.hit = 1;
                         hit
                     }
-                    None => self.detect_and_cache(&policy, ml.as_deref(), text, surface, key, &mut stats)?,
+                    None => self.detect_and_cache(
+                        &policy,
+                        ml.as_deref(),
+                        text,
+                        surface,
+                        key,
+                        &mut stats,
+                    )?,
                 }
             }
             None => self.detect_and_cache(&policy, None, text, surface, key, &mut stats)?,
@@ -595,7 +606,14 @@ impl MaskEngine {
         if ml.is_some() {
             stats.ml_ran = 1;
         }
-        match run_detection(&self.analyzer, &policy.config, &policy.customs, ml, text, surface) {
+        match run_detection(
+            &self.analyzer,
+            &policy.config,
+            &policy.customs,
+            ml,
+            text,
+            surface,
+        ) {
             Ok(d) => {
                 stats.fresh_miss = 1;
                 let d = Arc::new(d);
@@ -1246,7 +1264,10 @@ mod tests {
             "stale load must not become active after disable"
         );
         let out = e.mask("call Alice Johnson", Surface::UserMessage).unwrap();
-        assert!(out.masked_text.contains("Alice Johnson"), "stale load leaked");
+        assert!(
+            out.masked_text.contains("Alice Johnson"),
+            "stale load leaked"
+        );
     }
 
     // DATE_TIME (the ML model's `private_date`) is intentionally unmapped to any
@@ -1286,10 +1307,22 @@ mod tests {
     #[test]
     fn ml_status_serializes_to_stable_strings() {
         use serde_json::json;
-        assert_eq!(serde_json::to_value(MlStatus::Disabled).unwrap(), json!("disabled"));
-        assert_eq!(serde_json::to_value(MlStatus::Loading).unwrap(), json!("loading"));
-        assert_eq!(serde_json::to_value(MlStatus::Ready).unwrap(), json!("ready"));
-        assert_eq!(serde_json::to_value(MlStatus::Failed).unwrap(), json!("failed"));
+        assert_eq!(
+            serde_json::to_value(MlStatus::Disabled).unwrap(),
+            json!("disabled")
+        );
+        assert_eq!(
+            serde_json::to_value(MlStatus::Loading).unwrap(),
+            json!("loading")
+        );
+        assert_eq!(
+            serde_json::to_value(MlStatus::Ready).unwrap(),
+            json!("ready")
+        );
+        assert_eq!(
+            serde_json::to_value(MlStatus::Failed).unwrap(),
+            json!("failed")
+        );
     }
 
     // Lock the catalog mapping target strings: the ML model maps its labels to
@@ -1308,7 +1341,11 @@ mod tests {
             // parse alias; the category must list the canonical Display (RHS).
             ("IBAN", "IBAN_CODE", Category::Financial),
             ("CRYPTO_WALLET", "CRYPTO", Category::Financial),
-            ("US_ROUTING_NUMBER", "ABA_ROUTING_NUMBER", Category::Financial),
+            (
+                "US_ROUTING_NUMBER",
+                "ABA_ROUTING_NUMBER",
+                Category::Financial,
+            ),
             ("US_MEDICAL_LICENSE", "MEDICAL_LICENSE", Category::Identity),
         ] {
             let et: EntityType = parsed.parse().unwrap();
@@ -1336,7 +1373,9 @@ mod tests {
     #[test]
     fn reveal_marker_wraps_assistant_unmask_only() {
         let e = engine_with_marker("<", ">");
-        let m = e.mask("mail bob@example.com", Surface::UserMessage).unwrap();
+        let m = e
+            .mask("mail bob@example.com", Surface::UserMessage)
+            .unwrap();
         let tok = m.manifest.entries[0].token_handle.clone();
         let line = format!("write to {tok} now");
 
@@ -1363,7 +1402,9 @@ mod tests {
     #[test]
     fn reveal_marker_disabled_is_plain_unmask() {
         let e = engine(); // default: marker off
-        let m = e.mask("mail bob@example.com", Surface::UserMessage).unwrap();
+        let m = e
+            .mask("mail bob@example.com", Surface::UserMessage)
+            .unwrap();
         let tok = m.manifest.entries[0].token_handle.clone();
         let line = format!("to {tok}");
         assert_eq!(
@@ -1429,7 +1470,9 @@ mod tests {
         let e = engine_with_marker("$", "$");
         // A user types literal `$`; that surface is never stripped, so the `$` survive
         // (the strip is AssistantText-only — we only peel decoration WE added).
-        let user = e.mask("the price is $5 to $10", Surface::UserMessage).unwrap();
+        let user = e
+            .mask("the price is $5 to $10", Surface::UserMessage)
+            .unwrap();
         assert!(
             user.masked_text.contains("$5") && user.masked_text.contains("$10"),
             "user-surface `$` must not be stripped: {:?}",
@@ -1461,7 +1504,10 @@ mod tests {
         let b = e.mask(text, Surface::UserMessage).unwrap();
         assert_eq!(b.stats.hit, 1, "second identical mask is a cache hit");
         assert_eq!(b.stats.fresh_miss, 0);
-        assert_eq!(a.masked_text, b.masked_text, "hit reproduces the masked text");
+        assert_eq!(
+            a.masked_text, b.masked_text,
+            "hit reproduces the masked text"
+        );
         assert!(
             !b.manifest.is_empty(),
             "manifest is REPLAYED on a hit, not cached empty"
@@ -1493,7 +1539,10 @@ mod tests {
         let second = e.mask(text, Surface::UserMessage).unwrap();
         assert_eq!(second.stats.hit, 1, "second mask is a hit");
         assert!(second.masked_text.contains("[CODENAME_acme]"));
-        assert_eq!(e.unmask(&second.masked_text, &second.manifest).unwrap(), text);
+        assert_eq!(
+            e.unmask(&second.masked_text, &second.manifest).unwrap(),
+            text
+        );
     }
 
     // Operators are resolved at APPLY time: swapping an operator VALUE (same key)
@@ -1690,7 +1739,11 @@ mod tests {
         assert_eq!(a[0].start, b[0].start);
         assert_eq!(a[0].end, b[0].end);
         assert_eq!(a[0].entity_type, b[0].entity_type);
-        assert_eq!(a[0].source, Source::Regex, "presidio email is regex-sourced");
+        assert_eq!(
+            a[0].source,
+            Source::Regex,
+            "presidio email is regex-sourced"
+        );
         assert!(!a[0].literal);
     }
 }

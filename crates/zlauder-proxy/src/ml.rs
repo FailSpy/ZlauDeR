@@ -23,7 +23,8 @@ pub fn spawn_ml_load(engine: Arc<MaskEngine>, ml: MlConfig) {
     let model = ml.model.clone();
     tokio::spawn(async move {
         tracing::info!(model = %model, "loading openai-privacy model in background");
-        let res = tokio::task::spawn_blocking(move || zlauder_engine::ml::build_recognizer(&ml)).await;
+        let res =
+            tokio::task::spawn_blocking(move || zlauder_engine::ml::build_recognizer(&ml)).await;
         match res {
             Ok(Ok(rec)) => {
                 engine.ml_set_ready(generation, rec);

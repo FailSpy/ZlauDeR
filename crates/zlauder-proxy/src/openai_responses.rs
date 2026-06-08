@@ -83,7 +83,8 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
 
     if is_sse {
         let body = unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
-        st.monitor.record_response(&record_id, status, None);
+        st.monitor
+            .record_response(&record_id, status.as_u16(), None);
         routes::respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
@@ -97,7 +98,8 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
         };
         let out = unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
-        st.monitor.record_response(&record_id, status, Some(&out));
+        st.monitor
+            .record_response(&record_id, status.as_u16(), Some(&out));
         routes::respond(status, out_headers, Body::from(out))
     }
 }
@@ -507,10 +509,13 @@ pub fn unmask_sse_body(
     Body::from_stream(stream)
 }
 
+type TextCarryKey = (Option<String>, Option<u64>, Option<u64>);
+type ArgsCarryKey = (Option<String>, Option<u64>);
+
 #[derive(Default)]
 struct ResponsesSseUnmasker {
-    text_carry: HashMap<(Option<String>, Option<u64>, Option<u64>), String>,
-    args_carry: HashMap<(Option<String>, Option<u64>), String>,
+    text_carry: HashMap<TextCarryKey, String>,
+    args_carry: HashMap<ArgsCarryKey, String>,
 }
 
 impl ResponsesSseUnmasker {
@@ -698,11 +703,13 @@ mod tests {
     }
 
     fn engine_marked() -> MaskEngine {
-        let mut cfg = EngineConfig::default();
-        cfg.reveal_marker = RevealMarker {
-            enabled: true,
-            prefix: "<".into(),
-            suffix: ">".into(),
+        let cfg = EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: true,
+                prefix: "<".into(),
+                suffix: ">".into(),
+            },
+            ..Default::default()
         };
         MaskEngine::new(cfg).unwrap()
     }

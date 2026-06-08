@@ -360,12 +360,7 @@ fn is_context_management_protocol_key(key: &str) -> bool {
         key,
         // Anthropic validates these as exact enum/tool-name strings. They are
         // request-control metadata, not natural-language content.
-        "type"
-            | "keep"
-            | "trigger"
-            | "clear_at_least"
-            | "clear_tool_inputs"
-            | "exclude_tools"
+        "type" | "keep" | "trigger" | "clear_at_least" | "clear_tool_inputs" | "exclude_tools"
     )
 }
 
@@ -474,11 +469,13 @@ mod tests {
     }
 
     fn engine_marked() -> MaskEngine {
-        let mut cfg = EngineConfig::default();
-        cfg.reveal_marker = RevealMarker {
-            enabled: true,
-            prefix: "«".into(),
-            suffix: "»".into(),
+        let cfg = EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: true,
+                prefix: "«".into(),
+                suffix: "»".into(),
+            },
+            ..Default::default()
         };
         MaskEngine::new(cfg).unwrap()
     }
@@ -558,7 +555,11 @@ mod tests {
         // Arrow 4 — tool_result content masked.
         assert!(!s.contains("bob@example.com"), "tool_result email leaked");
         assert!(s.contains("[EMAIL_ADDRESS_"));
-        assert_eq!(manifest.len(), 2, "only known text-bearing fields are masked");
+        assert_eq!(
+            manifest.len(),
+            2,
+            "only known text-bearing fields are masked"
+        );
 
         // The masked tool_result round-trips back to plaintext.
         let masked_tr = v["messages"][1]["content"][0]["content"].as_str().unwrap();

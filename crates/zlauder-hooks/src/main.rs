@@ -455,6 +455,22 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
     Ok(())
 }
 
+/// Derive the conversation id the monitor groups turns under (and that the proxy
+/// receives via the `/zlauder/session/{conversation}/…` path) from the SessionStart
+/// hook payload.
+///
+/// Precedence (most-stable first): a real session id wins over a transcript-path
+/// slug, because the session id is the harness's own durable identifier for the
+/// conversation, whereas a transcript path is incidental, machine-specific, and
+/// only ever a fallback for harness versions that don't surface a session id:
+///   1. `session_id` / `sessionId`
+///   2. `conversation_id` / `conversationId`
+///   3. `transcript_path` / `transcriptPath`  (the embedded session id, see below)
+///
+/// Claude Code names transcripts `<…>/<session-uuid>.jsonl`, so when we fall back
+/// to a path we slug its **file stem** — the embedded session id — not the whole
+/// absolute path. That keeps the transcript-derived id short, portable, and equal
+/// to the session id, instead of a long dash-joined slug of someone's home dir.
 fn conversation_id_from_hook_payload(stdin: &str) -> Option<String> {
     let value: Value = serde_json::from_str(stdin).ok()?;
     for key in [
@@ -462,14 +478,31 @@ fn conversation_id_from_hook_payload(stdin: &str) -> Option<String> {
         "sessionId",
         "conversation_id",
         "conversationId",
-        "transcript_path",
-        "transcriptPath",
     ] {
         if let Some(raw) = find_string_key(&value, key) {
             return Some(safe_conversation_id(&raw));
         }
     }
+    for key in ["transcript_path", "transcriptPath"] {
+        if let Some(raw) = find_string_key(&value, key) {
+            return Some(safe_conversation_id(&conversation_id_from_transcript_path(
+                &raw,
+            )));
+        }
+    }
     None
+}
+
+/// Extract the durable conversation key embedded in a transcript path: its file
+/// stem (Claude Code uses `<session-uuid>.jsonl`). Falls back to the raw value
+/// when there's no stem to take, so a non-path string still round-trips.
+fn conversation_id_from_transcript_path(raw: &str) -> String {
+    Path::new(raw)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn find_string_key(value: &Value, key: &str) -> Option<String> {
@@ -503,7 +536,7 @@ fn safe_conversation_id(raw: &str) -> String {
     if out.len() > 80 {
         let mut h = blake3::Hasher::new();
         h.update(raw.as_bytes());
-        format!("{}-{}", &out[..40], h.finalize().to_hex()[..16].to_string())
+        format!("{}-{}", &out[..40], &h.finalize().to_hex()[..16])
     } else if out.is_empty() {
         "unknown".to_string()
     } else {
@@ -1354,6 +1387,60 @@ fn clear_reservation_if_ours(port: u16, root: &str) {
         && let Ok(path) = zlauder_state::state_path(port)
     {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::{conversation_id_from_hook_payload, conversation_id_from_transcript_path};
+
+    #[test]
+    fn prefers_session_id_over_transcript_path() {
+        let payload = r#"{
+            "session_id": "abc-123",
+            "transcript_path": "/home/u/.claude/projects/x/zzz-999.jsonl"
+        }"#;
+        assert_eq!(
+            conversation_id_from_hook_payload(payload).as_deref(),
+            Some("abc-123")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_transcript_stem_not_full_path() {
+        // No session id: the durable key is the transcript's file stem (the
+        // embedded session uuid), NOT a slug of the whole absolute path.
+        let payload = r#"{
+            "transcript_path": "/home/user/.claude/projects/proj/9f8e-7d6c.jsonl"
+        }"#;
+        assert_eq!(
+            conversation_id_from_hook_payload(payload).as_deref(),
+            Some("9f8e-7d6c")
+        );
+    }
+
+    #[test]
+    fn camel_case_session_id_supported() {
+        let payload = r#"{"sessionId": "sess_42"}"#;
+        assert_eq!(
+            conversation_id_from_hook_payload(payload).as_deref(),
+            Some("sess_42")
+        );
+    }
+
+    #[test]
+    fn transcript_stem_handles_non_path_value() {
+        // A bare value with no path separators round-trips through stem extraction.
+        assert_eq!(
+            conversation_id_from_transcript_path("just-an-id"),
+            "just-an-id"
+        );
+    }
+
+    #[test]
+    fn no_identifier_yields_none() {
+        assert_eq!(conversation_id_from_hook_payload(r#"{"foo": "bar"}"#), None);
+        assert_eq!(conversation_id_from_hook_payload("not json"), None);
     }
 }
 

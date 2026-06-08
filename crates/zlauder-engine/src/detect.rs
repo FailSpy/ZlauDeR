@@ -130,7 +130,14 @@ pub fn run_detection(
     // Pass 2: presidio regex analyzer.
     let results = analyzer
         .analyze(AnalyzeRequest::new(text, &cfg.language).score_threshold(cfg.score_threshold));
-    ingest_results(results, cfg, text, &mut dets, &mut allowed_spans, Source::Regex);
+    ingest_results(
+        results,
+        cfg,
+        text,
+        &mut dets,
+        &mut allowed_spans,
+        Source::Regex,
+    );
 
     // Pass 2b: the optional ML recognizer (openai/privacy-filter), if loaded. It
     // returns the same `RecognizerResult` type, so it flows through the identical
@@ -139,7 +146,14 @@ pub fn run_detection(
     // deferred Component-3 burn can single it out.
     if let Some(rec) = ml {
         let ml_results = rec.analyze(text, None, None);
-        ingest_results(ml_results, cfg, text, &mut dets, &mut allowed_spans, Source::Ml);
+        ingest_results(
+            ml_results,
+            cfg,
+            text,
+            &mut dets,
+            &mut allowed_spans,
+            Source::Ml,
+        );
     }
 
     // Suppress detections fully contained within an allow-listed span.
@@ -349,9 +363,9 @@ mod precision_tests {
             "VeryLongCamelCaseComponentNameThatExceedsThirtyTwoChars",
             "this-is-a-rather-long-kebab-case-filename-indeed",
             "this_is_a_very_long_snake_case_identifier_name_here",
-            "4f3a2b1c9d8e7f6a5b4c3d2e1f0a9b8c",                 // 32-hex digest
-            "0123456789abcdef0123456789abcdef",                 // uniform 32-hex (entropy 4.0)
-            "550e8400-e29b-41d4-a716-446655440000",             // UUID
+            "4f3a2b1c9d8e7f6a5b4c3d2e1f0a9b8c", // 32-hex digest
+            "0123456789abcdef0123456789abcdef", // uniform 32-hex (entropy 4.0)
+            "550e8400-e29b-41d4-a716-446655440000", // UUID
         ] {
             assert!(
                 !plausible_generic_secret(s),
@@ -364,9 +378,9 @@ mod precision_tests {
     #[test]
     fn generic_gate_keeps_real_opaque_tokens() {
         for s in [
-            "k7Lm2Nq9Rp4StUvWxYzAbCdEfGhIjKlMnOp",              // bare base62
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",         // AWS secret w/ slash
-            "dGhpc2lzYVZlcnlMb25nU2VjcmV0VmFsdWUxMjM0NTY3",     // base64 blob
+            "k7Lm2Nq9Rp4StUvWxYzAbCdEfGhIjKlMnOp",          // bare base62
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",     // AWS secret w/ slash
+            "dGhpc2lzYVZlcnlMb25nU2VjcmV0VmFsdWUxMjM0NTY3", // base64 blob
         ] {
             assert!(plausible_generic_secret(s), "should keep secret: {s:?}");
         }
