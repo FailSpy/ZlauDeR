@@ -211,6 +211,31 @@ operating territories and partner facilities for the remainder of the calendar y
                 "San Francisco",
                 "the team relocated to San Francisco last spring",
             ),
+            // --- Widened ML-unique PERSON corpus --------------------------------
+            // Varied structure (apostrophe / hyphen / diacritic / non-Western /
+            // single-token) with NO regex trigger word (no "Mr."/"Dr."), so each
+            // span is genuinely the model's job. These broaden the ML-owned recall
+            // denominator far past the original 6 spans so a low-precision lever
+            // (bf16/f16/Q8) cannot pass the gate by only preserving a thin set.
+            P::new("PERSON", "Wei Chen", "forward the signed deck to Wei Chen before noon"),
+            P::new("PERSON", "Sarah O'Brien", "the panel will be chaired by Sarah O'Brien"),
+            P::new(
+                "PERSON",
+                "Mohammed Al-Farsi",
+                "the lease was countersigned by Mohammed Al-Farsi",
+            ),
+            P::new("PERSON", "Yuki Tanaka", "Yuki Tanaka transferred in from the Osaka desk"),
+            P::new("PERSON", "Dmitri Volkov", "escalate the outage ticket to Dmitri Volkov"),
+            P::new("PERSON", "Aisha Rahman", "the quarterly audit is led by Aisha Rahman"),
+            P::new("PERSON", "Carlos Mendes", "Carlos Mendes signed off on the revised budget"),
+            P::new("PERSON", "Ingrid Larsson", "route the escalation to Ingrid Larsson tonight"),
+            // --- Widened ML-unique LOCATION corpus ------------------------------
+            P::new("LOCATION", "Reykjavik", "the working group convenes in Reykjavik next month"),
+            P::new("LOCATION", "Kyoto", "the new materials lab opened in Kyoto this spring"),
+            P::new("LOCATION", "Lagos", "the regional hub was consolidated into Lagos"),
+            P::new("LOCATION", "Geneva", "the arbitration hearing resumed in Geneva yesterday"),
+            P::new("LOCATION", "Mumbai", "the consignment cleared customs in Mumbai overnight"),
+            P::new("LOCATION", "Nairobi", "the field survey team is now based in Nairobi"),
         ]
     }
 
@@ -297,6 +322,34 @@ operating territories and partner facilities for the remainder of the calendar y
             id: "long-01-logistics".to_string(),
             text: long_doc(n2_sentences, "ANNUAL LOGISTICS SUMMARY."),
             needles: n2,
+        });
+
+        // Long-doc #3: two PERSONs + LOCATION in long prose — extra long-`T`
+        // ML-owned coverage (the spans low-precision/banded paths break first),
+        // with two distinct persons in one document.
+        let n3: Vec<(&'static str, &'static str)> = vec![
+            ("PERSON", "Helena Voss"),
+            ("PERSON", "Tomás Herrera"),
+            ("LOCATION", "Reykjavik"),
+        ];
+        let n3_sentences: &[(&'static str, &'static str)] = &[
+            (
+                "PERSON",
+                "The compliance brief was prepared by Helena Voss for the board.",
+            ),
+            (
+                "PERSON",
+                "Field operations for the quarter were coordinated by Tomás Herrera.",
+            ),
+            (
+                "LOCATION",
+                "The contingency site selected for the program is Reykjavik.",
+            ),
+        ];
+        fixtures.push(Fixture {
+            id: "long-02-compliance".to_string(),
+            text: long_doc(n3_sentences, "QUARTERLY COMPLIANCE BRIEF."),
+            needles: n3,
         });
 
         fixtures
