@@ -6,63 +6,43 @@
 # if the slot was empty, we just drop our line. Every other setting is preserved; the
 # file is rewritten atomically. The seeded zlauder.toml is left in place (inert without
 # routing).
-set -euo pipefail
+# No `set -e`: the binary's exit 3 (idempotent "already disabled") is expected, not fatal.
+set -uo pipefail
 
 settings="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/settings.json"
-sidecar="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/zlauder-statusline.json"
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "error: jq is required but not found on PATH" >&2
+# Resolve the zlauder-hooks binary the same way every other script does, then hand the
+# settings.json edit to it — no `jq` dependency (a hard blocker on Windows). --no-build:
+# teardown should never trigger a heavyweight build. The binary validates JSON, deletes
+# env.ANTHROPIC_BASE_URL/ZLAUDER_PORT (and an emptied env), restores the wrapped status
+# line from the sidecar (or drops ours), writes atomically, and removes the sidecar.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_resolve-bins.sh
+. "$SCRIPT_DIR/_resolve-bins.sh"
+zlauder_resolve_bins --no-build || true
+
+if ! command -v "$ZLAUDER_HOOKS_BIN" >/dev/null 2>&1; then
+  echo "error: zlauder-hooks is not available, so $settings cannot be edited automatically." >&2
+  echo "  Start a Claude Code session in this project (or put the binaries on PATH), then re-run /zlauder:disable." >&2
+  echo "  To remove routing by hand instead: in $settings delete env.ANTHROPIC_BASE_URL and env.ZLAUDER_PORT," >&2
+  echo "  and if statusLine.command runs 'zlauder-hooks statusline', restore it from .claude/zlauder-statusline.json (or delete it)." >&2
   exit 1
 fi
 
-if [[ ! -f "$settings" ]]; then
-  echo "ZlauDeR already disabled: no $settings"
-  exit 0
-fi
+# Exit code is a contract: 0 = removed wiring, 3 = already disabled (no wiring / no file),
+# non-zero = error (reason on stderr).
+"$ZLAUDER_HOOKS_BIN" settings disable
+rc=$?
 
-# Refuse malformed JSON rather than mis-reporting "already disabled" — a corrupt
-# settings file with live ZlauDeR wiring would otherwise slip past the guard below
-# (jq exits nonzero on parse error) and skip cleanup. Mirrors enable.sh's check.
-if ! jq -e . "$settings" >/dev/null 2>&1; then
-  echo "error: $settings is not valid JSON; refusing to edit. Fix it and re-run." >&2
-  exit 1
-fi
-
-# Trigger on ANY zlauder wiring — either routing env key OR our status line — so
-# disable is a true inverse even in asymmetric state (e.g. a key left behind by a
-# partial edit), not just when the env keys are present.
-if ! jq -e '
-  ((.env? // {}) | (has("ANTHROPIC_BASE_URL") or has("ZLAUDER_PORT")))
-  or (((.statusLine?.command) // "") | test("zlauder-hooks(\\.exe)? statusline"))
-' "$settings" >/dev/null 2>&1; then
-  echo "ZlauDeR already disabled: no ZlauDeR wiring in $settings"
-  exit 0
-fi
-
-# Load the saved original status line (if enable.sh wrapped one). `null` means there
-# was nothing to restore, so we just delete our line. We only act on the statusLine if
-# it's currently OURS — a line the user set by hand after enabling is left alone.
-restore="null"
-if [[ -f "$sidecar" ]] && orig="$(cat "$sidecar")" && jq -e . <<<"$orig" >/dev/null 2>&1; then
-  restore="$orig"
-fi
-
-# Delete the keys enable.sh added (and the env object if it ends up empty), and undo the
-# status-line takeover: restore the saved original, or drop our line if there was none.
-tmp="$(mktemp "${settings}.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
-jq --argjson restore "$restore" '
-  del(.env.ANTHROPIC_BASE_URL)
-  | del(.env.ZLAUDER_PORT)
-  | if (.env | type) == "object" and (.env | length) == 0 then del(.env) else . end
-  | if (((.statusLine?.command) // "") | test("zlauder-hooks(\\.exe)? statusline"))
-    then (if $restore == null then del(.statusLine) else .statusLine = $restore end)
-    else . end
-' "$settings" >"$tmp"
-mv -f "$tmp" "$settings"
-trap - EXIT
-rm -f "$sidecar"
-
-echo "Removed the ZlauDeR routing env from $settings (restored your original status line, if any)."
-echo "ZlauDeR is now disabled. Restart Claude Code for this to take effect."
+case "$rc" in
+  0)
+    echo "Removed the ZlauDeR routing env from $settings (restored your original status line, if any)."
+    echo "ZlauDeR is now disabled. Restart Claude Code for this to take effect."
+    ;;
+  3)
+    echo "ZlauDeR already disabled: no ZlauDeR wiring in $settings"
+    ;;
+  *)
+    exit "$rc"
+    ;;
+esac

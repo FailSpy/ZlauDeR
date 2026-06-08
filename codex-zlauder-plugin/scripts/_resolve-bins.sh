@@ -11,11 +11,19 @@ zlauder__is_windows_bash() {
   esac
 }
 
-if [ -z "${CODEX_PLUGIN_ROOT:-}" ]; then
-  _zl_pr="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
-  [ -n "$_zl_pr" ] && export CODEX_PLUGIN_ROOT="$_zl_pr"
-  unset _zl_pr
-fi
+# Normalize CODEX_PLUGIN_ROOT by re-deriving it from THIS file's own path ONLY when the
+# inherited value is missing or in native-Windows form (a `DRIVE:` prefix or a backslash):
+# a `!bash` block doesn't export it (empty), and on Windows a hook exports it as a native
+# C:\... path whose drive-colon splits PATH when prepended below. `cd ... && pwd` always
+# emits MSYS form (/c/...), which prepends cleanly. A value already in MSYS/POSIX form is
+# correct and is left untouched (so we don't override a good host root with a resolved variant).
+case "${CODEX_PLUGIN_ROOT:-}" in
+  '' | *'\'* | [A-Za-z]:*)
+    _zl_pr="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+    [ -n "$_zl_pr" ] && export CODEX_PLUGIN_ROOT="$_zl_pr"
+    unset _zl_pr
+    ;;
+esac
 
 zlauder__host_triple() {
   local os arch
@@ -95,7 +103,16 @@ zlauder__build_bins() {
     return 1
   fi
   mkdir -p "$data_dir/bin"
-  install -m 0755 "$rel/$ZLAUDER_PROXY_BIN" "$rel/$ZLAUDER_HOOKS_BIN" "$data_dir/bin/"
+  # cp + chmod rather than `install`: coreutils `install` isn't guaranteed in a minimal
+  # Git Bash, while cp/chmod are. chmod is harmless on Windows (the .exe is already runnable).
+  # Check cp explicitly: this helper is called via `... || return 1`, which DISABLES errexit
+  # inside the function, so a failed copy would otherwise fall through to a success return and
+  # prepend an incomplete bin dir to PATH.
+  if ! cp -f "$rel/$ZLAUDER_PROXY_BIN" "$rel/$ZLAUDER_HOOKS_BIN" "$data_dir/bin/"; then
+    zlauder__warn "ZlauDeR: failed to copy the built binaries into $data_dir/bin."
+    return 1
+  fi
+  chmod 0755 "$data_dir/bin/$ZLAUDER_PROXY_BIN" "$data_dir/bin/$ZLAUDER_HOOKS_BIN" 2>/dev/null || true
   ZLAUDER_BIN_DIR="$data_dir/bin"
 }
 

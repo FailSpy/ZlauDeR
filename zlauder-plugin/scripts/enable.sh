@@ -22,11 +22,6 @@ set -euo pipefail
 # wrapped line still shows); `min`/`verbose` change how much it shows.
 # Idempotent: re-running is a no-op once the values are already present.
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "error: jq is required but not found on PATH. Install jq and re-run /zlauder:enable." >&2
-  exit 1
-fi
-
 # Share the SessionStart resolver so the binaries are found the SAME way (PATH ->
 # plugin bin/ -> data bin/ -> build) and their dir is exported onto PATH — otherwise
 # a session-start that needs to spawn the proxy can't find a non-PATH `zlauder-proxy`.
@@ -78,53 +73,28 @@ else
 fi
 
 project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-settings_dir="${project_dir}/.claude"
-settings_file="${settings_dir}/settings.json"
+settings_file="${project_dir}/.claude/settings.json"
 
-mkdir -p "$settings_dir"
-
-if [[ ! -f "$settings_file" ]]; then
-  printf '{}\n' >"$settings_file"
-fi
-
-if ! jq -e . "$settings_file" >/dev/null 2>&1; then
-  echo "error: ${settings_file} is not valid JSON; refusing to overwrite. Fix it and re-run." >&2
+# Patch .claude/settings.json via zlauder-hooks — no `jq` dependency (a hard blocker on
+# Windows). The binary creates the dir/file as needed, validates JSON, wraps any existing
+# status line into the sidecar, sets env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT + statusLine,
+# and writes atomically. Exit code is a contract: 0 = changed, 3 = already pointed at this
+# proxy (idempotent), non-zero = error (it printed the reason to stderr). Guard `set -e`
+# so the deliberate 3 doesn't abort us. Needs the binary resolved up front (bins_ok).
+if [ "$bins_ok" -ne 1 ]; then
+  echo "error: zlauder-hooks is unavailable, so ${settings_file} cannot be patched. Ensure the zlauder binaries are available (on PATH, shipped in the plugin's bin/, or buildable from the cargo workspace), then re-run /zlauder:enable." >&2
   exit 1
 fi
 
-current="$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$settings_file")"
-current_port="$(jq -r '.env.ZLAUDER_PORT // empty' "$settings_file")"
+set +e
+"$ZLAUDER_HOOKS_BIN" settings enable \
+  --url "$base_url" --zport "$port" --statusline "$statusline_cmd"
+rc=$?
+set -e
 
-# Preserve the user's existing status line so we can wrap (not clobber) it. If the
-# current statusLine isn't already ours, snapshot it to the sidecar that the wrapper
-# reads and that /zlauder:disable restores from. We skip this when it's already ours so
-# re-running /zlauder:enable can't overwrite the true original with our own wrapper
-# (which would lose their line and risk a self-referential status line).
-sidecar="${settings_dir}/zlauder-statusline.json"
-is_ours="$(jq -r '((.statusLine?.command) // "") | test("zlauder-hooks(\\.exe)? statusline")' "$settings_file")"
-if [ "$is_ours" != "true" ]; then
-  orig="$(jq -c '.statusLine // null' "$settings_file")"
-  if [ "$orig" != "null" ]; then
-    printf '%s\n' "$orig" >"$sidecar"
-    echo "ZlauDeR: wrapping your existing status line (saved to ${sidecar}; restored on /zlauder:disable)."
-  else
-    # No prior line to wrap: ensure no stale sidecar lingers from an earlier setup.
-    rm -f "$sidecar"
-  fi
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+  exit "$rc" # hard error; zlauder-hooks already explained on stderr
 fi
-
-tmp="$(mktemp "${settings_dir}/.settings.json.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
-
-# Set the routing env (always) and take over the status-line slot (always). The wrapper
-# prepends our segment to the saved original line; an empty slot just shows our segment.
-jq --arg url "$base_url" --arg port "$port" --arg sl "$statusline_cmd" '
-    setpath(["env","ANTHROPIC_BASE_URL"]; $url)
-  | setpath(["env","ZLAUDER_PORT"]; $port)
-  | setpath(["statusLine"]; {"type": "command", "command": $sl})
-' "$settings_file" >"$tmp"
-mv -f "$tmp" "$settings_file"
-trap - EXIT
 
 echo "ZlauDeR: set ANTHROPIC_BASE_URL=${base_url} and ZLAUDER_PORT=${port} in ${settings_file}"
 
@@ -140,7 +110,7 @@ if [ ! -f "$proj_cfg" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$tmpl" ]; t
   fi
 fi
 
-if [[ "$current" == "$base_url" && "$current_port" == "$port" ]]; then
+if [ "$rc" -eq 3 ]; then
   echo "ZlauDeR: already pointed at the proxy; nothing changed."
   exit 0
 fi

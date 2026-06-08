@@ -48,12 +48,8 @@ case "$sub" in
     "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" statusline || true
     echo
     echo "Routing (ANTHROPIC_BASE_URL in this project's .claude/settings.json):"
-    settings="${CLAUDE_PROJECT_DIR:-.}/.claude/settings.json"
-    if [ -f "$settings" ] && command -v jq >/dev/null 2>&1; then
-      jq -r '.env.ANTHROPIC_BASE_URL // "(unset)"' "$settings" 2>/dev/null || echo "(unset)"
-    else
-      echo "(no .claude/settings.json)"
-    fi
+    # zlauder-hooks reads settings.json (then settings.local.json) itself — no jq needed.
+    "$ZLAUDER_HOOKS_BIN" settings route-url || echo "(unset)"
     echo
     echo "Masking:"
     "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config || true

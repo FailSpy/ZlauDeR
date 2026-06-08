@@ -35,20 +35,27 @@ zlauder__is_windows_bash() {
   esac
 }
 
-# Repair CLAUDE_PLUGIN_ROOT when it isn't in the environment. Claude Code exports
-# it to SessionStart *hook* processes, but a slash-command `!bash` block only
-# substitutes ${CLAUDE_PLUGIN_ROOT} into the command STRING — it does NOT export the
-# var to that subprocess. A sourced script reading the env var would then see it
-# empty, so the resolver can't find bin/<triple> and the workspace probe is blank
-# (observed: `/zlauder:enable` -> "no prebuilt binary ... no cargo workspace at ''").
-# Derive it from THIS file's path (<plugin_root>/scripts/_resolve-bins.sh) and export
-# it, so every consumer in the sourcing script (binary resolution AND e.g. enable.sh's
-# zlauder.toml seeding) sees a consistent value. No-op under a hook, where it's set.
-if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  _zl_pr="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
-  [ -n "$_zl_pr" ] && export CLAUDE_PLUGIN_ROOT="$_zl_pr"
-  unset _zl_pr
-fi
+# Normalize CLAUDE_PLUGIN_ROOT by re-deriving it from THIS file's own path
+# (<plugin_root>/scripts/_resolve-bins.sh) ONLY when the inherited value is missing or in
+# native-Windows form. The two cases that break:
+#   - UNSET: a slash-command `!bash` block only substitutes ${CLAUDE_PLUGIN_ROOT} into the
+#     command STRING; it does NOT export the var, so a sourced script sees it empty and the
+#     resolver can't find bin/<triple> ("no prebuilt binary ... no cargo workspace at ''").
+#   - NATIVE-WINDOWS form (`C:\Users\...`, i.e. a drive-letter colon or a backslash): under
+#     a SessionStart hook on Windows, Claude Code exports it that way, and prepending it to
+#     PATH below splits on the drive colon (`C:\...` -> a bogus `C` entry), so
+#     `zlauder-hooks.exe` isn't found and the proxy never launches.
+# `cd ... && pwd` always emits MSYS form (/c/Users/...), which has no colon and prepends
+# cleanly. A value already in MSYS/POSIX form (Unix hooks, or Git Bash's /c/...) is correct
+# and is LEFT UNTOUCHED, so we never override a good host-provided root with a
+# symlink-resolved variant.
+case "${CLAUDE_PLUGIN_ROOT:-}" in
+  '' | *'\'* | [A-Za-z]:*)
+    _zl_pr="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+    [ -n "$_zl_pr" ] && export CLAUDE_PLUGIN_ROOT="$_zl_pr"
+    unset _zl_pr
+    ;;
+esac
 
 # This host's Rust target triple, or "" if unsupported (-> falls through to a
 # source build). Must match the bin/<triple> dirs CI publishes on plugin-dist and
@@ -140,7 +147,16 @@ zlauder__build_bins() {
     return 1
   fi
   mkdir -p "$data_dir/bin"
-  install -m 0755 "$rel/$ZLAUDER_PROXY_BIN" "$rel/$ZLAUDER_HOOKS_BIN" "$data_dir/bin/"
+  # cp + chmod rather than `install`: coreutils `install` isn't guaranteed in a minimal
+  # Git Bash, while cp/chmod are. chmod is harmless on Windows (the .exe is already runnable).
+  # Check cp explicitly: this helper is called via `... || return 1`, which DISABLES errexit
+  # inside the function, so a failed copy would otherwise fall through to a success return and
+  # prepend an incomplete bin dir to PATH.
+  if ! cp -f "$rel/$ZLAUDER_PROXY_BIN" "$rel/$ZLAUDER_HOOKS_BIN" "$data_dir/bin/"; then
+    zlauder__warn "ZlauDeR: failed to copy the built binaries into $data_dir/bin."
+    return 1
+  fi
+  chmod 0755 "$data_dir/bin/$ZLAUDER_PROXY_BIN" "$data_dir/bin/$ZLAUDER_HOOKS_BIN" 2>/dev/null || true
   ZLAUDER_BIN_DIR="$data_dir/bin"
 }
 

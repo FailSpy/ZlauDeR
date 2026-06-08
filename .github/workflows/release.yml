@@ -35,8 +35,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Cheap gate that runs FIRST: tag must match the shipped plugin.json versions.
+  # Lives ahead of `test`/`build` so a version mismatch fails in seconds instead
+  # of after the multi-platform build matrix burns CI minutes. Its resolved
+  # tag/ver are exported for `publish` to reuse (no second check needed there).
+  verify:
+    name: verify tag & versions
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ver: ${{ steps.v.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Resolve & verify tag
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ github.event.inputs.tag || github.ref_name }}'
+          case "$tag" in v*) ;; *) echo "::error::expected a v* tag, got '$tag'"; exit 1 ;; esac
+          ver="$(jq -r .version zlauder-plugin/.claude-plugin/plugin.json)"
+          if [ "$tag" != "v$ver" ]; then
+            echo "::error::tag '$tag' != plugin.json version 'v$ver'. Bump zlauder-plugin/.claude-plugin/plugin.json (and the marketplace entry + Cargo version) to match the tag before releasing." >&2
+            exit 1
+          fi
+          codex_ver="$(jq -r .version codex-zlauder-plugin/.codex-plugin/plugin.json)"
+          if [ "$tag" != "v$codex_ver" ]; then
+            echo "::error::tag '$tag' != Codex plugin version 'v$codex_ver'. Bump codex-zlauder-plugin/.codex-plugin/plugin.json to match the tag before releasing." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+
   test:
     name: test
+    needs: verify
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -114,32 +149,12 @@ jobs:
 
   publish:
     name: publish (plugin dist + Release)
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
-
-      - name: Resolve & verify tag
-        id: v
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag='${{ github.event.inputs.tag || github.ref_name }}'
-          case "$tag" in v*) ;; *) echo "::error::expected a v* tag, got '$tag'"; exit 1 ;; esac
-          ver="$(jq -r .version zlauder-plugin/.claude-plugin/plugin.json)"
-          if [ "$tag" != "v$ver" ]; then
-            echo "::error::tag '$tag' != plugin.json version 'v$ver'. Bump zlauder-plugin/.claude-plugin/plugin.json (and the marketplace entry + Cargo version) to match the tag before releasing." >&2
-            exit 1
-          fi
-          codex_ver="$(jq -r .version codex-zlauder-plugin/.codex-plugin/plugin.json)"
-          if [ "$tag" != "v$codex_ver" ]; then
-            echo "::error::tag '$tag' != Codex plugin version 'v$codex_ver'. Bump codex-zlauder-plugin/.codex-plugin/plugin.json to match the tag before releasing." >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -161,7 +176,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ steps.v.outputs.tag }}'
+          tag='${{ needs.verify.outputs.tag }}'
           rm -rf pkg pkg-codex
           mkdir pkg pkg-codex
           # plugin files: manifest, hooks, scripts, configs, docs, skills/commands
@@ -192,10 +207,10 @@ jobs:
           printf '%s\n' "$tag" > pkg/.zlauder-release
           printf '%s\n' "$tag" > pkg-codex/.zlauder-release
           tmp="$(mktemp)"
-          jq --arg v '${{ steps.v.outputs.ver }}' '.version=$v' pkg/.claude-plugin/plugin.json > "$tmp"
+          jq --arg v '${{ needs.verify.outputs.ver }}' '.version=$v' pkg/.claude-plugin/plugin.json > "$tmp"
           mv "$tmp" pkg/.claude-plugin/plugin.json
           tmp="$(mktemp)"
-          jq --arg v '${{ steps.v.outputs.ver }}' '.version=$v' pkg-codex/.codex-plugin/plugin.json > "$tmp"
+          jq --arg v '${{ needs.verify.outputs.ver }}' '.version=$v' pkg-codex/.codex-plugin/plugin.json > "$tmp"
           mv "$tmp" pkg-codex/.codex-plugin/plugin.json
           echo "Claude payload:"; find pkg -type f | sort
           echo "Codex payload:"; find pkg-codex -type f | sort
@@ -204,7 +219,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ steps.v.outputs.tag }}'
+          tag='${{ needs.verify.outputs.tag }}'
           tar -C pkg-codex -czf "stage/zlauder-openai-codex-plugin-$tag.tar.gz" .
           ( cd stage
             if command -v sha256sum >/dev/null 2>&1; then
@@ -219,7 +234,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag='${{ steps.v.outputs.tag }}'
+          tag='${{ needs.verify.outputs.tag }}'
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           cd pkg
           git init -q -b plugin-dist
@@ -244,7 +259,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag='${{ steps.v.outputs.tag }}'
+          tag='${{ needs.verify.outputs.tag }}'
           assets=(stage/*.tar.gz stage/*.zip stage/*.sha256)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --clobber

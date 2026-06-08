@@ -94,6 +94,42 @@ enum Cmd {
         #[arg(long)]
         keep_thinking: bool,
     },
+    /// Patch this project's .claude/settings.json to route through (or stop routing
+    /// through) the zlauder proxy. Backs `/zlauder:enable` and `/zlauder:disable`,
+    /// replacing the former shell+jq implementation so the plugin needs no `jq` on PATH
+    /// (a hard blocker on Windows). Exit codes are a contract — see `SettingsAction`.
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Wire env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT and take over the statusLine slot
+    /// (wrapping any existing line to the sidecar). A missing settings.json is treated as
+    /// `{}` (and created). Exit 0 = file changed (caller prints the RESTART banner);
+    /// exit 3 = already pointed at this proxy, nothing routing-relevant changed; non-zero
+    /// = error (invalid JSON / write failure), message on stderr.
+    Enable {
+        /// Proxy base URL to bake in, e.g. http://127.0.0.1:18123.
+        #[arg(long)]
+        url: String,
+        /// Port to store as env.ZLAUDER_PORT. Kept as a STRING (matching the historical
+        /// jq behavior) and named `--zport` to avoid colliding with the global --port.
+        #[arg(long = "zport")]
+        zport: String,
+        /// The exact statusLine command string to install.
+        #[arg(long)]
+        statusline: String,
+    },
+    /// Remove env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT (and drop an emptied env), then
+    /// restore the user's original statusLine from the sidecar (or drop ours if none).
+    /// Exit 0 = changed; exit 3 = already disabled / no wiring / no file; non-zero = error.
+    Disable,
+    /// Print env.ANTHROPIC_BASE_URL from settings.json (else settings.local.json), or
+    /// "(unset)". Replaces the optional jq one-liner in privacy.sh's status path. Exit 0.
+    RouteUrl,
 }
 
 fn default_proxy_bin() -> String {
@@ -230,7 +266,240 @@ fn main() -> Result<()> {
             replacement,
             keep_thinking,
         ),
+        Cmd::Settings { action } => settings_cmd(action),
     }
+}
+
+// ---------------------------------------------------------------------------
+// settings — patch .claude/settings.json (replaces the former shell+jq path)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a settings mutation, mapped to the shell's exit-code contract:
+/// `Changed` => exit 0 (caller prints the RESTART banner), `NoOp` => exit 3 (caller
+/// prints "already pointed…"/"already disabled…"). Hard errors bubble as `anyhow` (exit 1).
+enum SettingsOutcome {
+    Changed,
+    NoOp,
+}
+
+fn settings_cmd(action: SettingsAction) -> Result<()> {
+    let outcome = match action {
+        SettingsAction::Enable {
+            url,
+            zport,
+            statusline,
+        } => settings_enable(&url, &zport, &statusline)?,
+        SettingsAction::Disable => settings_disable()?,
+        SettingsAction::RouteUrl => {
+            print_route_url();
+            return Ok(());
+        }
+    };
+    match outcome {
+        SettingsOutcome::Changed => Ok(()),
+        SettingsOutcome::NoOp => std::process::exit(3),
+    }
+}
+
+/// A leading UTF-8 BOM is not JSON whitespace, so serde_json rejects it — and it's common
+/// in a settings.json saved by a Windows editor. Strip it before parsing on every read.
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+/// Read+parse a settings.json, treating a missing file as `{}`. A parse failure is a hard
+/// error — we must never clobber a file we can't understand.
+fn load_settings_or_empty(path: &Path) -> Result<Value> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(strip_bom(&text)).with_context(|| {
+            format!(
+                "{} is not valid JSON; refusing to overwrite. Fix it and re-run.",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Mutable handle to `v[key]` as an object, creating an empty one if absent or non-object.
+/// `v` must already be an object.
+fn ensure_object<'a>(v: &'a mut Value, key: &str) -> &'a mut serde_json::Map<String, Value> {
+    let map = v.as_object_mut().expect("settings root is an object");
+    if !map.get(key).map(Value::is_object).unwrap_or(false) {
+        map.insert(key.to_string(), json!({}));
+    }
+    map.get_mut(key)
+        .and_then(Value::as_object_mut)
+        .expect("just inserted an object")
+}
+
+/// Atomically write `value` as pretty JSON (2-space, trailing newline — like jq): write a
+/// same-dir temp, then rename over the target. `std::fs::rename` is atomic and replaces an
+/// existing file on both Unix and Windows (MoveFileEx w/ REPLACE_EXISTING).
+fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut text = serde_json::to_string_pretty(value)?;
+    text.push('\n');
+    let tmp = dir.join(format!(".settings.json.tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
+}
+
+fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsOutcome> {
+    let proj = project_root();
+    let settings_dir = proj.join(".claude");
+    let settings_file = settings_dir.join("settings.json");
+    std::fs::create_dir_all(&settings_dir)
+        .with_context(|| format!("creating {}", settings_dir.display()))?;
+
+    let mut v = load_settings_or_empty(&settings_file)?;
+    if !v.is_object() {
+        bail!(
+            "{} is not a JSON object; refusing to overwrite. Fix it and re-run.",
+            settings_file.display()
+        );
+    }
+
+    // Idempotency: is this project ALREADY pointed at this exact proxy (url + port)?
+    let cur_url = v
+        .pointer("/env/ANTHROPIC_BASE_URL")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let cur_port = v
+        .pointer("/env/ZLAUDER_PORT")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let already = base_url_matches(cur_url, url) && cur_port == zport;
+
+    // Status-line takeover: snapshot the user's original line (unless it's already ours)
+    // to the sidecar that /zlauder:disable restores from and the wrapper reads.
+    let sidecar = wrap_sidecar_path(&proj);
+    let cur_sl_cmd = v
+        .pointer("/statusLine/command")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !is_zlauder_statusline(cur_sl_cmd) {
+        match v.get("statusLine") {
+            Some(orig) if !orig.is_null() => {
+                let compact = serde_json::to_string(orig)?;
+                std::fs::write(&sidecar, format!("{compact}\n"))
+                    .with_context(|| format!("writing {}", sidecar.display()))?;
+                println!(
+                    "ZlauDeR: wrapping your existing status line (saved to {}; restored on /zlauder:disable).",
+                    sidecar.display()
+                );
+            }
+            // No prior line to wrap: clear any stale sidecar from an earlier setup.
+            _ => {
+                let _ = std::fs::remove_file(&sidecar);
+            }
+        }
+    }
+
+    // Set the routing env (always) and take over the status-line slot (always).
+    let env = ensure_object(&mut v, "env");
+    env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        Value::String(url.to_string()),
+    );
+    env.insert("ZLAUDER_PORT".to_string(), Value::String(zport.to_string()));
+    v["statusLine"] = json!({ "type": "command", "command": statusline });
+
+    atomic_write_json(&settings_file, &v)?;
+    Ok(if already {
+        SettingsOutcome::NoOp
+    } else {
+        SettingsOutcome::Changed
+    })
+}
+
+fn settings_disable() -> Result<SettingsOutcome> {
+    let proj = project_root();
+    let settings_file = proj.join(".claude").join("settings.json");
+    let sidecar = wrap_sidecar_path(&proj);
+
+    let text = match std::fs::read_to_string(&settings_file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SettingsOutcome::NoOp),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", settings_file.display())),
+    };
+    let mut v: Value = serde_json::from_str(strip_bom(&text)).with_context(|| {
+        format!(
+            "{} is not valid JSON; refusing to edit. Fix it and re-run.",
+            settings_file.display()
+        )
+    })?;
+
+    // Trigger on ANY zlauder wiring — env key OR our status line — so disable is a true
+    // inverse even in asymmetric state (e.g. a key left by a partial edit).
+    let has_env_wiring = v.pointer("/env/ANTHROPIC_BASE_URL").is_some()
+        || v.pointer("/env/ZLAUDER_PORT").is_some();
+    let sl_is_ours = is_zlauder_statusline(
+        v.pointer("/statusLine/command")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    if !has_env_wiring && !sl_is_ours {
+        return Ok(SettingsOutcome::NoOp);
+    }
+
+    // The original line to restore (if enable wrapped one). `None` => just drop ours.
+    let restore: Option<Value> = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(strip_bom(&t)).ok());
+
+    // Delete the keys enable added (and the env object if it ends up empty).
+    if let Some(env) = v.get_mut("env").and_then(Value::as_object_mut) {
+        env.remove("ANTHROPIC_BASE_URL");
+        env.remove("ZLAUDER_PORT");
+        if env.is_empty()
+            && let Some(root) = v.as_object_mut()
+        {
+            root.remove("env");
+        }
+    }
+    // Undo the status-line takeover only when the current line is still OURS — a line the
+    // user set by hand after enabling is left alone.
+    if sl_is_ours {
+        match restore {
+            Some(orig) => v["statusLine"] = orig,
+            None => {
+                if let Some(root) = v.as_object_mut() {
+                    root.remove("statusLine");
+                }
+            }
+        }
+    }
+
+    atomic_write_json(&settings_file, &v)?;
+    let _ = std::fs::remove_file(&sidecar);
+    Ok(SettingsOutcome::Changed)
+}
+
+/// Print env.ANTHROPIC_BASE_URL from settings.json (else settings.local.json), or
+/// "(unset)". Replaces privacy.sh's optional jq one-liner. Reads in the same precedence
+/// as `project_configures`.
+fn print_route_url() {
+    let proj = project_root();
+    for name in [".claude/settings.json", ".claude/settings.local.json"] {
+        if let Ok(text) = std::fs::read_to_string(proj.join(name))
+            && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&text))
+            && let Some(u) = v
+                .pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str)
+        {
+            println!("{u}");
+            return;
+        }
+    }
+    println!("(unset)");
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +690,37 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
             .stderr(std::process::Stdio::from(log_err));
         if let Some(cfg) = &config {
             cmd.arg("--config").arg(cfg);
+        }
+        // Detach the long-lived proxy from THIS hook process so nothing we own can keep
+        // it tethered: the proxy must outlive the session (sibling `claude` windows and
+        // later sessions reuse the one per-project proxy), and it must not hold the
+        // SessionStart hook's stdout pipe — the one Claude Code reads our hook JSON from —
+        // open, or the FIRST `claude` (the one that launches it) stalls waiting for EOF.
+        // The stdio handles are already redirected to log files; these flags drop the
+        // remaining console/session tether on each platform.
+        #[cfg(windows)]
+        {
+            // No inherited console (DETACHED_PROCESS) => no live handle back to us;
+            // CREATE_NEW_PROCESS_GROUP isolates the daemon from our Ctrl-C/console events.
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        #[cfg(unix)]
+        {
+            // POSIX analogue: setsid() puts the proxy in its OWN session with no
+            // controlling terminal, so a terminal SIGHUP (or a process-group kill on
+            // session exit) can't reap a daemon meant to persist. pre_exec runs in the
+            // forked child before exec; setsid() is async-signal-safe and always succeeds
+            // there (the fresh child is never already a process-group leader).
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
         }
         if let Err(e) = cmd.spawn() {
             // A hard spawn failure (e.g. proxy binary missing) must not leave the
@@ -741,12 +1041,39 @@ fn wrap_sidecar_path(proj: &Path) -> PathBuf {
 /// `/zlauder:disable` can restore it.
 fn read_wrap_original(proj: &Path) -> Option<String> {
     let txt = std::fs::read_to_string(wrap_sidecar_path(proj)).ok()?;
-    let v: Value = serde_json::from_str(&txt).ok()?;
+    let v: Value = serde_json::from_str(strip_bom(&txt)).ok()?;
     let cmd = v.get("command")?.as_str()?.trim();
-    if cmd.is_empty() || cmd.contains("zlauder-hooks") && cmd.contains("statusline") {
+    if cmd.is_empty() || is_zlauder_statusline(cmd) {
         return None;
     }
     Some(cmd.to_string())
+}
+
+/// Is `cmd` one of OUR status-line commands — `[<path>/]zlauder-hooks[.exe] statusline`?
+/// We match `zlauder-hooks statusline` (or the `.exe` form) as a contiguous substring AND
+/// require `zlauder-hooks` to be a command BASENAME: at the string start, or right after a
+/// path separator (`/` or `\`). enable.sh only ever emits the name bare or after `'<dir>'/`,
+/// so real installs always match — but a user line where the token is merely an argument
+/// (`echo zlauder-hooks statusline`) or a different binary whose name ends in it
+/// (`/usr/local/bin/not-zlauder-hooks statusline`) does NOT, so we never silently eat their
+/// status line. This is stricter than the old jq regex `zlauder-hooks(\.exe)? statusline`,
+/// which was anchorless and would have over-claimed both. Single source of truth for
+/// enable/disable's slot-ownership test and the wrapper's self-reference guard; no regex dep.
+fn is_zlauder_statusline(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    for needle in ["zlauder-hooks statusline", "zlauder-hooks.exe statusline"] {
+        let mut from = 0;
+        while let Some(rel) = cmd[from..].find(needle) {
+            let at = from + rel;
+            // `zlauder-hooks` must be a basename: string start, or after a path separator.
+            // Boundary chars are ASCII, so a UTF-8 continuation byte (>=0x80) correctly fails.
+            if at == 0 || matches!(bytes[at - 1], b'/' | b'\\') {
+                return true;
+            }
+            from = at + 1; // `at` indexes an ASCII 'z', so `at + 1` stays on a char boundary.
+        }
+    }
+    false
 }
 
 fn read_stdin_bytes() -> Vec<u8> {
@@ -787,13 +1114,21 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // Lead our own process group so a timeout can signal the whole job tree, not
-    // just the immediate shell — a backgrounded grandchild could otherwise survive
-    // holding our stdout pipe open and strand the reader thread.
+    // Isolate the wrapped command into its own job/group so a timeout can tear down the
+    // whole tree, not just the immediate shell — a backgrounded grandchild could otherwise
+    // survive holding our stdout pipe open and strand the reader thread. Unix: lead a new
+    // process group (kill_group signals it). Windows: a new process group, and kill_group
+    // uses `taskkill /T` to reap the tree (cmd.exe + descendants).
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         builder.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        builder.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     let mut child = builder.spawn().ok()?;
 
@@ -850,10 +1185,11 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// Kill an overrunning wrapped status-line process and reap it. On Unix we signal
-/// the whole process group (the child leads its own group via `process_group(0)`)
-/// so a backgrounded grandchild can't survive holding our stdout pipe open;
-/// elsewhere we fall back to killing the child directly.
+/// Kill an overrunning wrapped status-line process AND its descendants, then reap it.
+/// `child.kill()` alone terminates only the immediate shell (cmd.exe / sh), so a
+/// backgrounded grandchild can survive holding our stdout pipe open and strand the reader
+/// thread. Unix signals the whole process group (the child leads its own via
+/// `process_group(0)`); Windows uses `taskkill /T` to walk the process tree.
 fn kill_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -863,6 +1199,15 @@ fn kill_group(child: &mut std::process::Child) {
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
+    }
+    #[cfg(windows)]
+    {
+        // /T = terminate the whole tree (cmd.exe + its children), /F = force.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -1533,7 +1878,7 @@ fn project_configures(root: &str, base_url: &str) -> bool {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        let Ok(v) = serde_json::from_str::<Value>(strip_bom(&text)) else {
             continue;
         };
         if let Some(url) = v

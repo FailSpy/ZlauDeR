@@ -82,6 +82,10 @@ pub fn user_config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        // Windows fallback when HOME is unset (Claude Code launched from cmd/PowerShell
+        // may not export HOME to Git Bash): %APPDATA% is the roaming config root, so the
+        // path becomes %APPDATA%\zlauder\config.toml.
+        .or_else(windows_appdata)
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("zlauder").join("config.toml")
 }
@@ -97,17 +101,45 @@ pub fn derive_port(project_root: &str) -> u16 {
     PORT_BASE + (n % PORT_SPAN)
 }
 
-/// Root directory for zlauder state files (created `0700`).
+/// Root directory for zlauder state files (created `0700` on Unix).
 ///
-/// `ZLAUDER_STATE_DIR` wins; else `$XDG_RUNTIME_DIR/zlauder`; else a temp dir.
+/// `ZLAUDER_STATE_DIR` wins; else `$XDG_RUNTIME_DIR/zlauder`; else (Windows)
+/// `%LOCALAPPDATA%\zlauder`; else a temp dir.
+///
+/// NOTE: `set_mode` is a no-op on Windows (see below), so the `0700` is not enforced
+/// there — the state file holds the proxy's admin key + salt. We therefore prefer a
+/// per-user dir (`%LOCALAPPDATA%`) over the shared, cleanup-prone temp dir on Windows;
+/// hardening file ACLs further is out of scope.
 pub fn state_dir() -> Result<PathBuf> {
     let base = std::env::var_os("ZLAUDER_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("zlauder")))
+        .or_else(windows_localappdata_zlauder)
         .unwrap_or_else(|| std::env::temp_dir().join("zlauder"));
     std::fs::create_dir_all(&base).with_context(|| format!("creating state dir {base:?}"))?;
     set_mode(&base, 0o700);
     Ok(base)
+}
+
+/// `%LOCALAPPDATA%\zlauder` on Windows (a per-user, non-volatile dir), else `None`.
+#[cfg(windows)]
+fn windows_localappdata_zlauder() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("zlauder"))
+}
+#[cfg(not(windows))]
+fn windows_localappdata_zlauder() -> Option<PathBuf> {
+    None
+}
+
+/// `%APPDATA%` (the roaming config root) on Windows, else `None`. Used as a config-path
+/// fallback when neither `XDG_CONFIG_HOME` nor `HOME` is set.
+#[cfg(windows)]
+fn windows_appdata() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(PathBuf::from)
+}
+#[cfg(not(windows))]
+fn windows_appdata() -> Option<PathBuf> {
+    None
 }
 
 /// Path to the state file for `port` (`<state_dir>/proxy-<port>.json`).
@@ -128,16 +160,22 @@ pub fn read_state_opt(port: u16) -> Option<ProxyState> {
     read_state(port).ok()
 }
 
-/// Is `pid` (probably) a live process? Linux uses `/proc/<pid>`, Windows asks the
-/// OS process table, and other platforms conservatively assume alive (never steal a
-/// port we can't prove is dead).
+/// Is `pid` (probably) a live process? Unix (Linux AND macOS) uses POSIX `kill(pid, 0)`;
+/// Windows asks the OS process table; any other platform conservatively assumes alive
+/// (never steal a port we can't prove is dead).
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
+        // kill(pid, 0) sends no signal but runs the kernel's existence + permission
+        // checks: 0 => the process is alive; errno EPERM => it exists but isn't ours
+        // (still alive); ESRCH => it's gone. Portable across Linux and macOS, unlike a
+        // `/proc` probe — without this, macOS hit the conservative "always alive" arm,
+        // so a crashed proxy's stale record was never reclaimable and pinned its port.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {
@@ -162,7 +200,7 @@ fn pid_alive(pid: u32) -> bool {
                     .unwrap_or(false)
             })
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -295,6 +333,11 @@ fn set_mode(path: &Path, mode: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
+// No-op on non-Unix (Windows): there is no portable `chmod`, so state files are not
+// permission-restricted there. The proxy state file holds the admin key + salt, so on
+// Windows we instead place the state dir under a per-user location (`%LOCALAPPDATA%`,
+// see `state_dir`) rather than a world-readable temp dir; tightening NTFS ACLs is out of
+// scope.
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) {}
 

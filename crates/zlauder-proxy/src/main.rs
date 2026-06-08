@@ -214,6 +214,29 @@ fn decode_hex_array<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    // The proxy runs detached (the hooks launcher setsid's it on Unix / spawns it
+    // DETACHED on Windows), so it must drain gracefully on SIGTERM as well as SIGINT —
+    // SIGTERM is what a bare `kill <pid>`, an OS shutdown, and an updated launcher all
+    // send. Catching only ctrl_c (SIGINT) would let those hard-terminate it mid-request.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            // Couldn't register SIGTERM — fall back to SIGINT-only rather than never draining.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("shutting down");
 }

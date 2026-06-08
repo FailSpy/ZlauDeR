@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.91"
 license = "BUSL-1.1"
@@ -46,7 +46,12 @@ lru      = "0.12"
 
 # serde / common
 serde       = { version = "1.0", features = ["derive"] }
-serde_json  = "1.0"
+# preserve_order (IndexMap-backed Map): keep object key order on read/rewrite. Without
+# it, Value uses a BTreeMap and rewriting a user's .claude/settings.json would
+# alphabetize their keys (the `settings enable/disable` path replaces the old jq, which
+# preserved order). Workspace-wide, so the proxy's JSON walk also preserves upstream key
+# order instead of sorting it — neutral-to-correct for a masking passthrough.
+serde_json  = { version = "1.0", features = ["preserve_order"] }
 thiserror   = "2.0"
 toml        = "0.8"
 anyhow      = "1.0"
