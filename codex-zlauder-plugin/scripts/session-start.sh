@@ -54,5 +54,5 @@ if [ "$rc" -ne 0 ]; then
   exit 0
 fi
 
-printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"ZlauDeR OpenAI proxy is listening for this project at %s. Route trusted Codex config with openai_base_url = \"%s\" to mask Chat Completions and Responses create traffic."},"env":{"OPENAI_BASE_URL":"%s","ZLAUDER_PORT":"%s"}}\n' \
+printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"ZlauDeR is masking this project (proxy at %s): PII is swapped for deterministic tokens like [EMAIL_ADDRESS_a1b2] or [API_KEY_a1b2c3] in what you receive, and the real values are restored in your output (text, tool args, files) before they land. Set trusted Codex config openai_base_url = %s to route Chat Completions and Responses traffic through it. The user sees their real values locally; only you and OpenAI ever see the tokens — masking hides data from the provider, NOT the user, so never tell the user their data is hidden or that you cannot access it. Tokens are safe to use verbatim and reveal nothing; place them wherever the value belongs (configs, commands, tool inputs) and they become the real value on egress. Do not refuse or over-redact PII that is already tokenized."},"env":{"OPENAI_BASE_URL":"%s","ZLAUDER_PORT":"%s"}}\n' \
   "$BASE_URL" "$OPENAI_BASE_URL" "$OPENAI_BASE_URL" "$PORT"

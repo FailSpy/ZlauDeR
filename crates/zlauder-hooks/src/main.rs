@@ -333,7 +333,10 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
                         "additionalContext":
                             "ZlauDeR is configured for this project but masking is NOT active \
                              this session: Claude Code must be restarted to route through the \
-                             proxy. Until then, outbound text reaches the model unmasked."
+                             local proxy. Until then, outbound text reaches the API provider \
+                             UNMASKED — real PII, not tokens. (This is about what the provider \
+                             sees; the user always sees their own plaintext locally either way.) \
+                             Tell the user to restart Claude Code to activate masking."
                     }
                 })
             );
@@ -448,9 +451,20 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext":
-                "ZlauDeR PII masking proxy active for this project. Outbound text is masked \
-                 before it reaches the model; responses are unmasked on return. Tokens look \
-                 like [EMAIL_ADDRESS_xxxx]. Configure with the /zlauder:privacy command."
+                "ZlauDeR is masking this project: a local proxy swaps PII for deterministic \
+                 tokens like [EMAIL_ADDRESS_a1b2] or [API_KEY_a1b2c3] in what you receive, and \
+                 restores the real values in your output — text, tool arguments, and files — \
+                 before they land.\n\
+                 - The user sees their real values locally; only you and the API provider ever \
+                 see the tokens. Masking hides data from the provider, NOT the user — never \
+                 tell the user their data is hidden, redacted, or that you can't access it.\n\
+                 - Tokens are safe to use freely and reveal nothing (you only ever hold the \
+                 token; it becomes the real value on the way out). Use the exact token verbatim \
+                 wherever the value belongs — prose, config files (writing \
+                 \"api_key\": \"[API_KEY_a1b2c3]\" puts the REAL key in the file), shell \
+                 commands, tool inputs. Don't refuse, over-redact, or warn about \"exposing\" \
+                 PII by using tokens; the tokenization is what makes it safe.\n\
+                 Configure masking/routing with /zlauder:privacy (this project only)."
         },
         "env": { "ANTHROPIC_BASE_URL": session_base_url, "ZLAUDER_PORT": port.to_string() }
     });
@@ -569,33 +583,137 @@ fn reserve_port_cmd(port: Option<u16>) -> Result<()> {
 // statusline
 // ---------------------------------------------------------------------------
 
-fn statusline(port: Option<u16>) -> Result<()> {
-    let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
+/// How much the zlauder status-line segment shows, chosen by `$ZLAUDER_STATUSLINE`.
+/// Defaults to `Compact`. `Off` hides the zlauder segment entirely — when the status
+/// line wraps a user's original line (see [`read_wrap_original`]), that original still
+/// prints, so `off` means "show only my line, no zlauder chrome", not "blank".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlMode {
+    Off,
+    Min,
+    Compact,
+    Verbose,
+}
 
-    if !proxy_healthy(port) {
-        println!("\u{26a0} ZlauDeR off");
-        return Ok(());
+fn sl_mode() -> SlMode {
+    match std::env::var("ZLAUDER_STATUSLINE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("off" | "none" | "hidden" | "0" | "false") => SlMode::Off,
+        Some("min" | "minimal" | "compact-min") => SlMode::Min,
+        Some("verbose" | "full" | "all") => SlMode::Verbose,
+        _ => SlMode::Compact,
     }
-    // Try the (key-gated) config endpoint for a richer indicator. We only show the
-    // shield (🛡) when we have CONFIRMED masking is on; any unconfirmed state (key
-    // desync / 403 / stale state / unfamiliar shape) degrades to "❔ unverified" —
-    // never a false shield (review finding C5).
-    match key_for(port).and_then(|k| admin_get(port, &k)) {
-        Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
-            Ok(s) if s.enabled => {
-                println!(
-                    "\u{1f6e1} ZlauDeR :{port} {}{}",
-                    s.config.profile,
-                    ml_indicator(s.ml.as_ref())
-                )
-            }
-            Ok(_) => println!("\u{26a0} ZlauDeR OFF :{port}"),
-            Err(_) => println!("\u{2754} ZlauDeR :{port} (unverified)"),
-        },
-        Err(_) => println!("\u{2754} ZlauDeR :{port} (unverified)"),
+}
+
+fn statusline(port: Option<u16>) -> Result<()> {
+    let proj = project_root();
+    let root = canonical(&proj);
+    let port = port.unwrap_or_else(|| pick_port(&root));
+    let mode = sl_mode();
+
+    // The zlauder segment (None only in `off` mode). Built first so a slow/absent
+    // wrapped command never delays or suppresses our own privacy indicator.
+    let segment = match mode {
+        SlMode::Off => None,
+        _ => Some(render_segment(port, mode)),
+    };
+
+    // Seamless wrap: if the user already had a status line when `/zlauder:enable` ran,
+    // that original was saved to a sidecar. Run it (forwarding the exact session JSON
+    // Claude Code fed us on stdin) and prepend our segment, so the user keeps their
+    // line as `🛡 … │ {their line}`. We only touch stdin when there's something to
+    // forward — reading it unconditionally would block when run from an interactive
+    // shell (e.g. someone testing `zlauder-hooks statusline` by hand).
+    let wrapped = read_wrap_original(&proj).and_then(|cmd| {
+        let stdin = read_stdin_bytes();
+        run_wrapped(&cmd, &stdin)
+    });
+
+    let line = compose_line(segment, wrapped);
+    if !line.is_empty() {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// Join the zlauder segment and the wrapped original line with a `│` divider. Either
+/// side may be absent: `off` mode drops the segment; an unwrapped/empty original drops
+/// the right side. Kept pure (no I/O) so the join rules are unit-testable.
+fn compose_line(segment: Option<String>, wrapped: Option<String>) -> String {
+    match (segment, wrapped) {
+        (Some(seg), Some(w)) if !w.trim().is_empty() => format!("{seg} \u{2502} {w}"),
+        (Some(seg), _) => seg,
+        (None, Some(w)) => w,
+        (None, None) => String::new(),
+    }
+}
+
+/// Render the zlauder segment for a non-`Off` mode. We only show the shield (🛡) when
+/// we have CONFIRMED masking is on; any unconfirmed state (proxy down / key desync /
+/// 403 / stale state / unfamiliar shape) degrades to an explicit offline/off/unverified
+/// marker — never a false shield (review finding C5).
+fn render_segment(port: u16, mode: SlMode) -> String {
+    if !proxy_healthy(port) {
+        return match mode {
+            SlMode::Min => "\u{26a0}".to_string(), // ⚠
+            _ => "\u{26a0} ZlauDeR offline".to_string(),
+        };
+    }
+    match key_for(port).and_then(|k| admin_get(port, &k)) {
+        Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
+            Ok(s) if s.enabled => render_on(&s, port, mode),
+            Ok(_) => match mode {
+                SlMode::Min => "\u{26a0}".to_string(),
+                _ => format!("\u{26a0} ZlauDeR OFF :{port}"),
+            },
+            Err(_) => unverified(port, mode),
+        },
+        Err(_) => unverified(port, mode),
+    }
+}
+
+fn unverified(port: u16, mode: SlMode) -> String {
+    match mode {
+        SlMode::Min => "\u{2754}".to_string(), // ❔
+        _ => format!("\u{2754} ZlauDeR :{port} (unverified)"),
+    }
+}
+
+/// The confirmed-on segment. `token_count` is the number of distinct tokens minted
+/// this session — i.e. unique PII values caught — so it doubles as the "N PII" count.
+fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
+    let ml = ml_indicator(s.ml.as_ref());
+    match mode {
+        SlMode::Off => String::new(),
+        SlMode::Min => "\u{1f6e1}".to_string(), // 🛡 only
+        SlMode::Compact => format!(
+            "\u{1f6e1} :{port} {}{}{}",
+            s.config.profile,
+            ml,
+            pii_suffix(s.token_count)
+        ),
+        SlMode::Verbose => format!(
+            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]",
+            s.config.profile,
+            s.config.score_threshold,
+            ml,
+            s.token_count,
+            s.config.enabled_categories.join(",")
+        ),
+    }
+}
+
+/// `" 7 PII"` once anything has been caught; empty until then (keeps a fresh session's
+/// line tight rather than reading `0 PII`).
+fn pii_suffix(n: u64) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(" {n} PII")
+    }
 }
 
 /// Compact ML indicator appended to the status line when masking is on: a brain
@@ -608,6 +726,64 @@ fn ml_indicator(ml: Option<&MlSnap>) -> &'static str {
         Some("failed") => " \u{26a0}ml",  // ⚠ml load failed
         _ => "",
     }
+}
+
+/// Path of the sidecar that holds the user's pre-zlauder `statusLine` object, written
+/// by `/zlauder:enable` when it took over the slot. Lives beside `settings.json`.
+fn wrap_sidecar_path(proj: &Path) -> PathBuf {
+    proj.join(".claude").join("zlauder-statusline.json")
+}
+
+/// The shell command of the user's original status line, if `/zlauder:enable` wrapped
+/// one. Returns `None` when no sidecar exists, it isn't a `command` status line, or —
+/// defensively — the stored command is itself a zlauder status line (which would
+/// recurse). The sidecar stores the original `statusLine` object verbatim so
+/// `/zlauder:disable` can restore it.
+fn read_wrap_original(proj: &Path) -> Option<String> {
+    let txt = std::fs::read_to_string(wrap_sidecar_path(proj)).ok()?;
+    let v: Value = serde_json::from_str(&txt).ok()?;
+    let cmd = v.get("command")?.as_str()?.trim();
+    if cmd.is_empty() || cmd.contains("zlauder-hooks") && cmd.contains("statusline") {
+        return None;
+    }
+    Some(cmd.to_string())
+}
+
+fn read_stdin_bytes() -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut buf);
+    buf
+}
+
+/// Run the user's wrapped status-line command through the shell (matching how Claude
+/// Code itself runs a `command` status line), feeding it the same session JSON on
+/// stdin, and return its trimmed stdout. Any failure (spawn error, non-UTF8, empty
+/// output) yields `None` so the zlauder segment still stands alone.
+fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let (sh, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut child = Command::new(sh)
+        .arg(flag)
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(stdin);
+        // `si` drops here, closing the child's stdin so it can finish.
+    }
+    let out = child.wait_with_output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim_end_matches(['\n', '\r']);
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,6 +1645,66 @@ mod conversation_tests {
     fn no_identifier_yields_none() {
         assert_eq!(conversation_id_from_hook_payload(r#"{"foo": "bar"}"#), None);
         assert_eq!(conversation_id_from_hook_payload("not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod statusline_tests {
+    use super::{compose_line, pii_suffix, read_wrap_original, wrap_sidecar_path};
+
+    #[test]
+    fn compose_joins_segment_and_wrapped_with_divider() {
+        assert_eq!(
+            compose_line(Some("🛡 :18820 balanced".into()), Some("⎇ main".into())),
+            "🛡 :18820 balanced \u{2502} ⎇ main"
+        );
+    }
+
+    #[test]
+    fn compose_drops_empty_or_absent_sides() {
+        // Off-mode segment + a real wrapped line => just the wrapped line.
+        assert_eq!(compose_line(None, Some("⎇ main".into())), "⎇ main");
+        // A segment + a blank wrapped line => just the segment (no trailing divider).
+        assert_eq!(
+            compose_line(Some("🛡 off".into()), Some("   ".into())),
+            "🛡 off"
+        );
+        assert_eq!(compose_line(Some("🛡 off".into()), None), "🛡 off");
+        assert_eq!(compose_line(None, None), "");
+    }
+
+    #[test]
+    fn pii_suffix_hides_zero() {
+        assert_eq!(pii_suffix(0), "");
+        assert_eq!(pii_suffix(7), " 7 PII");
+    }
+
+    #[test]
+    fn read_wrap_original_extracts_command() {
+        let dir = std::env::temp_dir().join(format!("zl-sl-{}", std::process::id()));
+        let claude = dir.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = wrap_sidecar_path(&dir);
+
+        std::fs::write(&path, r#"{"type":"command","command":"echo hi"}"#).unwrap();
+        assert_eq!(read_wrap_original(&dir).as_deref(), Some("echo hi"));
+
+        // A sidecar that somehow points back at a zlauder status line is ignored so the
+        // wrapper can never recurse into itself.
+        std::fs::write(
+            &path,
+            r#"{"type":"command","command":"/x/zlauder-hooks statusline"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_wrap_original(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_wrap_original_none_without_sidecar() {
+        let dir = std::env::temp_dir().join(format!("zl-sl-absent-{}", std::process::id()));
+        assert_eq!(read_wrap_original(&dir), None);
     }
 }
 

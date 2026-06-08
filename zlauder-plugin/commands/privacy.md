@@ -12,6 +12,13 @@ The block above is the result of the unified ZlauDeR privacy control plane for t
 request "$ARGUMENTS" (empty means "show status"). Everything here affects **only
 this project's** proxy — other projects/sessions are unaffected.
 
+When you explain any of this to the user, keep the model of masking right: the
+**user sees their real values locally** at all times — masking only changes what
+the **model and the API provider** see (deterministic `[TOKEN]` stand-ins). It
+protects data from the provider, not from the user. Never tell the user their own
+data is hidden, redacted, or unavailable to them; a token always corresponds to a
+real value they can see, and `reveal` just decodes one for convenience/audit.
+
 This command controls **masking** (what the running proxy does to your text), which
 is live and needs no restart. Do not confuse it with **routing**: `/zlauder:enable`
 and `/zlauder:disable` decide whether traffic goes through the proxy at all (they

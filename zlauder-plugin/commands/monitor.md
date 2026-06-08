@@ -6,5 +6,10 @@ allowed-tools: Bash
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/monitor.sh"`
 
-Open the printed local URL in your browser to view realtime masked request and
-response previews for this project's proxy.
+Tell the user to open the printed local URL in their browser to watch this
+project's traffic in realtime. The monitor shows **what the API provider actually
+receives** — the tokenized payload — alongside the real values it stands for, so
+the user can confirm masking is doing what they expect and, in manual mode,
+approve or reject each request before it leaves the machine. (The user already
+sees their own plaintext locally; the monitor is for auditing what the *provider*
+sees, and for catching anything that should have been masked but wasn't.)
