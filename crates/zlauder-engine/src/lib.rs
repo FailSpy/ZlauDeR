@@ -231,7 +231,14 @@ impl MaskEngine {
         config: EngineConfig,
         make_store: impl FnOnce() -> SessionStore,
     ) -> Result<Self, EngineError> {
-        let analyzer = presidio_analyzer::default_analyzer(&config.language);
+        // Wire the context-aware enhancer: a recognizer's context words (e.g.
+        // PHONE_NUMBER's "call"/"phone"/"number") boost a nearby match's score.
+        // Without it, low-confidence-by-design recognizers (phones score 0.4) never
+        // clear the 0.5 floor. `run_detection` feeds it lightweight NLP artifacts and
+        // pre-filters below the boost band so a boostable candidate survives to be
+        // enhanced (presidio filters before enhancing — see detect.rs).
+        let analyzer = presidio_analyzer::default_analyzer(&config.language)
+            .with_context_enhancer(presidio_analyzer::LemmaContextAwareEnhancer::new());
         let cache_cap = config.detection_cache_cap;
         let policy = Policy::new(config)?;
         Ok(Self {
@@ -1360,11 +1367,13 @@ mod tests {
     // ----- Reveal marker (display-time decoration of un-masked assistant text) ---
 
     fn engine_with_marker(prefix: &str, suffix: &str) -> MaskEngine {
-        let mut cfg = EngineConfig::default();
-        cfg.reveal_marker = RevealMarker {
-            enabled: true,
-            prefix: prefix.to_string(),
-            suffix: suffix.to_string(),
+        let cfg = EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: true,
+                prefix: prefix.to_string(),
+                suffix: suffix.to_string(),
+            },
+            ..EngineConfig::default()
         };
         MaskEngine::new(cfg).unwrap()
     }
@@ -1450,11 +1459,13 @@ mod tests {
     #[test]
     fn reveal_marker_not_in_detection_fingerprint() {
         let base = EngineConfig::default().detection_fingerprint();
-        let mut cfg = EngineConfig::default();
-        cfg.reveal_marker = RevealMarker {
-            enabled: true,
-            prefix: "<<".into(),
-            suffix: ">>".into(),
+        let cfg = EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: true,
+                prefix: "<<".into(),
+                suffix: ">>".into(),
+            },
+            ..EngineConfig::default()
         };
         assert_eq!(
             base,

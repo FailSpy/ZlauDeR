@@ -3,7 +3,7 @@
 
 use presidio_analyzer::recognizers::GENERIC_ENTROPY_PATTERN;
 use presidio_analyzer::{AnalyzeRequest, AnalyzerEngine};
-use presidio_core::{Recognizer, RecognizerResult};
+use presidio_core::{NlpArtifacts, Recognizer, RecognizerResult, Token};
 use regex::{Regex, RegexBuilder};
 use std::collections::HashSet;
 
@@ -26,7 +26,19 @@ use crate::surface::Surface;
 // API_KEY catch-all (see `plausible_generic_secret`) — drops 32+-char file paths,
 // identifiers, and hex/UUID digests that the 0.55 catch-all can't distinguish from a
 // real opaque key. Changes output for unchanged text, so bump to abandon stale cache.
-pub const DETECTOR_VERSION: u64 = 3;
+// v4: wired presidio's LemmaContextAwareEnhancer (context words boost nearby matches,
+// e.g. "call"/"number" lift a PHONE_NUMBER from its 0.4 base over the 0.5 floor). The
+// regex pass now runs with NLP artifacts and a lowered pre-enhancement floor, so
+// context-bearing text yields detections it didn't before — bump to abandon stale cache.
+pub const DETECTOR_VERSION: u64 = 4;
+
+/// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
+/// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
+/// `context_similarity_factor`). The regex pass is pre-filtered to
+/// `score_threshold - CONTEXT_BOOST` so any candidate a context word could lift
+/// over the floor survives presidio's filter-before-enhance step; the authoritative
+/// `score_threshold` gate is then re-applied in `ingest_results` on the boosted score.
+const CONTEXT_BOOST: f32 = 0.35;
 
 /// A custom rule compiled to a regex (literal rules are escaped). Matching via
 /// regex on the original text gives correct byte offsets for any case folding.
@@ -127,9 +139,21 @@ pub fn run_detection(
         }
     }
 
-    // Pass 2: presidio regex analyzer.
-    let results = analyzer
-        .analyze(AnalyzeRequest::new(text, &cfg.language).score_threshold(cfg.score_threshold));
+    // Pass 2: presidio regex analyzer, with context-aware enhancement.
+    //
+    // The enhancer needs NLP artifacts (tokens + lemmas) to find context words near
+    // a match; the regex path has no NLP engine, so we build lightweight artifacts
+    // here. presidio filters by threshold BEFORE enhancing, so we pre-filter at
+    // `score_threshold - CONTEXT_BOOST` — low enough that a boostable candidate
+    // (e.g. a phone at 0.4) survives to be enhanced — and let `ingest_results`
+    // re-apply the authoritative `score_threshold` to the boosted score.
+    let artifacts = context_artifacts(text, &cfg.language);
+    let pre_floor = (cfg.score_threshold - CONTEXT_BOOST).max(0.0);
+    let results = analyzer.analyze(
+        AnalyzeRequest::new(text, &cfg.language)
+            .nlp_artifacts(&artifacts)
+            .score_threshold(pre_floor),
+    );
     ingest_results(
         results,
         cfg,
@@ -168,6 +192,35 @@ pub fn run_detection(
     Ok(resolve_overlaps(dets))
 }
 
+/// Build lightweight NLP artifacts for the context-aware enhancer.
+///
+/// The enhancer only needs word tokens (with byte offsets) and parallel lemmas to
+/// test whether a recognizer's context word (e.g. "call", "phone") sits within the
+/// window before a match. We don't have — or need — a real lemmatizer/NER here: a
+/// match against lowercased word runs catches the literal context words recognizers
+/// declare. Tokens are maximal Unicode alphanumeric runs; punctuation/whitespace are
+/// boundaries (and never emitted), so byte offsets stay correct across multibyte text.
+fn context_artifacts(text: &str, language: &str) -> NlpArtifacts {
+    let mut artifacts = NlpArtifacts::new(language);
+    let mut start: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_alphanumeric() {
+            start.get_or_insert(idx);
+        } else if let Some(s) = start.take() {
+            push_word(&mut artifacts, &text[s..idx], s, idx);
+        }
+    }
+    if let Some(s) = start.take() {
+        push_word(&mut artifacts, &text[s..], s, text.len());
+    }
+    artifacts
+}
+
+fn push_word(artifacts: &mut NlpArtifacts, word: &str, start: usize, end: usize) {
+    artifacts.tokens.push(Token::new(word, start, end));
+    artifacts.lemmas.push(word.to_lowercase());
+}
+
 /// Filter one recognizer's results through the engine policy and push survivors to
 /// `dets` (allow-listed values are recorded as suppression spans instead). Shared
 /// by the regex analyzer (Pass 2) and the ML recognizer (Pass 2b) so both get
@@ -181,9 +234,11 @@ fn ingest_results(
     source: Source,
 ) {
     for r in results {
-        // One predictable score floor across both sources. The regex analyzer is
-        // already filtered to this threshold; the ML recognizer applies its own
-        // `min_score`, so re-applying here keeps the engine-wide floor authoritative.
+        // One predictable score floor across both sources, and the authoritative
+        // gate: the regex analyzer ran with a lowered pre-enhancement floor (so the
+        // context enhancer could boost candidates), and the ML recognizer applies its
+        // own `min_score` — so re-applying `score_threshold` here, on the final
+        // (possibly context-boosted) score, keeps the engine-wide floor authoritative.
         if r.score < cfg.score_threshold {
             continue;
         }
@@ -348,6 +403,75 @@ fn max_lowercase_run(s: &str) -> usize {
         }
     }
     max
+}
+
+#[cfg(test)]
+mod context_enhancer_tests {
+    use super::*;
+
+    /// Build the analyzer the way `MaskEngine::from_parts` now does — with the
+    /// context-aware enhancer wired in.
+    fn enhanced_analyzer() -> presidio_analyzer::AnalyzerEngine {
+        presidio_analyzer::default_analyzer("en")
+            .with_context_enhancer(presidio_analyzer::LemmaContextAwareEnhancer::new())
+    }
+
+    fn phone_detected(text: &str) -> bool {
+        let cfg = EngineConfig::default(); // Balanced: threshold 0.5, Contact on
+        let dets = run_detection(
+            &enhanced_analyzer(),
+            &cfg,
+            &[],
+            None,
+            text,
+            Surface::UserMessage,
+        )
+        .unwrap();
+        dets.iter().any(|d| d.entity_type == "PHONE_NUMBER")
+    }
+
+    #[test]
+    fn phone_with_context_word_is_boosted_over_threshold() {
+        // Base PHONE_NUMBER score is 0.4 (< 0.5 floor); the context word "Call"
+        // within the prefix window lifts it to 0.75, so it now masks.
+        assert!(
+            phone_detected("Call me at +1 415 555 0132 about the contract."),
+            "a phone with a nearby context word should clear the threshold"
+        );
+        assert!(
+            phone_detected("My number is +1 415 555 0132."),
+            "\"number\" is a phone context word and should boost the match"
+        );
+    }
+
+    #[test]
+    fn bare_phone_without_context_stays_below_threshold() {
+        // No phone context word nearby: the 0.4 base stays below the 0.5 floor.
+        // (Documents the tradeoff — context boosts recall; lowering the threshold or
+        // the Strict profile is the lever for context-free phones.)
+        assert!(
+            !phone_detected("The reference value is +1 415 555 0132 exactly."),
+            "a context-free phone should remain below the default threshold"
+        );
+    }
+
+    #[test]
+    fn context_artifacts_are_byte_correct_across_multibyte() {
+        // Token byte offsets must index the original string correctly even after a
+        // multibyte char, so the enhancer's window lands on the right words.
+        let text = "Café — call +1 415 555 0132";
+        let a = context_artifacts(text, "en");
+        for t in &a.tokens {
+            assert_eq!(
+                &text[t.start..t.end],
+                t.text,
+                "token offsets must be byte-correct"
+            );
+        }
+        assert!(a.tokens.iter().any(|t| t.text == "Café"));
+        assert_eq!(a.tokens.len(), a.lemmas.len(), "lemmas parallel tokens");
+        assert!(a.lemmas.iter().any(|l| l == "call"));
+    }
 }
 
 #[cfg(test)]
