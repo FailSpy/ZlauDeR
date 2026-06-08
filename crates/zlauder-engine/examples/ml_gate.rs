@@ -359,41 +359,81 @@ operating territories and partner facilities for the remainder of the calendar y
     // Engine + scoring
     // ---------------------------------------------------------------------------
 
+    /// True iff this host has the AVX512-BF16 ISA the native `Bf16Vnni` kernel needs.
+    /// Mirrors presidio's `has_avx512_bf16`; the gate checks independently so it can
+    /// REFUSE to certify Bf16Vnni on a host where it would silently fall back to the
+    /// safe kernel (a fallback run must never masquerade as a Bf16Vnni recall proof).
+    fn host_has_avx512_bf16() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bf16")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
     /// Build a Strict-profile engine with the ML recognizer loaded synchronously.
     /// Returns the engine and the recognizer handle (for direct scoring) on success.
-    fn build_engine_with_ml() -> Result<(MaskEngine, std::sync::Arc<dyn Recognizer>), String> {
+    ///
+    /// `baseline=true` (for `--dump-golden`) forces the canonical **F32 / None / dense
+    /// oracle**, ignoring env — that is the reference truth the golden records.
+    /// `baseline=false` (for `--check-golden`) builds the **SHIPPED DEFAULTS**
+    /// (Bf16 + banded) so a *bare* gate run validates what production actually runs;
+    /// env vars then override a single lever to measure it against the F32 golden:
+    ///   `ZLAUDER_ML_QUANT`     = none|bf16|bf16_vnni|q8_0  (default: bf16, shipped)
+    ///   `ZLAUDER_ML_BANDED`    = 0/1                       (default: 1, shipped)
+    ///   `ZLAUDER_ML_PRECISION` = f32|f16                   (default: f32)
+    fn build_engine_with_ml(
+        baseline: bool,
+    ) -> Result<(MaskEngine, std::sync::Arc<dyn Recognizer>), String> {
         let mut cfg = EngineConfig::for_profile(Profile::Strict);
-        // Default precision is F32 (the real gate path). `ZLAUDER_ML_PRECISION=f16`
-        // flips the recall-risk f16 lever ON for INFORMATIONAL recall measurement
-        // only — it never changes the default/golden path, which stays F32.
-        let precision = match std::env::var("ZLAUDER_ML_PRECISION").ok().as_deref() {
-            Some("f16") | Some("F16") => zlauder_engine::ComputePrecision::F16,
-            _ => zlauder_engine::ComputePrecision::F32,
+        let (precision, quant, banded) = if baseline {
+            // The golden oracle: always F32 / None / dense, independent of env.
+            (
+                zlauder_engine::ComputePrecision::F32,
+                zlauder_engine::Quantization::None,
+                false,
+            )
+        } else {
+            let precision = match std::env::var("ZLAUDER_ML_PRECISION").ok().as_deref() {
+                Some("f16") | Some("F16") => zlauder_engine::ComputePrecision::F16,
+                _ => zlauder_engine::ComputePrecision::F32,
+            };
+            // Default to the SHIPPED quant (Bf16); explicit values select a lever
+            // (`none`/`f32` forces the F32 path to reproduce the golden via check).
+            let quant = match std::env::var("ZLAUDER_ML_QUANT").ok().as_deref() {
+                Some("none") | Some("None") | Some("f32") => zlauder_engine::Quantization::None,
+                Some("q8_0") | Some("Q8_0") | Some("q8") => zlauder_engine::Quantization::Q8_0,
+                Some("bf16") | Some("BF16") => zlauder_engine::Quantization::Bf16,
+                Some("bf16_vnni") | Some("bf16vnni") | Some("vnni") => {
+                    zlauder_engine::Quantization::Bf16Vnni
+                }
+                _ => zlauder_engine::Quantization::Bf16, // shipped default
+            };
+            // Default to the SHIPPED banded=true; explicit 0/false/off forces dense.
+            let banded = !matches!(
+                std::env::var("ZLAUDER_ML_BANDED").ok().as_deref(),
+                Some("0") | Some("false") | Some("off")
+            );
+            (precision, quant, banded)
         };
-        // The gate's quant is F32/None UNLESS overridden here — this is the gate
-        // BASELINE, deliberately F32 so `--dump-golden` captures the F32 reference
-        // (independent of the production default, which is now Quantization::Bf16).
-        // `ZLAUDER_ML_QUANT` selects a lever to MEASURE against that F32 golden:
-        // `bf16` (recall-neutral), `bf16_vnni`/`q8_0` (recall-risk). It never
-        // changes the golden baseline itself.
-        let quant = match std::env::var("ZLAUDER_ML_QUANT").ok().as_deref() {
-            Some("q8_0") | Some("Q8_0") | Some("q8") => zlauder_engine::Quantization::Q8_0,
-            Some("bf16") | Some("BF16") => zlauder_engine::Quantization::Bf16,
-            Some("bf16_vnni") | Some("bf16vnni") | Some("vnni") => {
-                zlauder_engine::Quantization::Bf16Vnni
-            }
-            _ => zlauder_engine::Quantization::None,
-        };
-        // Default banded_attention is false (the real gate path). `ZLAUDER_ML_BANDED=1`
-        // flips the recall-risk banded-attention lever ON for the gate's
-        // equivalence measurement — the banded path is designed to be
-        // bit-equivalent to dense, but the gate must PROVE zero dropped
-        // true-positives and score delta < 1e-3 (esp. on long-doc fixtures)
-        // before it is trusted; it never changes the default/golden path.
-        let banded = matches!(
-            std::env::var("ZLAUDER_ML_BANDED").ok().as_deref(),
-            Some("1") | Some("true") | Some("on")
-        );
+
+        // Refuse to certify the native VNNI kernel on a host that will silently fall
+        // back to the safe (recall-neutral) bf16 kernel: the gate would report a
+        // PASS for Bf16Vnni without ever exercising the recall-RISK vdpbf16ps path
+        // that rounds activations (audit privacy #1). Fail loudly instead.
+        if matches!(quant, zlauder_engine::Quantization::Bf16Vnni) && !host_has_avx512_bf16() {
+            return Err(
+                "ZLAUDER_ML_QUANT=bf16_vnni requested, but this host lacks AVX512-BF16 — the \
+                 native vdpbf16ps kernel would silently fall back to the safe bf16 kernel. \
+                 Refusing to certify a Bf16Vnni recall result that did not run the risky path."
+                    .to_string(),
+            );
+        }
+
         cfg.ml = MlConfig {
             enabled: true,
             model: "openai/privacy-filter".to_string(),
@@ -402,9 +442,14 @@ operating territories and partner facilities for the remainder of the calendar y
             banded_attention: banded,
             ..Default::default()
         };
-        eprintln!("compute_precision = {precision:?} (default F32; f16 is recall-risk, informational only)");
-        eprintln!("quant = {quant:?} (gate baseline F32/None; set ZLAUDER_ML_QUANT=bf16|bf16_vnni|q8_0 to measure a lever vs the F32 golden)");
-        eprintln!("banded_attention = {banded} (default false; banded is recall-risk opt-in, gate-only)");
+        eprintln!(
+            "[{}] compute_precision={precision:?} quant={quant:?} banded_attention={banded}",
+            if baseline {
+                "dump: F32 oracle"
+            } else {
+                "check: shipped defaults (env overrides one lever vs the F32 golden)"
+            }
+        );
 
         let engine = MaskEngine::new(cfg.clone()).map_err(|e| format!("build engine: {e}"))?;
 
@@ -610,7 +655,8 @@ operating territories and partner facilities for the remainder of the calendar y
     }
 
     fn dump_golden(path: &str) -> ExitCode {
-        let (engine, rec) = match build_engine_with_ml() {
+        // The golden is the canonical F32/None/dense oracle (baseline=true).
+        let (engine, rec) = match build_engine_with_ml(true) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("FATAL: {e}");
@@ -690,7 +736,10 @@ operating territories and partner facilities for the remainder of the calendar y
             }
         };
 
-        let (engine, rec) = match build_engine_with_ml() {
+        // Check the SHIPPED defaults (Bf16 + banded) against the F32 golden
+        // (baseline=false); env vars override a single lever. A bare
+        // `--check-golden` therefore validates exactly what production runs.
+        let (engine, rec) = match build_engine_with_ml(false) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("FATAL: {e}");
