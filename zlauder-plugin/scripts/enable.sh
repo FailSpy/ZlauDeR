@@ -68,7 +68,11 @@ base_url="http://127.0.0.1:${port}"
 # existing line — see below); re-running /zlauder:enable refreshes a stale path, and
 # /zlauder:disable restores the user's original line from the sidecar.
 if [ -n "${ZLAUDER_BIN_DIR:-}" ]; then
-  statusline_cmd="${ZLAUDER_BIN_DIR}/${ZLAUDER_HOOKS_BIN} statusline"
+  # Single-quote ONLY the directory so an install path with spaces survives Claude
+  # Code's shell splitting it into argv. The binary name stays outside the quotes so
+  # `zlauder-hooks statusline` remains contiguous for the ownership regex in this
+  # script and disable.sh ("zlauder-hooks(\.exe)? statusline").
+  statusline_cmd="'${ZLAUDER_BIN_DIR}'/${ZLAUDER_HOOKS_BIN} statusline"
 else
   statusline_cmd="${ZLAUDER_HOOKS_BIN} statusline"
 fi
