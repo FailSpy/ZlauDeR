@@ -203,6 +203,15 @@ pub struct MonitorSnapshot {
     pub max_pending_approvals: usize,
     pub records: Vec<RequestRecord>,
     pub conversations: Vec<ConversationMeta>,
+    /// Server-side hold timeout in seconds. A pending request silently becomes a
+    /// reject after this elapses; the UI drives a live countdown from this value.
+    /// Additive field; deserializes to the historical default when absent.
+    #[serde(default = "default_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+}
+
+fn default_approval_timeout_secs() -> u64 {
+    300
 }
 
 /// SSE event envelope: `{ "event": ..., "data": ... }`.

@@ -43,9 +43,16 @@
     <button id="saveMode" class="btn ghost">SET</button>
   </div>
 
-  <div class="queue-meter" id="queueMeter" title="pending approval queue">
-    <div class="queue-bar"><span class="queue-fill" id="queueFill"></span></div>
-    <span class="queue-text" id="queue">0 / 0</span>
+  <div class="queue-wrap">
+    <div class="queue-meter" id="queueMeter" title="pending approval queue — click to review holds">
+      <div class="queue-bar"><span class="queue-fill" id="queueFill"></span></div>
+      <span class="queue-text"><span id="queuePend">0</span> / </span>
+      <input class="queue-cap" id="queueCap" type="number" min="0" step="1" value="0"
+             title="max pending approvals — new requests are rejected past this">
+    </div>
+    <span class="backpressure-note" id="backpressureNote" hidden>
+      queue full &mdash; new requests are being rejected. raise the cap or clear holds.
+    </span>
   </div>
 </header>
 
@@ -65,6 +72,15 @@
     <div class="rail-head">
       <span class="rail-title" id="recordsTitle">TRAFFIC</span>
       <button class="chip-btn" id="clearFilter" hidden>&times; channel</button>
+    </div>
+    <div class="df-bar">
+      <button class="df-chip" data-filter="pending">PENDING <span class="df-n" id="fcPending">0</span></button>
+      <button class="df-chip" data-filter="rejected">REJECTED <span class="df-n" id="fcRejected">0</span></button>
+      <button class="df-chip" data-filter="backpressure">BLOCKED <span class="df-n" id="fcBackpressure">0</span></button>
+      <button class="df-chip" data-filter="all">ALL <span class="df-n" id="fcAll">0</span></button>
+    </div>
+    <div class="rail-search">
+      <input id="trafficSearch" placeholder="filter by id / endpoint / tag / entity&hellip;" autocomplete="off">
     </div>
     <div class="rail-scroll" id="records"></div>
   </section>

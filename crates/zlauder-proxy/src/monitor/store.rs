@@ -17,7 +17,8 @@ use super::spans::{now_ms, preview, spans_from_manifest, spans_from_values, toke
 use super::surfaces::{surfaces_from_body, surfaces_from_response_body};
 
 const MAX_RECORDS: usize = 500;
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+const APPROVAL_TIMEOUT_SECS: u64 = 300;
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(APPROVAL_TIMEOUT_SECS);
 const DEFAULT_MAX_PENDING_APPROVALS: usize = 32;
 /// Cap on the per-conversation cache of last-turn surface hashes. Keeps deltas
 /// computable even after the prior turn's record is evicted from the global ring.
@@ -85,6 +86,7 @@ impl Monitor {
             max_pending_approvals: inner.max_pending_approvals,
             records: inner.records.iter().cloned().collect(),
             conversations: conversations_from_records(&inner.records),
+            approval_timeout_secs: APPROVAL_TIMEOUT_SECS,
         }
     }
 
@@ -412,6 +414,34 @@ fn push_record(records: &mut VecDeque<RequestRecord>, record: RequestRecord) {
     }
 }
 
+/// Derive a friendlier channel label than the raw conversation id.
+///
+/// Real conversation ids are opaque UUIDs/hashes; the triage rail reads better
+/// as the endpoint's terminal segment plus a short id tail (e.g.
+/// `messages · a1b2c3`). Falls back to the bare id when it is already short.
+fn conversation_label(endpoint: &str, conversation_id: &str) -> String {
+    let leaf = endpoint
+        .rsplit(['/', ':'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(endpoint);
+    let id = conversation_id.trim();
+    if id == "unknown" || id.is_empty() {
+        return format!("{leaf} · unknown");
+    }
+    // Last six chars give a stable, human-scannable tail without leaking the
+    // full id into the rail (the full id stays available via the row title).
+    let tail: String = {
+        let chars: Vec<char> = id.chars().collect();
+        let n = chars.len();
+        chars[n.saturating_sub(6)..].iter().collect()
+    };
+    if tail == id {
+        id.to_string()
+    } else {
+        format!("{leaf} · {tail}")
+    }
+}
+
 /// Build the conversation timeline from the current record set.
 fn conversations_from_records(records: &VecDeque<RequestRecord>) -> Vec<ConversationMeta> {
     let mut metas: HashMap<String, ConversationMeta> = HashMap::new();
@@ -421,7 +451,7 @@ fn conversations_from_records(records: &VecDeque<RequestRecord>) -> Vec<Conversa
             .entry(r.conversation_id.clone())
             .or_insert_with(|| ConversationMeta {
                 id: r.conversation_id.clone(),
-                label: r.conversation_id.clone(),
+                label: conversation_label(&r.endpoint, &r.conversation_id),
                 turn_count: 0,
                 last_updated_ms: 0,
                 pending_count: 0,
