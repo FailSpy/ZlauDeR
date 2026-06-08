@@ -729,6 +729,22 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .pol-check input { accent-color: var(--cyan); }
 .pol-check:has(input:checked) { border-color: var(--cyan-dim); color: var(--ink); background: var(--cyan-glow); }
 
+/* Personal is ML-only: a persistent "needs ML" tag, and an amber "inert" row when
+   it is enabled but the model is not ready (it masks nothing in that state). */
+.pol-need-ml {
+  font-family: var(--mono); font-style: normal; font-size: 8.5px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--amber); border: 1px solid var(--amber-dim);
+  border-radius: 99px; padding: 1px 5px; margin-left: 5px; vertical-align: middle;
+}
+.pol-check.inert { border-color: var(--amber-dim); background: var(--amber-glow); color: var(--amber); }
+.pol-check.inert input { accent-color: var(--amber); }
+.pol-ml-warn {
+  font-size: 10.5px; line-height: 1.5; color: var(--amber);
+  background: var(--amber-glow); border: 1px solid var(--amber-dim);
+  border-radius: var(--radius); padding: 8px 10px; margin: 2px 0 10px;
+}
+.pol-ml-warn b { color: var(--ink); }
+
 .pol-ml-status {
   font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
   padding: 1px 9px; border-radius: 99px; border: 1px solid var(--line); color: var(--ink-faint);

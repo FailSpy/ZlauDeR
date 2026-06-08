@@ -920,12 +920,39 @@ function applyPolicyConfig(snap) {
 
   // ML
   const status = ml.status || (ml.enabled ? 'loading' : 'disabled');
+  mlStatus = status;
   $('polMlToggle').checked = !!ml.enabled;
   $('polMlLabel').textContent = ml.enabled ? 'enabled' : 'disabled';
   const sEl = $('polMlStatus');
   sEl.textContent = status;
   sEl.className = 'pol-ml-status ' + status;
   $('polMlModel').textContent = ml.model ? `model: ${ml.model}${ml.error ? ' — ' + ml.error : ''}` : '';
+
+  refreshPersonalTier();
+}
+
+/* Personal (PERSON/LOCATION/ORGANIZATION) is ML-only — no regex can find arbitrary
+   names — so it masks NOTHING unless the openai/privacy-filter model is loaded AND
+   ready. We do NOT disable the checkbox (you may want to pre-arm Personal before
+   turning the model on), but we flag it hard so it's never mistaken for active:
+   a persistent "needs ML" tag, plus an active warning + amber "inert" row whenever
+   Personal is enabled while the model is not `ready`. The warning is keyed on the
+   live ml STATUS, so it auto-clears the moment the model goes ready. */
+let mlStatus = 'disabled';
+function refreshPersonalTier() {
+  const box = $('polCats').querySelector('input[value=personal]');
+  const on = !!(box && box.checked);
+  const ready = mlStatus === 'ready';
+  const warn = $('polPersonalWarn');
+  $('polCheckPersonal').classList.toggle('inert', on && !ready);
+  if (!on || ready) { warn.hidden = true; warn.textContent = ''; return; }
+  const msg = mlStatus === 'loading'
+    ? 'Personal entities are not masked <b>yet</b> — the openai/privacy-filter model is still <b>loading</b>. Names, locations &amp; organisations start masking the moment it is ready.'
+    : mlStatus === 'failed'
+    ? '&#9888; Personal is enabled but the model <b>FAILED to load</b> — names, locations &amp; organisations are <b>NOT being masked</b>. Re-enable the model under ML RECOGNIZER below, or untick Personal.'
+    : '&#9888; Personal only masks with the ML model, which is <b>OFF</b>. Names, locations &amp; organisations are <b>NOT being masked</b> right now. Enable &amp; load the model under ML RECOGNIZER below.';
+  warn.innerHTML = msg;
+  warn.hidden = false;
 }
 
 function loadPolicy() {
@@ -959,7 +986,7 @@ function refreshDivergence() {
   }
 }
 $('polProfile').addEventListener('change', refreshDivergence);
-$('polCats').addEventListener('change', refreshDivergence);
+$('polCats').addEventListener('change', () => { refreshDivergence(); refreshPersonalTier(); });
 
 /* ---- profile ---- */
 $('polApplyProfile').addEventListener('click', () => {
