@@ -237,6 +237,8 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .rec.active { background: var(--bg-panel); box-shadow: inset 2px 0 0 var(--cyan); }
 .rec.pending { box-shadow: inset 3px 0 0 var(--pending); }
 .rec.pending.active { box-shadow: inset 3px 0 0 var(--pending), inset 0 0 0 1px rgba(255,211,77,.1); }
+.rec.inflight { box-shadow: inset 3px 0 0 var(--cyan); }
+.rec.inflight.active { box-shadow: inset 3px 0 0 var(--cyan), inset 0 0 0 1px rgba(95,211,224,.12); }
 .rec.flash { animation: recFlash 1.1s ease-out; }
 @keyframes recFlash {
   0% { background: var(--cyan-glow); box-shadow: inset 3px 0 0 var(--cyan), 0 0 24px -6px var(--cyan); }
@@ -257,6 +259,7 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .st-good    { color: var(--good); background: rgba(95,211,139,.07); }
 .st-bad     { color: var(--bad);  background: rgba(255,93,108,.07); }
 .st-amber   { color: var(--amber); background: rgba(255,180,84,.08); }
+.st-live    { color: var(--cyan); background: var(--cyan-glow); animation: pulse 1.4s ease-in-out infinite; }
 .tok-count { color: var(--amber); }
 .tok-count.zero { color: var(--ink-dim); }
 .risk-tag {
@@ -272,6 +275,7 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 }
 .rec-clock.warn { color: var(--amber); }
 .rec-clock.crit { color: var(--bad); font-weight: 700; animation: blink 1s step-end infinite; }
+.rec-clock.live { color: var(--cyan); animation: pulse 1.4s ease-in-out infinite; }
 @keyframes blink { 50% { opacity: .35; } }
 .rec-kinds { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .rec-kind {
@@ -368,6 +372,7 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 }
 .kind-system, .kind-instructions { color: var(--cyan); border-color: var(--cyan-dim); }
 .kind-tool_result { color: #b59cf0; border-color: #4a3d73; }
+.kind-tool_use { color: var(--cyan); border-color: var(--cyan-dim); }
 .kind-message { color: var(--ink); }
 .surface-label { font-size: 10.5px; color: var(--ink-dim); }
 .surface-hash { font-size: 9px; color: var(--ink-faint); margin-left: auto; letter-spacing: .04em; }

@@ -33,7 +33,7 @@ pub use model::{
     RejectRequest, RequestDecision, RequestRecord, Run, Surface, TagsRequest, TokenPreview,
     TokenRef, TurnDelta,
 };
-pub use store::{Monitor, ReviewTicket};
+pub use store::{CompletionGuard, Monitor, ReviewTicket};
 pub use ui::ui;
 
 use ::http::HeaderMap;

@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt};
 use sse_core::{SseClient, SseEvent};
 use zlauder_engine::{MAX_TOKEN_LEN, MaskEngine, UnmaskManifest, token_regex};
 
+use crate::monitor::CompletionGuard;
 use crate::walk::unmask_value;
 
 // ---------------------------------------------------------------------------
@@ -260,14 +261,19 @@ struct StreamState {
     xform: SseUnmasker,
     queue: VecDeque<Bytes>,
     done: bool,
+    /// Finalizes the monitor record: drain → Completed, upstream error →
+    /// UpstreamError, drop-while-armed (client disconnect) → Aborted.
+    guard: CompletionGuard,
 }
 
 /// Build an axum body that relays the upstream SSE stream, unmasking tokens in
-/// text/tool-input/compaction deltas across frame boundaries.
+/// text/tool-input/compaction deltas across frame boundaries. `guard` finalizes
+/// the monitor lifecycle when the stream ends or the client disconnects.
 pub fn unmask_sse_body(
     upstream: ByteStream,
     engine: Arc<MaskEngine>,
     manifest: Arc<UnmaskManifest>,
+    guard: CompletionGuard,
 ) -> axum::body::Body {
     let state = StreamState {
         client: SseClient::new(upstream),
@@ -276,6 +282,7 @@ pub fn unmask_sse_body(
         xform: SseUnmasker::new(),
         queue: VecDeque::new(),
         done: false,
+        guard,
     };
 
     let stream = futures::stream::unfold(state, |mut st| async move {
@@ -288,7 +295,10 @@ pub fn unmask_sse_body(
             }
             match st.client.next().await {
                 Some(Ok(sse)) => enqueue(&mut st, sse),
-                Some(Err(_)) => st.done = true,
+                Some(Err(_)) => {
+                    st.guard.upstream_error("upstream stream error");
+                    st.done = true;
+                }
                 None => {
                     for (index, held) in st.xform.drain() {
                         let flushed = st
@@ -299,6 +309,7 @@ pub fn unmask_sse_body(
                             st.queue.push_back(frame_for(&text_delta(index, flushed)));
                         }
                     }
+                    st.guard.complete();
                     st.done = true;
                 }
             }

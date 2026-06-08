@@ -61,11 +61,11 @@
 <main class="grid">
   <aside class="rail rail-convos">
     <div class="rail-head">
-      <span class="rail-title">CHANNELS</span>
+      <span class="rail-title">CONVERSATIONS</span>
       <span class="rail-count" id="convoCount">0</span>
     </div>
     <div class="rail-search">
-      <input id="convoFilterInput" placeholder="filter channels&hellip;" autocomplete="off">
+      <input id="convoFilterInput" placeholder="filter conversations&hellip;" autocomplete="off">
     </div>
     <div class="rail-scroll" id="sessions"></div>
   </aside>
@@ -73,9 +73,10 @@
   <section class="rail rail-records">
     <div class="rail-head">
       <span class="rail-title" id="recordsTitle">TRAFFIC</span>
-      <button class="chip-btn" id="clearFilter" hidden>&times; channel</button>
+      <button class="chip-btn" id="clearFilter" hidden>&times; conversation</button>
     </div>
     <div class="df-bar">
+      <button class="df-chip" data-filter="live">LIVE <span class="df-n" id="fcLive">0</span></button>
       <button class="df-chip" data-filter="pending">PENDING <span class="df-n" id="fcPending">0</span></button>
       <button class="df-chip" data-filter="rejected">REJECTED <span class="df-n" id="fcRejected">0</span></button>
       <button class="df-chip" data-filter="backpressure">BLOCKED <span class="df-n" id="fcBackpressure">0</span></button>

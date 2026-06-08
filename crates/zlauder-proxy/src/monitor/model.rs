@@ -34,11 +34,35 @@ pub enum RequestDecision {
     AutoAccepted,
     Pending,
     Approved,
+    /// Released upstream; awaiting (or streaming) the response. Set by
+    /// `record_dispatched` just before the upstream call and cleared to
+    /// `Completed` when the response body / SSE stream finishes.
+    InFlight,
     Rejected,
     BackpressureRejected,
     TimedOut,
     UpstreamError,
+    /// The downstream client disconnected before the response completed (the
+    /// streamed body was dropped mid-flight). Terminal.
+    Aborted,
     Completed,
+}
+
+impl RequestDecision {
+    /// A terminal verdict that later lifecycle writes must not overwrite. Keeps
+    /// a stream drop-guard / late drain from resurrecting `Completed` over an
+    /// error or abort, or double-stamping a finished record.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RequestDecision::Rejected
+                | RequestDecision::BackpressureRejected
+                | RequestDecision::TimedOut
+                | RequestDecision::UpstreamError
+                | RequestDecision::Aborted
+                | RequestDecision::Completed
+        )
+    }
 }
 
 /// One masked token occurrence, with its hidden plaintext (local UI only).
@@ -174,6 +198,10 @@ pub struct RequestRecord {
     // --- additive fields (overhaul) ---
     /// 1-based position of this request within its conversation, by start order.
     pub turn_index: u32,
+    /// When the request was released upstream (`record_dispatched`). Drives the
+    /// live "streaming" elapsed timer in the UI. `None` until dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_ms: Option<u128>,
     /// Pre-segmented reviewable surfaces of the masked request body.
     pub request_surfaces: Vec<Surface>,
     /// Pre-segmented reviewable surfaces of the response body (best effort).

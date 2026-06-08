@@ -46,13 +46,31 @@ struct Inner {
     /// Newest-first ring buffer of records.
     records: VecDeque<RequestRecord>,
     waiters: HashMap<String, oneshot::Sender<ApprovalDecision>>,
-    /// Per-conversation turn counter (monotonic, 1-based).
+    /// Per-conversation turn counter (monotonic, 1-based) — the source of
+    /// `turn_index`. Evicted ONLY together with the conversation's anchor for the
+    /// same LRU-cold victim (see [`evict_stale_conversation_state`]): a live
+    /// conversation has a recent `last_seen` so it is never the victim, and a cold
+    /// one re-mints from scratch on return anyway (its anchor is gone too), so the
+    /// counter is never dropped out from under an in-flight lineage.
     turn_counts: HashMap<String, u32>,
     /// Per-conversation cache of the most recent turn's `(turn_index, surface
     /// block_hashes)`. Lets the delta survive eviction of the prior turn's full
     /// record from the global ring, so a resent transcript is not mis-flagged as
     /// "first contact / all new". Bounded by [`MAX_TRACKED_CONVERSATIONS`].
     last_turn_hashes: HashMap<String, (u32, Vec<String>)>,
+    /// Content-derived conversation anchors: auto-id → the conversation's current
+    /// ordered sequence of non-system surface `block_hash`es. A new request with
+    /// no explicit id is matched to the conversation whose anchor is a clean
+    /// prefix of the request's surface sequence (longest wins); see
+    /// [`resolve_content_conversation`]. Bounded by [`MAX_TRACKED_CONVERSATIONS`].
+    conversation_anchors: HashMap<String, Vec<String>>,
+    /// Per-conversation last-seen timestamp (ms), used as the LRU key when
+    /// evicting `last_turn_hashes` / `conversation_anchors` / `labels`.
+    last_seen: HashMap<String, u128>,
+    /// Per-conversation display label, cached at mint time (a snippet of the
+    /// first user message). Recomputing it from the ring is wrong — records are
+    /// newest-first and turn-1 evicts — so it is stored once when minted.
+    labels: HashMap<String, String>,
 }
 
 impl Default for Monitor {
@@ -73,6 +91,9 @@ impl Monitor {
                 waiters: HashMap::new(),
                 turn_counts: HashMap::new(),
                 last_turn_hashes: HashMap::new(),
+                conversation_anchors: HashMap::new(),
+                last_seen: HashMap::new(),
+                labels: HashMap::new(),
             })),
             events,
         }
@@ -85,7 +106,7 @@ impl Monitor {
             pending_count: inner.waiters.len(),
             max_pending_approvals: inner.max_pending_approvals,
             records: inner.records.iter().cloned().collect(),
-            conversations: conversations_from_records(&inner.records),
+            conversations: conversations_from_records(&inner.records, &inner.labels),
             approval_timeout_secs: APPROVAL_TIMEOUT_SECS,
         }
     }
@@ -129,11 +150,30 @@ impl Monitor {
             .iter()
             .map(|s| s.block_hash.clone())
             .collect();
-        let conversation_id = conversation_id.unwrap_or_else(|| "unknown".to_string());
+        // Content anchor for the conversation heuristic: the ordered hashes of the
+        // conversation-specific surfaces. Exclude `system`/`instructions` — Claude
+        // Code's system prompt is shared across all conversations and is the
+        // dominant false-merge vector. `message` + `tool_use` + `tool_result`
+        // remain, so the prefix still grows in tool-only agentic turns.
+        let anchor_seq: Vec<String> = request_surfaces
+            .iter()
+            .filter(|s| s.kind != "system" && s.kind != "instructions")
+            .map(|s| s.block_hash.clone())
+            .collect();
 
         let mut inner = self.inner.lock().expect("monitor mutex poisoned");
         let id = format!("req-{}", inner.next_seq);
         inner.next_seq += 1;
+
+        // Resolve the conversation id. An explicit id (session URL / header) always
+        // wins. Otherwise derive it from the transcript prefix; a body with no
+        // anchorable surface (e.g. metadata-only) falls back to the shared
+        // `"unknown"` bucket (no prefix matching — never mint from an empty head).
+        let conversation_id = match conversation_id {
+            Some(id) => id,
+            None if anchor_seq.is_empty() => "unknown".to_string(),
+            None => resolve_content_conversation(&mut inner.conversation_anchors, &anchor_seq),
+        };
         let should_hold = match inner.mode {
             MonitorMode::Off => false,
             MonitorMode::ManualAllLlm => true,
@@ -174,17 +214,22 @@ impl Monitor {
         };
 
         // Cache this turn's surface hashes (computed before the lock) for future
-        // delta computation after the full record is evicted from the ring.
+        // delta computation after the full record is evicted from the ring; stamp
+        // last-seen (the LRU eviction key); cache the conversation label once (from
+        // the resent transcript's first user message — works on any turn).
         {
-            // Reborrow through the guard so the two field accesses are seen as
+            // Reborrow through the guard so the field accesses are seen as
             // disjoint by the borrow checker.
             let inner = &mut *inner;
             inner
                 .last_turn_hashes
                 .insert(conversation_id.clone(), (turn_index, this_turn_hashes));
-            if inner.last_turn_hashes.len() > MAX_TRACKED_CONVERSATIONS {
-                evict_stale_conversation_hashes(&mut inner.last_turn_hashes, &inner.turn_counts);
+            inner.last_seen.insert(conversation_id.clone(), now);
+            if !inner.labels.contains_key(&conversation_id) {
+                let label = first_message_label(&request_surfaces, endpoint, &conversation_id);
+                inner.labels.insert(conversation_id.clone(), label);
             }
+            evict_stale_conversation_state(inner);
         }
 
         let pending_full = should_hold && inner.waiters.len() >= inner.max_pending_approvals;
@@ -221,6 +266,7 @@ impl Monitor {
             tags: Vec::new(),
             rejection_reason: immediate_reject.clone(),
             turn_index,
+            dispatched_ms: None,
             request_surfaces,
             response_surfaces: Vec::new(),
             delta,
@@ -237,6 +283,12 @@ impl Monitor {
 
     pub fn record_response(&self, id: &str, status: u16, body: Option<&[u8]>) {
         self.update_record(id, |r| {
+            // Terminal-idempotent: a late drain or a drop-guard firing after the
+            // record already reached a terminal verdict must NOT resurrect
+            // `Completed` over an error/abort or re-stamp the response surfaces.
+            if r.decision.is_terminal() {
+                return;
+            }
             r.response_status = Some(status);
             r.response_preview = body.map(preview);
             r.response_spans = r
@@ -250,19 +302,40 @@ impl Monitor {
             r.response_surfaces = body
                 .map(|b| surfaces_from_response_body(b, &r.tokens))
                 .unwrap_or_default();
-            if !matches!(
+            r.decision = RequestDecision::Completed;
+        });
+    }
+
+    /// Mark a request as released upstream (awaiting / streaming the response).
+    /// Only advances from an accepted/approved state — never over a terminal one.
+    pub fn record_dispatched(&self, id: &str) {
+        self.update_record(id, |r| {
+            if matches!(
                 r.decision,
-                RequestDecision::Rejected
-                    | RequestDecision::TimedOut
-                    | RequestDecision::BackpressureRejected
+                RequestDecision::AutoAccepted | RequestDecision::Approved
             ) {
-                r.decision = RequestDecision::Completed;
+                r.decision = RequestDecision::InFlight;
+                r.dispatched_ms = Some(now_ms());
             }
+        });
+    }
+
+    /// The downstream client disconnected before the streamed response finished.
+    pub fn record_aborted(&self, id: &str) {
+        self.update_record(id, |r| {
+            if r.decision.is_terminal() {
+                return;
+            }
+            r.decision = RequestDecision::Aborted;
+            r.rejection_reason = Some("client disconnected before response completed".to_string());
         });
     }
 
     pub fn record_upstream_error(&self, id: &str, msg: &str) {
         self.update_record(id, |r| {
+            if r.decision.is_terminal() {
+                return;
+            }
             r.decision = RequestDecision::UpstreamError;
             r.rejection_reason = Some(msg.to_string());
         });
@@ -359,6 +432,52 @@ impl Monitor {
     }
 }
 
+/// RAII guard that finalizes a streamed response's lifecycle. Held inside the
+/// per-response SSE stream state so it is dropped when the stream ends OR the
+/// downstream client disconnects mid-flight. A natural drain calls
+/// [`CompletionGuard::complete`]; an upstream stream error calls
+/// [`CompletionGuard::upstream_error`]; a drop while still armed (client
+/// disconnect) records `Aborted`. Single-fire via the `armed` flag.
+pub struct CompletionGuard {
+    monitor: Monitor,
+    id: String,
+    status: u16,
+    armed: bool,
+}
+
+impl CompletionGuard {
+    pub fn new(monitor: Monitor, id: String, status: u16) -> Self {
+        Self {
+            monitor,
+            id,
+            status,
+            armed: true,
+        }
+    }
+
+    /// The stream drained normally: record `Completed` and disarm.
+    pub fn complete(&mut self) {
+        if std::mem::replace(&mut self.armed, false) {
+            self.monitor.record_response(&self.id, self.status, None);
+        }
+    }
+
+    /// The upstream stream errored mid-flight: record `UpstreamError` and disarm.
+    pub fn upstream_error(&mut self, msg: &str) {
+        if std::mem::replace(&mut self.armed, false) {
+            self.monitor.record_upstream_error(&self.id, msg);
+        }
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.monitor.record_aborted(&self.id);
+        }
+    }
+}
+
 /// Approval handle returned by [`Monitor::record_llm_request`].
 pub struct ReviewTicket {
     id: String,
@@ -389,21 +508,115 @@ fn previous_turn_surfaces(
         .map(|r| (r.turn_index, r.request_surfaces.clone()))
 }
 
-/// Bound the per-conversation last-turn hash cache. Drops the entries with the
-/// lowest current turn count (least active conversations) until back under cap.
-fn evict_stale_conversation_hashes(
-    cache: &mut HashMap<String, (u32, Vec<String>)>,
-    turn_counts: &HashMap<String, u32>,
-) {
-    while cache.len() > MAX_TRACKED_CONVERSATIONS {
-        let Some(victim) = cache
-            .keys()
-            .min_by_key(|k| turn_counts.get(*k).copied().unwrap_or(0))
-            .cloned()
+/// Bound every per-conversation map by evicting the least-recently-seen
+/// conversations until back under cap. All five maps (`turn_counts`,
+/// `last_seen`, `last_turn_hashes`, `conversation_anchors`, `labels`) are evicted
+/// as a SET for the same victim, so they never disagree. Choosing the victim by
+/// `last_seen` (recency) — not by turn count — guarantees the victim is genuinely
+/// cold: a live conversation has a recent `last_seen` and is never selected. A
+/// cold conversation that later returns re-mints a fresh id (its anchor is gone),
+/// so retaining only its turn counter would be dead weight AND an unbounded leak.
+fn evict_stale_conversation_state(inner: &mut Inner) {
+    while inner.last_seen.len() > MAX_TRACKED_CONVERSATIONS {
+        let Some(victim) = inner
+            .last_seen
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(k, _)| k.clone())
         else {
             break;
         };
-        cache.remove(&victim);
+        inner.last_seen.remove(&victim);
+        inner.turn_counts.remove(&victim);
+        inner.last_turn_hashes.remove(&victim);
+        inner.conversation_anchors.remove(&victim);
+        inner.labels.remove(&victim);
+    }
+}
+
+/// Length of the clean prefix `anchor` forms of `seq`: `anchor.len()` when
+/// `anchor` matches the head of `seq` exactly, else 0 (a partial/divergent
+/// overlap does not count — only a clean prefix joins a conversation).
+fn anchor_prefix_len(anchor: &[String], seq: &[String]) -> usize {
+    if anchor.is_empty() || anchor.len() > seq.len() {
+        return 0;
+    }
+    if anchor.iter().zip(seq).all(|(a, s)| a == s) {
+        anchor.len()
+    } else {
+        0
+    }
+}
+
+/// Resolve a content-derived conversation id for a request that carried no
+/// explicit id. Matches the tracked conversation whose anchor is the longest
+/// clean prefix of `seq` (tie-broken by id for determinism); a strictly-longer
+/// match advances that anchor to `seq`. An exact-length match joins the lineage
+/// WITHOUT overwriting its anchor (so a colliding turn-1 cannot steal it). No
+/// match mints a fresh `auto-<head>` id, disambiguated by a digest of the full
+/// sequence when that base key is already taken by a different lineage.
+///
+/// ACCEPTED LIMITATION (paired review): two genuinely-distinct conversations
+/// whose first user message is byte-identical after masking share the same turn-1
+/// `seq`, so the second joins the first's lineage for turn 1 and only separates
+/// once their transcripts diverge on a later turn (a one-time relabel). There is
+/// no out-of-band signal to tell them apart at turn 1; this is inherent to
+/// content-derived identity and is preferable to scattering every turn into its
+/// own bucket (the bug this whole heuristic replaces).
+fn resolve_content_conversation(anchors: &mut HashMap<String, Vec<String>>, seq: &[String]) -> String {
+    let best = anchors
+        .iter()
+        .filter_map(|(id, anchor)| {
+            let n = anchor_prefix_len(anchor, seq);
+            (n > 0).then(|| (n, id.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    if let Some((n, id)) = best {
+        if n < seq.len() {
+            anchors.insert(id.clone(), seq.to_vec());
+        }
+        return id;
+    }
+    let head = &seq[0];
+    let base = format!("auto-{head}");
+    let id = if anchors.contains_key(&base) {
+        let disc: String = blake3::hash(seq.join("|").as_bytes())
+            .to_hex()
+            .as_str()
+            .chars()
+            .take(8)
+            .collect();
+        format!("auto-{head}-{disc}")
+    } else {
+        base
+    };
+    anchors.insert(id.clone(), seq.to_vec());
+    id
+}
+
+/// A human conversation label: a short snippet of the first user message
+/// (masked — safe to show), falling back to the endpoint + id tail. Computed
+/// from `request_surfaces`, which on every turn carry the full resent transcript,
+/// so the first message is present even on a mid-conversation cold start.
+fn first_message_label(surfaces: &[Surface], endpoint: &str, conversation_id: &str) -> String {
+    let snippet = surfaces
+        .iter()
+        .find(|s| s.kind == "message" && s.role.as_deref() == Some("user"))
+        .or_else(|| surfaces.iter().find(|s| s.kind == "message"))
+        .map(|s| s.runs.iter().map(|r| r.text.as_str()).collect::<String>());
+    match snippet {
+        Some(t) => {
+            let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.is_empty() {
+                conversation_label(endpoint, conversation_id)
+            } else if collapsed.chars().count() > 48 {
+                let head: String = collapsed.chars().take(48).collect();
+                format!("{head}…")
+            } else {
+                collapsed
+            }
+        }
+        None => conversation_label(endpoint, conversation_id),
     }
 }
 
@@ -442,8 +655,251 @@ fn conversation_label(endpoint: &str, conversation_id: &str) -> String {
     }
 }
 
-/// Build the conversation timeline from the current record set.
-fn conversations_from_records(records: &VecDeque<RequestRecord>) -> Vec<ConversationMeta> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn body(msgs: &[(&str, Value)]) -> Vec<u8> {
+        let arr: Vec<Value> = msgs
+            .iter()
+            .map(|(role, content)| json!({ "role": role, "content": content }))
+            .collect();
+        serde_json::to_vec(&json!({ "messages": arr })).unwrap()
+    }
+
+    fn record(m: &Monitor, b: &[u8]) -> String {
+        let manifest = UnmaskManifest::new();
+        m.record_llm_request("/v1/messages", "POST", None, b, &manifest)
+            .id()
+            .to_string()
+    }
+
+    fn convo_of(m: &Monitor, id: &str) -> String {
+        m.snapshot()
+            .records
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .conversation_id
+    }
+
+    fn turn_of(m: &Monitor, id: &str) -> u32 {
+        m.snapshot()
+            .records
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .turn_index
+    }
+
+    #[test]
+    fn anchor_prefix_len_requires_clean_prefix() {
+        let a = vec!["h1".to_string(), "h2".to_string()];
+        assert_eq!(anchor_prefix_len(&a, &["h1".into(), "h2".into(), "h3".into()]), 2);
+        assert_eq!(anchor_prefix_len(&a, &["h1".into(), "h2".into()]), 2);
+        // Divergent at index 1 → not a clean prefix.
+        assert_eq!(anchor_prefix_len(&a, &["h1".into(), "X".into(), "h3".into()]), 0);
+        // Anchor longer than seq → 0.
+        assert_eq!(anchor_prefix_len(&a, &["h1".into()]), 0);
+        assert_eq!(anchor_prefix_len(&[], &["h1".into()]), 0);
+    }
+
+    #[test]
+    fn growing_transcript_keeps_one_conversation_with_incrementing_turns() {
+        let m = Monitor::new();
+        let t1 = record(&m, &body(&[("user", json!("fix the build"))]));
+        let t2 = record(
+            &m,
+            &body(&[
+                ("user", json!("fix the build")),
+                ("assistant", json!("on it")),
+                ("user", json!("now run tests")),
+            ]),
+        );
+        assert_eq!(convo_of(&m, &t1), convo_of(&m, &t2));
+        assert_eq!(turn_of(&m, &t1), 1);
+        assert_eq!(turn_of(&m, &t2), 2);
+        assert_eq!(m.snapshot().conversations.len(), 1);
+    }
+
+    #[test]
+    fn divergent_opening_messages_split_into_two_conversations() {
+        let m = Monitor::new();
+        let a = record(&m, &body(&[("user", json!("conversation A opener"))]));
+        let b = record(&m, &body(&[("user", json!("a totally different opener B"))]));
+        assert_ne!(convo_of(&m, &a), convo_of(&m, &b));
+        assert_eq!(turn_of(&m, &a), 1);
+        assert_eq!(turn_of(&m, &b), 1);
+        assert_eq!(m.snapshot().conversations.len(), 2);
+    }
+
+    #[test]
+    fn tool_result_only_turn_still_grows_the_same_conversation() {
+        let m = Monitor::new();
+        let t1 = record(&m, &body(&[("user", json!("call a tool"))]));
+        // Turn 2 appends an assistant tool_use + a user tool_result; no new plain
+        // user message text, but the anchor (which includes tool_use/tool_result)
+        // grows, so it must stay the same conversation.
+        let t2 = record(
+            &m,
+            &body(&[
+                ("user", json!("call a tool")),
+                (
+                    "assistant",
+                    json!([{ "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "cmd": "ls" } }]),
+                ),
+                (
+                    "user",
+                    json!([{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "file.txt" }]),
+                ),
+            ]),
+        );
+        assert_eq!(convo_of(&m, &t1), convo_of(&m, &t2));
+        assert_eq!(turn_of(&m, &t2), 2);
+    }
+
+    #[test]
+    fn explicit_conversation_id_wins_over_content() {
+        let m = Monitor::new();
+        let manifest = UnmaskManifest::new();
+        let id = m
+            .record_llm_request(
+                "/v1/messages",
+                "POST",
+                Some("session-xyz".to_string()),
+                &body(&[("user", json!("hi"))]),
+                &manifest,
+            )
+            .id()
+            .to_string();
+        assert_eq!(convo_of(&m, &id), "session-xyz");
+    }
+
+    #[test]
+    fn empty_anchor_falls_back_to_unknown() {
+        let m = Monitor::new();
+        // A body with no message/tool surfaces (only metadata-ish content).
+        let manifest = UnmaskManifest::new();
+        let b = serde_json::to_vec(&json!({ "metadata": { "k": "v" } })).unwrap();
+        let id = m
+            .record_llm_request("/v1/messages", "POST", None, &b, &manifest)
+            .id()
+            .to_string();
+        assert_eq!(convo_of(&m, &id), "unknown");
+    }
+
+    #[test]
+    fn label_is_first_user_message_snippet() {
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("refactor the CPU hot loop"))]));
+        let cid = convo_of(&m, &id);
+        let label = m
+            .snapshot()
+            .conversations
+            .into_iter()
+            .find(|c| c.id == cid)
+            .unwrap()
+            .label;
+        assert_eq!(label, "refactor the CPU hot loop");
+    }
+
+    #[test]
+    fn dispatch_then_complete_lifecycle() {
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        // Off mode → AutoAccepted.
+        assert!(matches!(
+            convo_decision(&m, &id),
+            RequestDecision::AutoAccepted
+        ));
+        m.record_dispatched(&id);
+        let r = find(&m, &id);
+        assert!(matches!(r.decision, RequestDecision::InFlight));
+        assert!(r.dispatched_ms.is_some());
+        m.record_response(&id, 200, None);
+        assert!(matches!(find(&m, &id).decision, RequestDecision::Completed));
+    }
+
+    #[test]
+    fn terminal_idempotence_blocks_resurrection() {
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        m.record_dispatched(&id);
+        // Client disconnect → Aborted; a late drain must NOT flip it to Completed.
+        m.record_aborted(&id);
+        assert!(matches!(find(&m, &id).decision, RequestDecision::Aborted));
+        m.record_response(&id, 200, None);
+        assert!(matches!(find(&m, &id).decision, RequestDecision::Aborted));
+        // Upstream error stays terminal under a stray completion too.
+        let id2 = record(&m, &body(&[("user", json!("go2"))]));
+        m.record_dispatched(&id2);
+        m.record_upstream_error(&id2, "boom");
+        m.record_response(&id2, 200, None);
+        assert!(matches!(
+            find(&m, &id2).decision,
+            RequestDecision::UpstreamError
+        ));
+    }
+
+    #[test]
+    fn completion_guard_drain_completes_and_is_single_fire() {
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        m.record_dispatched(&id);
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200);
+        g.complete();
+        assert!(matches!(find(&m, &id).decision, RequestDecision::Completed));
+        drop(g); // already disarmed → Drop must NOT flip it to Aborted
+        assert!(matches!(find(&m, &id).decision, RequestDecision::Completed));
+    }
+
+    #[test]
+    fn completion_guard_drop_while_armed_aborts() {
+        // Simulates the downstream client disconnecting mid-stream: axum drops the
+        // body's stream state, dropping the guard while still armed.
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        m.record_dispatched(&id);
+        {
+            let _g = CompletionGuard::new(m.clone(), id.clone(), 200);
+        }
+        assert!(matches!(find(&m, &id).decision, RequestDecision::Aborted));
+    }
+
+    #[test]
+    fn completion_guard_upstream_error_is_terminal() {
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        m.record_dispatched(&id);
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200);
+        g.upstream_error("boom");
+        drop(g); // disarmed → stays UpstreamError, not Aborted
+        assert!(matches!(
+            find(&m, &id).decision,
+            RequestDecision::UpstreamError
+        ));
+    }
+
+    fn find(m: &Monitor, id: &str) -> RequestRecord {
+        m.snapshot()
+            .records
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+    }
+    fn convo_decision(m: &Monitor, id: &str) -> RequestDecision {
+        find(m, id).decision
+    }
+}
+
+/// Build the conversation timeline from the current record set. Labels come from
+/// the mint-time cache (`labels`); the endpoint+tail form is only a fallback for
+/// a conversation whose cached label was evicted.
+fn conversations_from_records(
+    records: &VecDeque<RequestRecord>,
+    labels: &HashMap<String, String>,
+) -> Vec<ConversationMeta> {
     let mut metas: HashMap<String, ConversationMeta> = HashMap::new();
     for r in records {
         let pending = matches!(r.decision, RequestDecision::Pending);
@@ -451,7 +907,10 @@ fn conversations_from_records(records: &VecDeque<RequestRecord>) -> Vec<Conversa
             .entry(r.conversation_id.clone())
             .or_insert_with(|| ConversationMeta {
                 id: r.conversation_id.clone(),
-                label: conversation_label(&r.endpoint, &r.conversation_id),
+                label: labels
+                    .get(&r.conversation_id)
+                    .cloned()
+                    .unwrap_or_else(|| conversation_label(&r.endpoint, &r.conversation_id)),
                 turn_count: 0,
                 last_updated_ms: 0,
                 pending_count: 0,

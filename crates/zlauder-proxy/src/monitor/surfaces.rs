@@ -100,7 +100,37 @@ fn collect_message_list(out: &mut Vec<RawSurface>, base: &str, items: &[Value]) 
         };
         // Prefer the `content` field when present (matches the old JS `hasOwn`).
         let content = m.as_object().and_then(|o| o.get("content")).unwrap_or(m);
-        push_texts(out, &label, "message", role, content);
+        push_texts(out, &label, "message", role.clone(), content);
+        // OpenAI Chat: an assistant message's tool calls live in a `tool_calls`
+        // sibling of `content` (not inside it), so they never reach
+        // `text_values_from_block`. Harvest them here as `tool_use` surfaces.
+        if let Some(Value::Array(calls)) = m.as_object().and_then(|o| o.get("tool_calls")) {
+            for (j, call) in calls.iter().enumerate() {
+                let func = call
+                    .as_object()
+                    .and_then(|c| c.get("function"))
+                    .and_then(Value::as_object);
+                let name = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let args = func
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let text = if args.is_empty() {
+                    format!("{name}()")
+                } else {
+                    format!("{name}({args})")
+                };
+                out.push(RawSurface {
+                    label: format!("{label} · tool_call[{j}]"),
+                    role: role.clone(),
+                    kind: "tool_use".to_string(),
+                    text,
+                });
+            }
+        }
     }
 }
 
@@ -147,6 +177,32 @@ fn text_values_from_block(
     default_kind: &str,
 ) -> Vec<(String, String)> {
     let block_type = o.get("type").and_then(Value::as_str);
+    // Tool call (Anthropic `tool_use` / OpenAI Responses `function_call`): surface
+    // the tool NAME plus its masked args so the operator can review what arguments
+    // — which may carry masked PII — are about to leave the machine. The volatile
+    // tool id (`id`/`call_id`) is deliberately NOT included in the surface text: it
+    // varies per call and would re-hash the surface every turn, breaking both the
+    // delta and the conversation-anchor prefix. The name IS in the text (not just a
+    // label) so two different tools with identical args don't collapse to one hash.
+    if matches!(block_type, Some("tool_use") | Some("function_call")) {
+        let name = o.get("name").and_then(Value::as_str).unwrap_or("tool");
+        let args = match o.get("input") {
+            // Anthropic: `input` is a JSON object (already masked in place).
+            Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
+            // OpenAI Responses: `arguments` is a JSON string.
+            _ => o
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        };
+        let text = if args.is_empty() {
+            format!("{name}()")
+        } else {
+            format!("{name}({args})")
+        };
+        return vec![(text, "tool_use".to_string())];
+    }
     // Classify as a tool result only on a positive signal: an explicit block type
     // or Anthropic's `tool_use_id` back-reference. A bare `output` key is NOT a
     // signal — assistant/control blocks can carry unrelated `output` fields, and
@@ -350,6 +406,47 @@ mod tests {
         // Round-trips exactly.
         let reassembled: String = resp[0].runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(reassembled, "your email is a@b.com now");
+    }
+
+    #[test]
+    fn anthropic_tool_use_block_becomes_tool_use_surface() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                     "input": {"command": "mail [EMAIL_ADDRESS_ab12]"}}
+                ]}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let surfaces = surfaces_from_body(&bytes, &[tok("[EMAIL_ADDRESS_ab12]", "a@b.com")]);
+        let tu: Vec<&Surface> = surfaces.iter().filter(|s| s.kind == "tool_use").collect();
+        assert_eq!(tu.len(), 1);
+        let text: String = tu[0].runs.iter().map(|r| r.text.as_str()).collect();
+        // Name is in the (hashed) surface text; the masked arg handle is located.
+        assert!(text.starts_with("Bash("), "got: {text}");
+        assert!(tu[0].runs.iter().any(|r| r.token.is_some()));
+        // The volatile tool id must NOT leak into the surface text (stable hash).
+        assert!(!text.contains("toolu_1"));
+    }
+
+    #[test]
+    fn openai_chat_tool_calls_sibling_becomes_tool_use_surface() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": Value::Null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "send", "arguments": "{\"to\":\"[EMAIL_ADDRESS_ab12]\"}"}}
+                ]}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let surfaces = surfaces_from_body(&bytes, &[tok("[EMAIL_ADDRESS_ab12]", "a@b.com")]);
+        let tu: Vec<&Surface> = surfaces.iter().filter(|s| s.kind == "tool_use").collect();
+        assert_eq!(tu.len(), 1);
+        let text: String = tu[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(text.starts_with("send("), "got: {text}");
+        assert!(tu[0].runs.iter().any(|r| r.token.is_some()));
     }
 
     #[test]

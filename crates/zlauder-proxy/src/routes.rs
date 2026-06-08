@@ -123,6 +123,7 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
         return resp;
     }
 
+    st.monitor.record_dispatched(&record_id);
     let resp = match send_upstream(&st, &parts, masked, "/v1/messages").await {
         Ok(r) => r,
         Err(resp) => {
@@ -143,14 +144,21 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let body = sse::unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
-        st.monitor
-            .record_response(&record_id, status.as_u16(), None);
+        let guard =
+            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let body = sse::unmask_sse_body(
+            Box::pin(resp.bytes_stream()),
+            st.engine.clone(),
+            manifest,
+            guard,
+        );
         respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                st.monitor
+                    .record_upstream_error(&record_id, "upstream body error");
                 return err(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream body error: {e}"),

@@ -65,6 +65,7 @@ async fn chat_completions_inner(
         return resp;
     }
 
+    st.monitor.record_dispatched(&record_id);
     let resp = match routes::send_upstream(&st, &parts, masked, "/v1/chat/completions").await {
         Ok(r) => r,
         Err(resp) => {
@@ -85,14 +86,21 @@ async fn chat_completions_inner(
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let body = unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
-        st.monitor
-            .record_response(&record_id, status.as_u16(), None);
+        let guard =
+            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let body = unmask_sse_body(
+            Box::pin(resp.bytes_stream()),
+            st.engine.clone(),
+            manifest,
+            guard,
+        );
         routes::respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                st.monitor
+                    .record_upstream_error(&record_id, "upstream body error");
                 return routes::err(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream body error: {e}"),
@@ -383,12 +391,14 @@ struct StreamState {
     xform: OpenAISseUnmasker,
     queue: VecDeque<Bytes>,
     done: bool,
+    guard: monitor::CompletionGuard,
 }
 
 pub fn unmask_sse_body(
     upstream: ByteStream,
     engine: Arc<MaskEngine>,
     manifest: Arc<UnmaskManifest>,
+    guard: monitor::CompletionGuard,
 ) -> Body {
     let state = StreamState {
         client: SseClient::new(upstream),
@@ -397,6 +407,7 @@ pub fn unmask_sse_body(
         xform: OpenAISseUnmasker::default(),
         queue: VecDeque::new(),
         done: false,
+        guard,
     };
 
     let stream = futures::stream::unfold(state, |mut st| async move {
@@ -409,8 +420,14 @@ pub fn unmask_sse_body(
             }
             match st.client.next().await {
                 Some(Ok(sse)) => enqueue(&mut st, sse),
-                Some(Err(_)) => st.done = true,
-                None => st.done = true,
+                Some(Err(_)) => {
+                    st.guard.upstream_error("upstream stream error");
+                    st.done = true;
+                }
+                None => {
+                    st.guard.complete();
+                    st.done = true;
+                }
             }
         }
     });

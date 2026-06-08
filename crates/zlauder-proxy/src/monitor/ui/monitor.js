@@ -31,7 +31,8 @@ let conversations = [];
 let selectedId = null;
 let channelFilter = null;
 let channelQuery = '';
-let decisionFilter = 'pending';   // pending | rejected | backpressure | all
+let decisionFilter = 'pending';   // live | pending | rejected | backpressure | all
+let decisionFilterUserSet = false; // true once the operator picks a filter (stops mode-driven default)
 let trafficQuery = '';
 let revealValues = localStorage.getItem('zlRevealValues') === '1';
 let approvalTimeoutMs = 300000;   // overwritten by snapshot.approval_timeout_secs
@@ -43,11 +44,13 @@ const DECISION = {
   pending:               { label: 'Pending',        cls: 'st-pending',  icon: '●' },
   approved:              { label: 'Approved',        cls: 'st-good',     icon: '✓' },
   auto_accepted:         { label: 'Auto-accepted',   cls: 'st-good',     icon: '✓' },
+  in_flight:             { label: 'In flight',       cls: 'st-live',     icon: '◴' },
   completed:             { label: 'Completed',       cls: 'st-good',     icon: '✓' },
   rejected:             { label: 'Rejected',         cls: 'st-bad',      icon: '✕' },
   timed_out:            { label: 'Timed out',        cls: 'st-amber',    icon: '⧖' },
   backpressure_rejected:{ label: 'Blocked — queue full', cls: 'st-amber', icon: '⌀' },
   upstream_error:       { label: 'Upstream error',   cls: 'st-amber',    icon: '⚠' },
+  aborted:              { label: 'Aborted',         cls: 'st-amber',    icon: '⊘' },
 };
 function decisionInfo(d) {
   return DECISION[d] || { label: String(d || '').replace(/_/g, ' '), cls: 'st-bad', icon: '•' };
@@ -80,10 +83,15 @@ function toast(msg, kind) {
   setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 320); }, 3200);
 }
 
-/* ---------- timeout helpers ---------- */
+/* ---------- timeout / in-flight helpers ---------- */
 function remainingMs(r) {
   if (r.decision !== 'pending') return null;
   return approvalTimeoutMs - (Date.now() - Number(r.started_ms));
+}
+/* Elapsed since the request was released upstream (live streaming timer). */
+function elapsedMs(r) {
+  if (r.decision !== 'in_flight') return null;
+  return Date.now() - Number(r.dispatched_ms || r.started_ms);
 }
 function fmtClock(ms) {
   if (ms == null) return '';
@@ -216,15 +224,22 @@ function renderSpotlight(r) {
 
   if (delta.is_first) {
     const allNew = new Set(surfaces.map(s => s.block_hash));
+    // The whole transcript is genuinely new, but dumping every surface here is
+    // noisy and duplicates the FULL MASKED REQUEST panel below. Show the first
+    // few; the rest stay one click away.
+    const CAP = 6;
+    const head = surfaces.slice(0, CAP);
+    const extra = surfaces.length - head.length;
     return `<div class="spotlight">`
       + `<div class="spotlight-head">`
       +   `<span class="spotlight-icon">&#9650;</span>`
       +   `<span class="spotlight-title">FIRST CONTACT</span>`
-      +   `<span class="spotlight-sub">entire channel is new &mdash; all ${surfaces.length} surface(s)</span>`
+      +   `<span class="spotlight-sub">entire conversation is new &mdash; ${surfaces.length} surface(s)</span>`
       + `</div>`
       + `<div class="spotlight-body">`
-      +   (surfaces.length ? surfaces.map(s => renderSurface(s, allNew)).join('')
+      +   (surfaces.length ? head.map(s => renderSurface(s, allNew)).join('')
                             : `<div class="empty-note">No recognized text surfaces in this request.</div>`)
+      +   (extra > 0 ? `<div class="empty-note">+${extra} more surface(s) — see FULL MASKED REQUEST below.</div>` : '')
       + `</div></div>`;
   }
 
@@ -452,10 +467,12 @@ function renderChannels() {
     +   (c.pending_count ? `<span class="pending-badge">${c.pending_count} HOLD</span>` : '')
     +   `<span class="ago">${ago(c.last_updated_ms)}</span>`
     + `</div></div>`
-  ).join('') : `<div class="empty-note" style="padding:14px">No channels${channelQuery ? ' match.' : ' yet.'}</div>`;
+  ).join('') : `<div class="empty-note" style="padding:14px">No conversations${channelQuery ? ' match.' : ' yet.'}</div>`;
 }
 
 const DECISION_FILTERS = {
+  // Live = active + recent successful traffic; hides terminal error/abort noise.
+  live:         r => !['rejected', 'timed_out', 'backpressure_rejected', 'aborted', 'upstream_error'].includes(r.decision),
   pending:      r => r.decision === 'pending',
   rejected:     r => r.decision === 'rejected',
   backpressure: r => r.decision === 'backpressure_rejected',
@@ -477,6 +494,7 @@ function trafficMatches(r) {
 function renderFilterCounts() {
   const within = records.filter(r => !channelFilter || r.conversation_id === channelFilter);
   const set = (id, n) => { const el = $(id); if (el) el.textContent = n; };
+  set('fcLive', within.filter(DECISION_FILTERS.live).length);
   set('fcPending', within.filter(DECISION_FILTERS.pending).length);
   set('fcRejected', within.filter(DECISION_FILTERS.rejected).length);
   set('fcBackpressure', within.filter(DECISION_FILTERS.backpressure).length);
@@ -486,17 +504,17 @@ function renderFilterCounts() {
 }
 
 function renderTraffic(flashId) {
-  // Pending floats to the top (oldest pending first = closest to timeout),
-  // then everything else newest-first.
+  // Active traffic floats up: pending first (oldest = closest to timeout), then
+  // in-flight, then everything else newest-first.
+  const rank = r => r.decision === 'pending' ? 0 : r.decision === 'in_flight' ? 1 : 2;
   const visible = records.filter(trafficMatches).slice().sort((a, b) => {
-    const ap = a.decision === 'pending', bp = b.decision === 'pending';
-    if (ap && bp) return Number(a.started_ms) - Number(b.started_ms);
-    if (ap) return -1;
-    if (bp) return 1;
-    return Number(b.started_ms) - Number(a.started_ms);
+    const ra = rank(a), rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    if (ra === 0) return Number(a.started_ms) - Number(b.started_ms); // oldest pending first
+    return Number(b.started_ms) - Number(a.started_ms);              // newest first otherwise
   });
   const title = channelFilter
-    ? (conversations.find(c => c.id === channelFilter)?.label || 'CHANNEL')
+    ? (conversations.find(c => c.id === channelFilter)?.label || 'CONVERSATION')
     : 'TRAFFIC';
   $('recordsTitle').textContent = title.toUpperCase();
   $('clearFilter').hidden = !channelFilter;
@@ -508,14 +526,17 @@ function renderTraffic(flashId) {
     const risk = isNothingMaskedRisk(r);
     const newCount = (r.delta && !r.delta.is_first) ? (r.delta.added_surface_hashes || []).length : -1;
     const pending = r.decision === 'pending';
+    const inflight = r.decision === 'in_flight';
     const rem = remainingMs(r);
+    const ela = elapsedMs(r);
     const roll = rollup(r.tokens).slice(0, 3)
       .map(([k, n]) => `<span class="rec-kind">${n}×${esc(k)}</span>`).join('');
-    return `<div class="rec ${pending ? 'pending' : ''} ${risk ? 'risk' : ''} ${selectedId === r.id ? 'active' : ''} ${flashId === r.id ? 'flash' : ''}" data-rec="${esc(r.id)}">`
+    return `<div class="rec ${pending ? 'pending' : ''} ${inflight ? 'inflight' : ''} ${risk ? 'risk' : ''} ${selectedId === r.id ? 'active' : ''} ${flashId === r.id ? 'flash' : ''}" data-rec="${esc(r.id)}">`
       + `<div class="rec-top">`
       +   `<span class="rec-turn">T${r.turn_index}</span>`
       +   `<span class="rec-endpoint">${esc(r.endpoint)}</span>`
       +   (pending ? `<span class="rec-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">&#9201; ${fmtClock(rem)}</span>` : '')
+      +   (inflight ? `<span class="rec-clock live" data-elapsed="${esc(r.id)}">&#9201; ${fmtClock(ela)} streaming</span>` : '')
       +   (r.delta && r.delta.is_first ? `<span class="new-flag">FIRST</span>`
             : (r.delta && r.delta.prev_unavailable ? `<span class="new-flag warn-flag">?</span>`
             : (newCount > 0 ? `<span class="new-flag">+${newCount}</span>` : '')))
@@ -528,7 +549,7 @@ function renderTraffic(flashId) {
       + `</div>`
       + (roll ? `<div class="rec-kinds">${roll}</div>` : '')
     + `</div>`;
-  }).join('') : `<div class="empty-note" style="padding:14px">No ${decisionFilter === 'all' ? '' : decisionFilter + ' '}traffic${channelFilter ? ' on this channel.' : '.'}</div>`;
+  }).join('') : `<div class="empty-note" style="padding:14px">No ${decisionFilter === 'all' ? '' : decisionFilter + ' '}traffic${channelFilter ? ' in this conversation.' : '.'}</div>`;
 }
 
 /* ---------- header ---------- */
@@ -615,7 +636,7 @@ document.addEventListener('click', e => {
     return;
   }
   const df = e.target.closest('.df-chip');
-  if (df) { decisionFilter = df.dataset.filter; renderTraffic(); return; }
+  if (df) { decisionFilter = df.dataset.filter; decisionFilterUserSet = true; renderTraffic(); return; }
   const rec = e.target.closest('[data-rec]');
   if (rec) { selectedId = rec.getAttribute('data-rec'); render(); return; }
   const ch = e.target.closest('[data-channel]');
@@ -755,6 +776,10 @@ function applySnapshot(s) {
   records = s.records || [];
   conversations = s.conversations || [];
   if (typeof s.approval_timeout_secs === 'number') approvalTimeoutMs = s.approval_timeout_secs * 1000;
+  // In OBSERVE-ONLY there is nothing to approve, so default the traffic view to
+  // live activity instead of an always-empty pending queue. A hold posture keeps
+  // the pending-first default. The operator's explicit pick always wins.
+  if (!decisionFilterUserSet && s.mode) decisionFilter = (s.mode === 'off') ? 'live' : 'pending';
   renderHeader(s);
 }
 function load() {
@@ -817,6 +842,12 @@ setInterval(() => {
     el.classList.remove('warn', 'crit');
     const c = clockClass(rem);
     if (c) el.classList.add(c);
+  });
+  // Live streaming timers for in-flight turns.
+  document.querySelectorAll('[data-elapsed]').forEach(el => {
+    const r = records.find(x => x.id === el.dataset.elapsed);
+    if (!r || r.decision !== 'in_flight') return;
+    el.innerHTML = `&#9201; ${fmtClock(elapsedMs(r))} streaming`;
   });
   // When a clock hits zero the server reject is imminent; refresh to catch it.
   if (anyPending) {
