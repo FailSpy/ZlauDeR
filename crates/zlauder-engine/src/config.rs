@@ -494,6 +494,37 @@ pub enum ComputePrecision {
     F16,
 }
 
+impl Quantization {
+    /// Per-variant byte for the recognizer-identity fingerprint
+    /// ([`crate::compute_ml_fp`]). The match is EXHAUSTIVE on purpose: adding a
+    /// `Quantization` variant is a compile error here until it is given a DISTINCT
+    /// tag, so a new quant mode can never silently share a fingerprint with an
+    /// existing one — which would serve stale cross-precision detections from the
+    /// detection cache (a dropped/altered span = recall regression). Values need
+    /// not be stable across releases (the cache is in-memory per-process); only
+    /// distinctness is mandatory.
+    pub(crate) fn fp_tag(self) -> u8 {
+        match self {
+            Quantization::None => 0,
+            Quantization::Q8_0 => 1,
+            Quantization::Bf16 => 2,
+            Quantization::Bf16Vnni => 3,
+        }
+    }
+}
+
+impl ComputePrecision {
+    /// Per-variant byte for the recognizer-identity fingerprint
+    /// ([`crate::compute_ml_fp`]). Exhaustive on purpose — see
+    /// [`Quantization::fp_tag`].
+    pub(crate) fn fp_tag(self) -> u8 {
+        match self {
+            ComputePrecision::F32 => 0,
+            ComputePrecision::F16 => 1,
+        }
+    }
+}
+
 fn default_ml_model() -> String {
     "openai/privacy-filter".to_string()
 }

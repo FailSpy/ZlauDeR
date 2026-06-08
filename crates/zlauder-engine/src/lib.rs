@@ -163,21 +163,15 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
             // f32 produce DIFFERENT detection output, so `same_model_params`
             // includes it and the fingerprint must move with it or an f16 flip
             // would serve stale f32-derived detections from a byte-identical leaf.
-            // Keep in sync with `same_model_params`.
-            h.update(&[match d.compute_precision {
-                crate::config::ComputePrecision::F32 => 0u8,
-                crate::config::ComputePrecision::F16 => 1u8,
-            }]);
-            // `quant` is likewise a recognizer-identity param: Q8_0 vs None produce
-            // DIFFERENT detection output, so `same_model_params` includes it and the
-            // fingerprint must move with it or a Q8 flip would serve stale F32-derived
-            // detections from a byte-identical leaf. Keep in sync with `same_model_params`.
-            h.update(&[match d.quant {
-                crate::config::Quantization::None => 0u8,
-                crate::config::Quantization::Q8_0 => 1u8,
-                crate::config::Quantization::Bf16 => 2u8,
-                crate::config::Quantization::Bf16Vnni => 3u8,
-            }]);
+            // `fp_tag` is an EXHAUSTIVE match at the enum def, so a new precision
+            // variant compile-forces a distinct tag here (keep `same_model_params`
+            // in sync too — that one is still a hand-listed field set).
+            h.update(&[d.compute_precision.fp_tag()]);
+            // `quant` is likewise a recognizer-identity param: Q8_0/Bf16/Bf16Vnni vs
+            // None produce DIFFERENT detection output. `Quantization::fp_tag` is
+            // exhaustive, so adding a quant variant without a distinct fingerprint
+            // byte is a compile error (no silent stale-cache collision).
+            h.update(&[d.quant.fp_tag()]);
             // `banded_attention` is likewise a recognizer-identity param: the
             // banded path is DESIGNED to be bit-equivalent to dense, but it is
             // an unproven recall-risk opt-in, so `same_model_params` includes it
