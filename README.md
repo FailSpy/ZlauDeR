@@ -120,6 +120,48 @@ zlauder-proxy --port 8787 --config zlauder.toml
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude   # any client honoring the base URL
 ```
 
+### Local plugin development
+
+Two acquisition paths run **in tandem** off the same source tree, so a maintainer
+can iterate locally while end users keep the zero-build GitHub flow:
+
+| | end users | local dev |
+|---|---|---|
+| marketplace | `/plugin marketplace add FailSpy/zlauder` → the plugin's `source` is the orphan **`plugin-dist`** branch | not used (see below) |
+| plugin files | shipped on `plugin-dist` | this repo's [`zlauder-plugin/`](./zlauder-plugin/), live |
+| binaries | prebuilt `bin/<triple>/`, picked by host triple — **no compile, no download** | your `cargo build --release --workspace` output |
+
+Both paths share one resolver ([`_resolve-bins.sh`](./zlauder-plugin/scripts/_resolve-bins.sh),
+precedence: PATH → shipped `bin/<triple>` → cached build → **`<workspace>/target/release`** →
+in-repo `cargo build`). The published marketplace is deliberately left pointing at
+`plugin-dist`; **do not** repoint it at `./zlauder-plugin` — a marketplace install
+*caches a copy* of the plugin detached from the cargo workspace, so the resolver
+could not find your built binaries, and a GitHub fetch of a relative source carries
+no `bin/`.
+
+Instead, load the in-repo plugin directly so `${CLAUDE_PLUGIN_ROOT}` stays inside
+the workspace and the resolver finds `target/release`:
+
+```sh
+cargo build --release --workspace            # build proxy + hooks once
+claude --plugin-dir ./zlauder-plugin         # load the live plugin from this folder
+```
+
+For an already-installed (cached) plugin or for the **Codex** plugin, point the
+resolver at your checkout instead — it then uses that tree's `target/release`
+(building it on first run if needed):
+
+```sh
+export ZLAUDER_WORKSPACE=/abs/path/to/zlauder
+cargo build --release --workspace
+```
+
+Rebuild after editing engine/proxy/hooks code; restart the session (or re-run
+`/zlauder:enable`) to pick up new binaries. Plugin command/hook/script edits under
+`zlauder-plugin/` are live under `--plugin-dir`. Release packaging
+(`cargo build --release --workspace` per target → `plugin-dist` + `codex-plugin-dist`
++ Release assets) is driven by [`.github/workflows/release.yml`](./.github/workflows/release.yml).
+
 ## Configuration
 
 ### The `/zlauder:privacy` command
