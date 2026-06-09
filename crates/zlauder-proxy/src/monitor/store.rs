@@ -563,16 +563,18 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
             "session-token ledger over cap ({MAX_SESSION_TOKENS}); evicting {over} oldest entr{}",
             if over == 1 { "y" } else { "ies" }
         );
-        while inner.session_tokens.len() > MAX_SESSION_TOKENS {
-            let Some(victim) = inner
-                .session_tokens
-                .values()
-                .min_by_key(|e| e.first_seen_ms)
-                .map(|e| e.token.clone())
-            else {
-                break;
-            };
-            inner.session_tokens.remove(&victim);
+        // One-shot eviction: a single sort, then drop the oldest `over`. A previous
+        // min-scan-per-victim loop was O(over * n) under the global monitor mutex —
+        // a single large request body can mint thousands of entries, so a huge
+        // over-cap could stall snapshots/approvals. O(n log n) once instead.
+        let mut by_age: Vec<(u128, String)> = inner
+            .session_tokens
+            .values()
+            .map(|e| (e.first_seen_ms, e.token.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(t, _)| *t);
+        for (_, tok) in by_age.into_iter().take(over) {
+            inner.session_tokens.remove(&tok);
         }
     }
 }

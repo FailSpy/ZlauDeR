@@ -293,24 +293,27 @@ pub async fn reveal_keyphrase(
     let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let mut cfg = st.engine.config_snapshot();
 
-    // If this value is a custom keyphrase, remove its backing rule (live + persisted)
-    // so it does not immediately re-mask the value the allow-list now lets through.
+    // If this value is a custom keyphrase, remove its backing rule so it does not
+    // immediately re-mask the value the allow-list now lets through. Mutate the LIVE
+    // config here; only mirror the removal to the persisted file AFTER `set_config`
+    // succeeds, so a rejected swap can't leave disk ahead of live.
     let mut removed_rule = false;
     let backing = req
         .pattern
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(pattern) = backing {
-        let entity_type = req
-            .entity_type
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "CUSTOM_KEYWORD".to_string());
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let backing_entity = req
+        .entity_type
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "CUSTOM_KEYWORD".to_string());
+    if let Some(pattern) = backing.as_deref() {
         let before = cfg.custom_replacements.len();
         let mut done = false;
         cfg.custom_replacements.retain(|c| {
-            if !done && c.pattern == pattern && c.entity_type == entity_type {
+            if !done && c.pattern == pattern && c.entity_type == backing_entity {
                 done = true;
                 false
             } else {
@@ -318,12 +321,15 @@ pub async fn reveal_keyphrase(
             }
         });
         removed_rule = cfg.custom_replacements.len() != before;
-        let _ = persist::remove_custom_replacement(&st.project_root, pattern, &entity_type);
     }
 
     cfg.allow_list.add_exact(&value);
     if let Err(e) = st.engine.set_config(cfg) {
         return text(StatusCode::BAD_REQUEST, &format!("reveal rejected: {e}"));
+    }
+    // Live swap succeeded — now mirror the custom-rule removal to disk (best-effort).
+    if removed_rule && let Some(pattern) = backing.as_deref() {
+        let _ = persist::remove_custom_replacement(&st.project_root, pattern, &backing_entity);
     }
     let live = st.engine.config_snapshot();
     let (persisted, session_only, persist_error) = persist_allow_lists(&st, &live.allow_list);

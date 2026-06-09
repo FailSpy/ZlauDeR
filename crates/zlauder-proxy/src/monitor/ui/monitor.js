@@ -956,6 +956,9 @@ document.body.appendChild(maskPop);
 let pendingMask = '';
 document.addEventListener('mouseup', e => {
   if (e.target.closest('.mask-pop')) return;
+  // The ledger has its own ADD-keyphrase affordance; selecting text there is to copy
+  // a peeked value, not to mint a mask. Don't pop the inspector's "mask selection" UI.
+  if (e.target.closest('#viewLedger')) { maskPop.style.display = 'none'; return; }
   const sel = (getSelection().toString() || '').trim();
   if (sel && sel.length > 1) {
     const rng = getSelection().getRangeAt(0).getBoundingClientRect();
@@ -995,8 +998,10 @@ $('maskGo').addEventListener('click', () => {
     } else {
       toast(`rule added${persistNote} for FUTURE traffic &mdash; THIS turn already left the machine`, 'bad');
     }
-    // Keep the policy drawer's custom-mask list in sync if it is open.
+    // Keep the policy drawer's custom-mask list AND the ledger's custom-rule source
+    // in sync (the ledger dedups AUTO-DETECTED against ledgerCustomRules).
     if (!$('policyDrawer').hidden) loadCustomMasks();
+    refreshLedgerSources();
   });
   maskPop.style.display = 'none';
   getSelection().removeAllRanges();
@@ -1048,6 +1053,16 @@ es.onmessage = e => {
     const wasSelectedPending = rec.id === selectedId;
     const prev = records.find(r => r.id === rec.id);
     records = [rec, ...records.filter(r => r.id !== rec.id)];
+    // Augment the durable ledger live from this record's tokens — the AUTO-DETECTED
+    // list otherwise only refreshes on full snapshots (per-record SSE frames carry no
+    // session_tokens). Dedup by token handle; the next snapshot reconciles to the
+    // authoritative server set (counts / first_seen / class). A token masked only by
+    // count_tokens still lands on the next snapshot (that path emits no SSE frame).
+    for (const t of (rec.tokens || [])) {
+      if (!sessionTokens.some(s => s.token === t.token)) {
+        sessionTokens.push({ token: t.token, value: t.value, entity_kind: t.entity_kind, class: 'auto_pii', peekable: true, count: 1 });
+      }
+    }
     if (lastSnap) {
       const pending = records.filter(r => r.decision === 'pending').length;
       renderHeader({ ...lastSnap, pending_count: pending });
@@ -1339,6 +1354,7 @@ $('polMasks').addEventListener('click', e => {
     .then(res => {
       toast(`removed mask <b>${esc(pattern)}</b>${res.removed_persisted ? ' (live + persisted)' : ' (live only)'}`, 'good');
       loadCustomMasks();
+      refreshLedgerSources();
     })
     .catch(() => toast('mask remove failed', 'bad'));
 });
