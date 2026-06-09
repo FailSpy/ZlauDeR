@@ -43,6 +43,11 @@ uuid     = { version = "1.11", features = ["v4", "serde"] }
 # Bounded LRU for the detection cache (correct recency eviction; FIFO would evict
 # hot early leaves that Claude Code re-sends every turn).
 lru      = "0.12"
+# Exact-literal multi-pattern matching for registered-secret (Pass-0) detection.
+aho-corasick = "1.1"
+# Secret-value memory hygiene (zeroized on drop). Pinned explicitly per the
+# secrets design (SecretValue / broker plaintext are zeroize-scoped).
+zeroize  = "1.8"
 
 # serde / common
 serde       = { version = "1.0", features = ["derive"] }

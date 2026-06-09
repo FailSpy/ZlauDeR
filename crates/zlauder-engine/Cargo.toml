@@ -22,6 +22,8 @@ regex    = { workspace = true }
 smallvec = { workspace = true }
 uuid     = { workspace = true }
 lru      = { workspace = true }
+aho-corasick = { workspace = true }
+zeroize  = { workspace = true }
 
 serde     = { workspace = true }
 thiserror = { workspace = true }

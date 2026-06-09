@@ -268,8 +268,17 @@ impl TokenClass {
     /// When the secrets engine tags manifest entries with a source, switch on it here
     /// (and nowhere else) to return `Guard`/`Broker`; `is_peekable()` then suppresses
     /// peek + plaintext transport on BOTH surfaces at once.
-    pub fn for_manifest_entry(_e: &ManifestEntry) -> TokenClass {
-        TokenClass::AutoPii
+    pub fn for_manifest_entry(e: &ManifestEntry) -> TokenClass {
+        // A brokered secret's `ManifestEntry` carries the value in `canonical_form`;
+        // classify it `Broker` (non-peekable) so `is_peekable()` suppresses both the
+        // UI peek AND the plaintext transport on the ledger + record previews. (Guard/
+        // `hash` secrets are colon-form, never interned, so they never reach a manifest
+        // entry — there is no `Guard` manifest path to switch on here.)
+        if e.broker {
+            TokenClass::Broker
+        } else {
+            TokenClass::AutoPii
+        }
     }
 }
 

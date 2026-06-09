@@ -981,6 +981,7 @@ mod tests {
             entity_kind: "EMAIL_ADDRESS".to_string(),
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
+            broker: false,
         });
         m
     }
@@ -1043,6 +1044,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&man);
@@ -1065,6 +1067,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&old);
@@ -1083,6 +1086,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&fresh);
