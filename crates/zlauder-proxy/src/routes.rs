@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/zlauder/enable", post(admin::enable))
         .route("/zlauder/disable", post(admin::disable))
         .route("/zlauder/reload", post(admin::reload))
+        .route("/zlauder/broker/resolve", post(admin::broker_resolve))
         .route("/zlauder/ml/enable", post(admin::ml_enable))
         .route("/zlauder/ml/disable", post(admin::ml_disable))
         .route("/zlauder/ui", get(monitor::ui))

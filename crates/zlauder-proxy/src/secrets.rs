@@ -8,10 +8,47 @@
 //! value-free (names/operators/scheme/resolved/required only).
 
 use serde::Serialize;
-use zlauder_engine::{MaskEngine, Operator, SecretRule};
+use zlauder_engine::{BrokerAllow, BrokerPolicy, DestRule, MaskEngine, Operator, SecretRule};
 use zlauder_secrets::{Eligibility, ProviderRegistry, SecretRef, classify};
 
-use crate::config::SecretSpec;
+use crate::config::{BrokerAllowSpec, SecretSpec};
+
+/// Build the default-deny broker policy from `[[broker.allow]]` config rules,
+/// compiling tool/param/secret globs and parsing the optional `dest` constraint.
+pub fn build_broker_policy(specs: &[BrokerAllowSpec]) -> Result<BrokerPolicy, String> {
+    let mut allow = Vec::with_capacity(specs.len());
+    for s in specs {
+        let dest = parse_dest(s.dest.as_deref())?;
+        let ttl = s.ttl_secs.map(std::time::Duration::from_secs);
+        let rule = BrokerAllow::new(s.secret.as_deref(), &s.tool, &s.param, dest, ttl)
+            .map_err(|e| e.to_string())?;
+        allow.push(rule);
+    }
+    Ok(BrokerPolicy { allow })
+}
+
+fn parse_dest(spec: Option<&str>) -> Result<Option<DestRule>, String> {
+    match spec {
+        None => Ok(None),
+        Some("any") => Ok(Some(DestRule::AnyHost)),
+        Some(s) => {
+            let Some(rest) = s.strip_prefix("host_allowlist:") else {
+                return Err(format!(
+                    "unknown dest {s:?} (use `any` or `host_allowlist:host1,host2`)"
+                ));
+            };
+            let hosts: Vec<String> = rest
+                .split(',')
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect();
+            if hosts.is_empty() {
+                return Err(format!("dest host_allowlist is empty in {s:?}"));
+            }
+            Ok(Some(DestRule::HostAllowList(hosts)))
+        }
+    }
+}
 
 /// Per-secret resolution outcome for the admin snapshot. NEVER carries a value.
 #[derive(Clone, Debug, Serialize)]

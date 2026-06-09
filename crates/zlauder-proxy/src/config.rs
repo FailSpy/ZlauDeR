@@ -31,6 +31,8 @@ pub struct LoadedConfig {
     /// Registered-secret REFERENCES (`[[secrets]]`), resolved at startup. Refs only —
     /// a value can never appear here (the scope invariant rejects it pre-parse).
     pub secrets: Vec<SecretSpec>,
+    /// Broker policy allow-rules (`[[broker.allow]]`), installed at startup.
+    pub broker_allows: Vec<BrokerAllowSpec>,
     pub layers: ConfigLayers,
 }
 
@@ -61,6 +63,41 @@ fn default_case_sensitive() -> bool {
     true
 }
 
+/// `[broker]` — the default-deny broker policy. Each `[[broker.allow]]` rule names
+/// the secret + tool + param pointer (+ optional dest host allow-list) that may
+/// receive a brokered value at the local tool boundary.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct BrokerSection {
+    #[serde(default)]
+    pub allow: Vec<BrokerAllowSpec>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct BrokerAllowSpec {
+    /// Glob over the registered secret name (`None` ⇒ any secret). Per-secret least
+    /// privilege: a DB password resolves only into the rule(s) that name it.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Glob over the tool name (`psql`, `curl`, `mcp__*` — though egress tools are
+    /// denied regardless).
+    pub tool: String,
+    /// Glob over the RFC-6901 param pointer (`/connection_uri`, `/args/*`). Default
+    /// `*` = any param of the tool.
+    #[serde(default = "default_param_glob")]
+    pub param: String,
+    /// Destination constraint: `host_allowlist:db.internal,db2.internal` | `any` |
+    /// omitted (no host constraint).
+    #[serde(default)]
+    pub dest: Option<String>,
+    /// Optional TTL (seconds) hint for the minted broker token.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+fn default_param_glob() -> String {
+    "*".to_string()
+}
+
 #[derive(Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
@@ -69,6 +106,8 @@ struct FileConfig {
     engine: EngineConfig,
     #[serde(default)]
     secrets: Vec<SecretSpec>,
+    #[serde(default)]
+    broker: BrokerSection,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +175,7 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
         upstream_base_url: file.proxy.upstream_base_url,
         engine,
         secrets: file.secrets,
+        broker_allows: file.broker.allow,
         layers,
     })
 }
@@ -153,6 +193,15 @@ pub fn reload_engine(layers: &ConfigLayers) -> anyhow::Result<EngineConfig> {
     engine.allow_list = build_allow_list(Some(&merged))?;
     warn_unknown_entity_types(&engine);
     Ok(engine)
+}
+
+/// Re-read the `[[broker.allow]]` rules from the current files (for `reload`), so a
+/// removed/restricted broker rule takes effect live. Re-runs the scope invariant.
+pub fn reload_broker_allows(layers: &ConfigLayers) -> anyhow::Result<Vec<BrokerAllowSpec>> {
+    let merged = merged_value(layers)?;
+    validate_no_inline_secret_values(&merged)?;
+    let file: FileConfig = merged.try_into()?;
+    Ok(file.broker.allow)
 }
 
 /// Scope invariant: a secret VALUE must NEVER live in a config file. Reject any

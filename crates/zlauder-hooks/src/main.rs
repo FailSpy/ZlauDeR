@@ -69,6 +69,12 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// PreToolUse hook: resolve allow-listed BROKER secrets into the tool input.
+    /// Reads the PreToolUse payload (tool_name + tool_input) on stdin, asks the proxy
+    /// to splice allow-listed broker values, and emits `hookSpecificOutput.updatedInput`.
+    /// FAIL-CLOSED: on ANY error (no proxy/key, timeout, non-2xx, nothing resolved) it
+    /// emits nothing, so the tool runs with the broker TOKEN unresolved — never a leak.
+    PreToolUse,
     /// Reveal a masked token's plaintext (local audit).
     Reveal { token: String },
     /// Print the keyed local web monitor URL for this project's proxy.
@@ -263,6 +269,7 @@ fn main() -> Result<()> {
         Cmd::ReservePort => reserve_port_cmd(cli.port),
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(cli.port, action),
+        Cmd::PreToolUse => pre_tool_use(cli.port),
         Cmd::Reveal { token } => reveal(cli.port, token),
         Cmd::Monitor => monitor_cmd(cli.port),
         Cmd::Secrets { action } => secrets_cmd(cli.port, action),
@@ -1574,6 +1581,67 @@ fn monitor_cmd(port: Option<u16>) -> Result<()> {
     let port = port.unwrap_or_else(|| pick_port(&root));
     let key = key_for(port).context("reading session state (is the proxy running?)")?;
     println!("http://127.0.0.1:{port}/zlauder/ui?key={key}");
+    Ok(())
+}
+
+/// PreToolUse broker resolver (T2). Reads the hook payload from stdin, asks the proxy
+/// to resolve allow-listed broker tokens into `tool_input`, and emits `updatedInput`.
+/// Every failure path is silent (emit nothing, exit 0) so the tool runs with the
+/// broker token unresolved — fail-closed, never a leak.
+fn pre_tool_use(port: Option<u16>) -> Result<()> {
+    use std::io::Read;
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return Ok(());
+    }
+    let payload: Value = match serde_json::from_str(&buf) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let tool_name = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
+    if tool_name.is_empty() || tool_input.is_null() {
+        return Ok(());
+    }
+
+    let root = canonical(&project_root());
+    let port = port.unwrap_or_else(|| pick_port(&root));
+    // No live proxy/key ⇒ emit nothing ⇒ tool runs with the token unresolved.
+    let key = match key_for(port) {
+        Ok(k) => k,
+        Err(_) => return Ok(()),
+    };
+
+    let req = json!({ "tool_name": tool_name, "tool_input": tool_input });
+    let resp = match blocking_client()
+        .post(format!("http://127.0.0.1:{port}/zlauder/broker/resolve"))
+        .header("x-zlauder-key", &key)
+        .json(&req)
+        .send()
+    {
+        Ok(r) if r.status().is_success() => r,
+        // timeout / connection failure / non-2xx ⇒ fail-closed (token unresolved).
+        _ => return Ok(()),
+    };
+    let out: Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    // Nothing resolved ⇒ don't rewrite the input (no-op hook).
+    if out.get("resolved").and_then(Value::as_u64).unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let updated = out.get("tool_input").cloned().unwrap_or(Value::Null);
+    if updated.is_null() {
+        return Ok(());
+    }
+    let emit = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": updated,
+        }
+    });
+    println!("{emit}");
     Ok(())
 }
 
