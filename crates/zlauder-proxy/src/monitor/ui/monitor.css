@@ -163,8 +163,105 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .grid {
   position: relative; z-index: 1;
   display: grid; grid-template-columns: var(--rail-1) var(--rail-2) 1fr;
-  height: calc(100vh - 58px);
+  height: calc(100vh - 58px - 38px);
 }
+/* [hidden] must beat the grid/flex display of an inactive view (same pattern the
+   policy drawer uses) so the off tab is genuinely hidden, not just behind. */
+.grid[hidden], .ledger[hidden] { display: none !important; }
+
+/* ---------- view tabs (Ledger / Inspector) ---------- */
+.view-tabs {
+  position: relative; z-index: 4; display: flex; align-items: center; gap: 4px;
+  height: 38px; padding: 0 16px;
+  background: var(--bg-raise); border-bottom: 1px solid var(--line);
+}
+.view-tab {
+  font: inherit; font-family: var(--disp); font-size: 11px; letter-spacing: .2em; font-weight: 500;
+  color: var(--ink-dim); background: transparent; border: 0; border-bottom: 2px solid transparent;
+  padding: 0 14px; height: 100%; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: .14s;
+}
+.view-tab:hover { color: var(--ink); }
+.view-tab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+.view-tab-glyph { font-size: 12px; opacity: .85; }
+.view-tab-badge {
+  font-size: 9px; font-weight: 700; color: #1a1206; background: var(--pending);
+  border-radius: 99px; padding: 0 6px; min-width: 16px; text-align: center;
+  box-shadow: 0 0 10px -2px var(--pending);
+}
+.view-tabs-note { margin-left: auto; font-size: 9.5px; letter-spacing: .06em; color: var(--ink-faint); }
+
+/* ---------- ledger view ---------- */
+.ledger {
+  position: relative; z-index: 1; height: calc(100vh - 58px - 38px);
+  overflow-y: auto; padding: 20px 22px 64px;
+}
+.ledger::-webkit-scrollbar { width: 9px; }
+.ledger::-webkit-scrollbar-thumb { background: var(--line); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+.ledger-cols { display: flex; flex-direction: column; gap: 16px; max-width: 920px; }
+
+.ledger-sec, .ledger-holds { border: 1px solid var(--line); border-radius: 8px; background: var(--bg-panel); overflow: hidden; }
+.ledger-holds { border-color: var(--pending); margin-bottom: 16px; max-width: 920px;
+  background: linear-gradient(180deg, rgba(255,211,77,.06), transparent 60%), var(--bg-panel);
+  box-shadow: 0 0 40px -24px var(--pending); }
+.ledger-sec-plain { border-color: var(--amber-dim);
+  background: linear-gradient(180deg, rgba(255,180,84,.05), transparent 60%), var(--bg-panel); }
+.ledger-sec-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line-soft); }
+.ledger-holds .ledger-sec-head { border-bottom-color: rgba(255,211,77,.28); background: linear-gradient(90deg, rgba(255,211,77,.08), transparent); }
+.ledger-sec-plain .ledger-sec-head { border-bottom-color: var(--amber-dim); background: linear-gradient(90deg, var(--amber-glow), transparent); }
+.ledger-sec-title { font-family: var(--disp); letter-spacing: .22em; font-size: 12px; color: var(--ink); font-weight: 600; }
+.ledger-holds .ledger-sec-title { color: var(--pending); }
+.ledger-sec-plain .ledger-sec-title { color: var(--amber); }
+.ledger-sec-sub { font-size: 10px; color: var(--ink-dim); }
+.ledger-sec-note { font-size: 10px; line-height: 1.5; color: var(--ink-dim); padding: 9px 16px 0; }
+.ledger-sec-note b { color: var(--amber); }
+.ledger-count { margin-left: auto; font-size: 10px; color: var(--cyan); background: var(--cyan-glow);
+  border: 1px solid var(--cyan-dim); border-radius: 99px; padding: 1px 8px; min-width: 22px; text-align: center; }
+
+.ledger-rows, .ledger-holds-list { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px 16px; }
+.lrow, .lhold {
+  display: flex; align-items: center; gap: 10px; padding: 8px 11px; flex-wrap: wrap;
+  background: var(--bg-inset); border: 1px solid var(--line-soft); border-radius: var(--radius);
+}
+.lrow.plain { border-color: var(--amber-dim); }
+.lhold { cursor: pointer; transition: border-color .12s; }
+.lhold:hover { border-color: var(--pending); }
+.lhold-turn { font-family: var(--disp); font-weight: 600; font-size: 13px; color: var(--cyan); min-width: 30px; }
+.lhold-ep { font-size: 11px; color: var(--ink); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lhold-clock { font-size: 10px; font-variant-numeric: tabular-nums; color: var(--pending); letter-spacing: .04em; }
+.lhold-clock.warn { color: var(--amber); }
+.lhold-clock.crit { color: var(--bad); font-weight: 700; animation: blink 1s step-end infinite; }
+.lhold-tok { font-size: 10px; color: var(--amber); }
+
+.lrow-handle { color: var(--amber); font-size: 11px; }
+.lrow-kind { font-size: 9px; letter-spacing: .08em; color: var(--amber); text-transform: uppercase; }
+.lrow-tag { font-size: 9px; color: var(--ink-faint); border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; font-variant-numeric: tabular-nums; }
+
+/* masked value chip + local peek */
+.lv-val { font-family: var(--mono); font-size: 12px; color: var(--ink); word-break: break-all; }
+.lv-val.peek { cursor: pointer; letter-spacing: .14em; color: var(--ink-dim); border-bottom: 1px dashed var(--ink-faint); border-radius: 2px; padding: 0 2px; transition: .12s; }
+.lv-val.peek:hover { color: var(--ink); border-bottom-color: var(--ink-dim); }
+.lv-val.peek:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.lv-val.peek.on { letter-spacing: normal; color: #fff; border-bottom-color: var(--amber); background: var(--amber-glow); }
+.lv-val.locked { color: var(--ink-faint); letter-spacing: .14em; cursor: not-allowed; }
+
+/* small / warn buttons used in ledger rows */
+.btn.sm { font-size: 9px; padding: 4px 9px; letter-spacing: .08em; }
+.btn.warn { border-color: var(--amber-dim); color: var(--amber); }
+.btn.warn:hover { border-color: var(--amber); color: #fff; box-shadow: 0 0 14px -4px var(--amber); }
+/* push a row's action buttons to the right edge */
+.lrow > button.btn:first-of-type { margin-left: auto; }
+
+/* add-keyphrase row */
+.ledger-addrow { display: flex; gap: 8px; padding: 12px 16px 0; flex-wrap: wrap; align-items: center; }
+.ledger-addrow input:not([type=checkbox]) {
+  font: inherit; font-size: 11px; background: var(--bg-inset); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 9px;
+}
+.ledger-addrow input:not([type=checkbox]):focus { outline: none; border-color: var(--cyan-dim); }
+#ledgerAddInput { flex: 1; min-width: 150px; }
+#ledgerAddEntity { width: 170px; }
+.ledger-add-cs { font-size: 10px; color: var(--ink-dim); display: flex; align-items: center; gap: 5px; cursor: pointer; }
+.ledger-add-cs input { accent-color: var(--cyan); }
 .rail { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: linear-gradient(180deg, var(--bg-raise), var(--bg)); }
 .rail-head {
   display: flex; align-items: center; justify-content: space-between;

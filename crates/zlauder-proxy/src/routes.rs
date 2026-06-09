@@ -51,6 +51,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(monitor::custom_masks_remove),
         )
         .route(
+            "/zlauder/monitor/reveal",
+            post(monitor::reveal_keyphrase).delete(monitor::remask_keyphrase),
+        )
+        .route(
             "/zlauder/session/{conversation}/v1/messages",
             post(messages_session),
         )
@@ -181,10 +185,14 @@ async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
         Ok(b) => b,
         Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
-    let (masked, _manifest) = match mask_body(&st, &body_bytes).await {
+    let (masked, manifest) = match mask_body(&st, &body_bytes).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
+    // count_tokens masks + forwards but never records a request. Feed the durable
+    // session-token ledger directly so values masked only for a token-count are not
+    // missing from the secrets ledger.
+    st.monitor.ingest_session_tokens(&manifest);
     let resp = match send_upstream(&st, &parts, masked, "/v1/messages/count_tokens").await {
         Ok(r) => r,
         Err(resp) => return resp,

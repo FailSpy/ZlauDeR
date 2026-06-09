@@ -33,6 +33,7 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         port: 0,
         monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
+        config_control: Arc::new(std::sync::Mutex::new(())),
     }
 }
 
@@ -1119,6 +1120,7 @@ fn mk_state_in(
         port: 0,
         monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
+        config_control: Arc::new(std::sync::Mutex::new(())),
     }
 }
 
@@ -1299,6 +1301,93 @@ async fn custom_mask_persist_list_remove() {
     assert_eq!(rm["removed_persisted"], serde_json::json!(true));
     let file = std::fs::read_to_string(dir.join("zlauder.local.toml")).unwrap();
     assert!(!file.contains("ACME-XYZ"), "file still has rule: {file}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Reveal-to-model: a custom keyphrase is allow-listed (egresses plaintext) AND its
+// backing rule is dropped; the choice persists to the local allow-list. Re-mask lifts
+// the allow-list entry durably.
+#[tokio::test]
+async fn reveal_then_remask_keyphrase_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("zlauder-rev-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::create_dir_all(&dir);
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state_in(engine, "http://127.0.0.1:1".into(), "rv", &dir);
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // Seed a custom keyphrase, then reveal it to the model.
+    client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/custom-mask"))
+        .header("x-zlauder-key", "rv")
+        .json(&serde_json::json!({"pattern":"SEKRET-1"}))
+        .send()
+        .await
+        .unwrap();
+
+    let rev: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/reveal"))
+        .header("x-zlauder-key", "rv")
+        .json(&serde_json::json!({"value":"SEKRET-1","pattern":"SEKRET-1","entity_type":"CUSTOM_KEYWORD"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rev["ok"], serde_json::json!(true));
+    assert_eq!(rev["removed_rule"], serde_json::json!(true), "backing custom rule dropped");
+    assert!(rev["persisted"].is_string(), "reveal persisted: {rev}");
+    // The value is now allow-listed in the returned config...
+    let allowed = rev["config"]["allow_list"]["exact"].as_array().unwrap();
+    assert!(allowed.iter().any(|v| v == "SEKRET-1"), "value allow-listed: {rev}");
+    // ...written to the local file's [engine.allow_list], and the custom rule is gone.
+    let file = std::fs::read_to_string(dir.join("zlauder.local.toml")).unwrap();
+    assert!(file.contains("SEKRET-1"), "allow-list persisted: {file}");
+    assert!(file.contains("allow_list"), "allow_list table written: {file}");
+
+    // The live config endpoint confirms the value egresses plaintext now.
+    let cfg: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "rv")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let live_allowed = cfg["config"]["allow_list"]["exact"].as_array().unwrap();
+    assert!(live_allowed.iter().any(|v| v == "SEKRET-1"));
+
+    // Re-mask: lift the allow-list suppression durably.
+    let rem: serde_json::Value = client
+        .request(
+            reqwest::Method::DELETE,
+            format!("http://{proxy_addr}/zlauder/monitor/reveal"),
+        )
+        .header("x-zlauder-key", "rv")
+        .json(&serde_json::json!({"value":"SEKRET-1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rem["removed_live"], serde_json::json!(true));
+    let live_allowed = rem["config"]["allow_list"]["exact"].as_array().unwrap();
+    assert!(!live_allowed.iter().any(|v| v == "SEKRET-1"), "remask cleared live: {rem}");
+    let file = std::fs::read_to_string(dir.join("zlauder.local.toml")).unwrap();
+    assert!(!file.contains("SEKRET-1"), "remask cleared the persisted allow-list: {file}");
+
+    // Reveal/remask is key-gated like the rest of the control plane.
+    let unauth = client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/reveal"))
+        .json(&serde_json::json!({"value":"x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), reqwest::StatusCode::FORBIDDEN);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

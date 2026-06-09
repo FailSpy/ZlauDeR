@@ -11,7 +11,7 @@ use zlauder_engine::UnmaskManifest;
 use super::delta::{compute_delta, compute_delta_from_hashes};
 use super::model::{
     ApprovalDecision, ConversationMeta, MonitorEvent, MonitorMode, MonitorSnapshot,
-    RequestDecision, RequestRecord, Surface, TurnDelta,
+    RequestDecision, RequestRecord, Surface, TokenClass, TokenLedgerEntry, TurnDelta,
 };
 use super::spans::{now_ms, preview, spans_from_manifest, spans_from_values, token_previews};
 use super::surfaces::{surfaces_from_body, surfaces_from_response_body};
@@ -23,6 +23,10 @@ const DEFAULT_MAX_PENDING_APPROVALS: usize = 32;
 /// Cap on the per-conversation cache of last-turn surface hashes. Keeps deltas
 /// computable even after the prior turn's record is evicted from the global ring.
 const MAX_TRACKED_CONVERSATIONS: usize = 1024;
+/// Hard cap on the durable session-token ledger. Generous (the secrets ledger
+/// should hold a whole session's distinct values), oldest-evicted past it — a real
+/// bound, logged when it trips, never a silent truncation.
+const MAX_SESSION_TOKENS: usize = 5000;
 
 /// Domain-level failure of a state mutation keyed by request id. The web layer
 /// maps this to an HTTP status; the state layer stays framework-free.
@@ -71,6 +75,11 @@ struct Inner {
     /// first user message). Recomputing it from the ring is wrong — records are
     /// newest-first and turn-1 evicts — so it is stored once when minted.
     labels: HashMap<String, String>,
+    /// Durable, session-scoped ledger of every distinct masked value, keyed by token
+    /// handle. Fed at the masking site (not the recording site) so it survives the
+    /// 500-record ring eviction and also captures count_tokens traffic that never
+    /// becomes a record. Bounded by [`MAX_SESSION_TOKENS`] (oldest-evicted).
+    session_tokens: HashMap<String, TokenLedgerEntry>,
 }
 
 impl Default for Monitor {
@@ -94,6 +103,7 @@ impl Monitor {
                 conversation_anchors: HashMap::new(),
                 last_seen: HashMap::new(),
                 labels: HashMap::new(),
+                session_tokens: HashMap::new(),
             })),
             events,
         }
@@ -101,6 +111,9 @@ impl Monitor {
 
     pub fn snapshot(&self) -> MonitorSnapshot {
         let inner = self.inner.lock().expect("monitor mutex poisoned");
+        let mut session_tokens: Vec<TokenLedgerEntry> =
+            inner.session_tokens.values().cloned().collect();
+        session_tokens.sort_by_key(|e| e.first_seen_ms);
         MonitorSnapshot {
             mode: inner.mode,
             pending_count: inner.waiters.len(),
@@ -108,7 +121,21 @@ impl Monitor {
             records: inner.records.iter().cloned().collect(),
             conversations: conversations_from_records(&inner.records, &inner.labels),
             approval_timeout_secs: APPROVAL_TIMEOUT_SECS,
+            session_tokens,
         }
+    }
+
+    /// Fold a request's masking manifest into the durable session-token ledger.
+    /// Called from BOTH [`Self::record_llm_request`] (inlined, under the same lock)
+    /// and directly from the `count_tokens` mask path (which masks + forwards but
+    /// never records) — so the ledger is complete across all masked egress.
+    pub fn ingest_session_tokens(&self, manifest: &UnmaskManifest) {
+        if manifest.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let mut inner = self.inner.lock().expect("monitor mutex poisoned");
+        ingest_tokens_into(&mut inner, manifest, now);
     }
 
     pub fn set_mode(
@@ -162,6 +189,9 @@ impl Monitor {
             .collect();
 
         let mut inner = self.inner.lock().expect("monitor mutex poisoned");
+        // Fold this request's masked values into the durable ledger under the same
+        // lock (a separate `ingest_session_tokens` call would deadlock the std mutex).
+        ingest_tokens_into(&mut inner, manifest, now);
         let id = format!("req-{}", inner.next_seq);
         inner.next_seq += 1;
 
@@ -488,6 +518,62 @@ pub struct ReviewTicket {
 impl ReviewTicket {
     pub fn id(&self) -> &str {
         &self.id
+    }
+}
+
+/// Accumulate a manifest's entries into the durable session-token ledger held in
+/// `inner`. New tokens are inserted with their first-seen timestamp; repeats bump
+/// the count. Over [`MAX_SESSION_TOKENS`] the oldest entries are evicted (logged).
+///
+/// FORWARD-COMPAT SEAM (plan A): classification lives here, the single ingest point.
+/// Today every manifest entry is detector/keyword PII → [`TokenClass::AutoPii`],
+/// peekable. When the secrets engine tags manifest entries with a source, switch on
+/// it here to set [`TokenClass::Guard`]/`Broker`; `is_peekable()` then suppresses
+/// both the stored plaintext (`value` left empty) and UI peek — so a brokered secret
+/// that interns into the manifest never reaches the snapshot in cleartext.
+fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
+    for e in &manifest.entries {
+        if let Some(existing) = inner.session_tokens.get_mut(&e.token_handle) {
+            existing.count = existing.count.saturating_add(1);
+            continue;
+        }
+        let class = TokenClass::AutoPii;
+        let peekable = class.is_peekable();
+        let value = if peekable {
+            e.canonical_form.clone()
+        } else {
+            String::new()
+        };
+        inner.session_tokens.insert(
+            e.token_handle.clone(),
+            TokenLedgerEntry {
+                token: e.token_handle.clone(),
+                value,
+                entity_kind: e.entity_kind.clone(),
+                class,
+                peekable,
+                first_seen_ms: now,
+                count: 1,
+            },
+        );
+    }
+    if inner.session_tokens.len() > MAX_SESSION_TOKENS {
+        let over = inner.session_tokens.len() - MAX_SESSION_TOKENS;
+        tracing::warn!(
+            "session-token ledger over cap ({MAX_SESSION_TOKENS}); evicting {over} oldest entr{}",
+            if over == 1 { "y" } else { "ies" }
+        );
+        while inner.session_tokens.len() > MAX_SESSION_TOKENS {
+            let Some(victim) = inner
+                .session_tokens
+                .values()
+                .min_by_key(|e| e.first_seen_ms)
+                .map(|e| e.token.clone())
+            else {
+                break;
+            };
+            inner.session_tokens.remove(&victim);
+        }
     }
 }
 
@@ -879,6 +965,64 @@ mod tests {
             find(&m, &id).decision,
             RequestDecision::UpstreamError
         ));
+    }
+
+    fn manifest_with(token: &str, value: &str) -> UnmaskManifest {
+        let mut m = UnmaskManifest::new();
+        m.push(zlauder_engine::ManifestEntry {
+            canonical_form: value.to_string(),
+            token_handle: token.to_string(),
+            entity_kind: "EMAIL_ADDRESS".to_string(),
+            arrow_origin: zlauder_engine::Surface::UserMessage,
+            exposed_at: None,
+        });
+        m
+    }
+
+    #[test]
+    fn session_token_survives_record_ring_eviction() {
+        let m = Monitor::new();
+        // A request masking a distinct value seeds the ledger.
+        let early = manifest_with("[EMAIL_0001]", "alice@example.com");
+        m.record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("hi"))]), &early);
+
+        // Flood the 500-record ring so the seeding record is evicted.
+        for i in 0..(MAX_RECORDS + 5) {
+            let b = body(&[("user", json!(format!("turn {i}")))]);
+            m.record_llm_request("/v1/messages", "POST", Some(format!("c{i}")), &b, &UnmaskManifest::new());
+        }
+
+        let snap = m.snapshot();
+        assert!(
+            snap.records.len() <= MAX_RECORDS,
+            "ring is bounded ({} records)",
+            snap.records.len()
+        );
+        // The value's originating record is long gone, but the ledger retains it.
+        let entry = snap
+            .session_tokens
+            .iter()
+            .find(|e| e.token == "[EMAIL_0001]")
+            .expect("session token survives record eviction");
+        assert_eq!(entry.value, "alice@example.com");
+        assert!(entry.peekable);
+    }
+
+    #[test]
+    fn session_token_count_aggregates_and_ledger_is_sorted() {
+        let m = Monitor::new();
+        m.ingest_session_tokens(&manifest_with("[EMAIL_0001]", "a@x.com"));
+        m.ingest_session_tokens(&manifest_with("[PHONE_0002]", "555-0100"));
+        m.ingest_session_tokens(&manifest_with("[EMAIL_0001]", "a@x.com")); // repeat
+        let snap = m.snapshot();
+        let email = snap.session_tokens.iter().find(|e| e.token == "[EMAIL_0001]").unwrap();
+        let phone = snap.session_tokens.iter().find(|e| e.token == "[PHONE_0002]").unwrap();
+        // Ledger is sorted by first_seen_ms (non-decreasing) and the email — ingested
+        // first — never sorts after the phone.
+        assert!(email.first_seen_ms <= phone.first_seen_ms);
+        let seens: Vec<u128> = snap.session_tokens.iter().map(|e| e.first_seen_ms).collect();
+        assert!(seens.windows(2).all(|w| w[0] <= w[1]), "ledger sorted by first_seen_ms");
+        assert_eq!(email.count, 2, "repeat masks bump the count");
     }
 
     fn find(m: &Monitor, id: &str) -> RequestRecord {

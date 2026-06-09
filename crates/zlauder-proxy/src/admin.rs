@@ -161,6 +161,10 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
             );
         }
     };
+    // Serialize the whole config read-modify-write against every other control-plane
+    // writer (custom-mask, reveal, profile, ml). Lock order is config_control THEN
+    // ml_control (acquired below) — fixed everywhere to avoid deadlock.
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     // Start from the live config in its wire form, overlay only the sent keys, then
     // deserialize the merged whole.
     let current = WireConfig::from_engine(&st.engine.config_snapshot());
@@ -289,6 +293,7 @@ pub async fn apply_profile(
     // Derive the profile's threshold/categories/operator from the single engine
     // source, then overlay them onto the LIVE config (keeping entity_operators,
     // allow_list, ml, custom rules, etc.). `enabled`/`ml.enabled` stay live-owned.
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let defaults = EngineConfig::for_profile(profile);
     let mut cfg = st.engine.config_snapshot();
     cfg.profile = profile;
@@ -366,7 +371,9 @@ pub async fn ml_enable(State(st): State<AppState>, hdrs: HeaderMap) -> Response 
     if !st.authed(&hdrs) {
         return forbidden();
     }
-    // Serialize against a concurrent enable/disable (held only across sync code).
+    // Serialize against a concurrent enable/disable AND any other config writer.
+    // Lock order config_control → ml_control (held only across sync code).
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
     let mut cfg = st.engine.config_snapshot();
     cfg.ml.enabled = true;
@@ -385,6 +392,7 @@ pub async fn ml_disable(State(st): State<AppState>, hdrs: HeaderMap) -> Response
     if !st.authed(&hdrs) {
         return forbidden();
     }
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
     let mut cfg = st.engine.config_snapshot();
     cfg.ml.enabled = false;
@@ -418,6 +426,9 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     if !st.authed(&hdrs) {
         return forbidden();
     }
+    // Serialize the file-reload RMW against live config writers. Lock order
+    // config_control → ml_control (acquired below).
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let mut cfg = match config::reload_engine(&st.layers) {
         Ok(c) => c,
         Err(e) => {

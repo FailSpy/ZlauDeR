@@ -37,6 +37,16 @@ let trafficQuery = '';
 let revealValues = localStorage.getItem('zlRevealValues') === '1';
 let approvalTimeoutMs = 300000;   // overwritten by snapshot.approval_timeout_secs
 
+/* ---------- ledger view state ---------- */
+let view = 'ledger';                 // 'ledger' (default, always) | 'inspector'
+let sessionTokens = [];              // snapshot.session_tokens (durable, session-scoped)
+let ledgerAllow = { exact: [], exact_ci: [] };  // GET /zlauder/config .config.allow_list
+let ledgerCustomRules = [];          // GET /zlauder/monitor/custom-mask
+const peeked = new Set();            // row keys currently peeked (local plaintext, anti shoulder-surf)
+// The four common-word defaults are always re-seeded; only NON-default allow-list
+// entries are operator-configured / reveal-created "passing plaintext".
+const DEFAULT_ALLOW = { exact: new Set(['Anthropic', 'Claude', '127.0.0.1']), exact_ci: new Set(['localhost']) };
+
 const $ = id => document.getElementById(id);
 
 /* ---------- decision vocabulary ---------- */
@@ -573,7 +583,230 @@ function render(flashId) {
   renderChannels();
   renderTraffic(flashId);
   renderReview();
+  renderLedger();
+  renderViewState();
 }
+
+/* ============================================================
+   VIEW TABS  —  Ledger (default) vs Inspector
+   ============================================================ */
+function renderViewState() {
+  const pending = records.filter(r => r.decision === 'pending').length;
+  $('viewLedger').hidden = view !== 'ledger';
+  $('viewInspector').hidden = view !== 'inspector';
+  $('tabLedger').classList.toggle('active', view === 'ledger');
+  $('tabInspector').classList.toggle('active', view === 'inspector');
+  const badge = $('tabInspectorBadge');
+  badge.textContent = pending;
+  badge.hidden = pending === 0;
+}
+function setView(v) { view = v; renderViewState(); }
+$('tabLedger').addEventListener('click', () => setView('ledger'));
+$('tabInspector').addEventListener('click', () => setView('inspector'));
+
+/* ============================================================
+   LEDGER  —  the secrets-first default view.
+   Three groups (custom first), values masked by default with a per-row local
+   PEEK (anti shoulder-surf; never sent anywhere), plus a holds strip that keeps
+   the approve/reject loop reachable without leaving the ledger.
+
+   Two distinct "reveals" (do not conflate):
+     - PEEK   : show plaintext in THIS browser only. Pure client state (`peeked`).
+     - REVEAL TO MODEL : allow-list the value so it egresses UNMASKED upstream;
+                durable, privacy-reducing → confirm first. Server-side.
+   Auto-detected rows whose class is non-peekable (reserved for the secrets engine)
+   render locked and cannot be revealed — the value is never in the snapshot.
+   ============================================================ */
+
+/* A value chip: masked by default; click peeks the plaintext locally. A non-peekable
+   (secret-class) row renders a static lock — no value, no peek. */
+function peekChip(rowKey, value, peekable) {
+  if (peekable === false) {
+    return `<span class="lv-val locked" title="secret — value withheld from the UI">••••••</span>`;
+  }
+  const on = peeked.has(rowKey);
+  return `<span class="lv-val peek ${on ? 'on' : ''}" data-peek="${attr(rowKey)}" tabindex="0" role="button"`
+    + ` aria-label="${on ? 'hide value' : 'reveal value locally'}"`
+    + ` title="${on ? 'click to hide' : 'click to reveal locally — not sent anywhere'}">`
+    + `${on ? esc(value) : '••••••'}</span>`;
+}
+
+function renderLedger() {
+  // ---- holds strip (keeps approve/reject reachable from the ledger) ----
+  const holds = records.filter(r => r.decision === 'pending')
+    .slice().sort((a, b) => Number(a.started_ms) - Number(b.started_ms));
+  $('ledgerHoldsWrap').hidden = holds.length === 0;
+  $('ledgerHolds').innerHTML = holds.map(r => {
+    const rem = remainingMs(r);
+    return `<div class="lhold" data-hold-select="${esc(r.id)}" title="open in inspector">`
+      + `<span class="lhold-turn">T${r.turn_index}</span>`
+      + `<span class="lhold-ep">${esc(r.endpoint)}</span>`
+      + `<span class="lhold-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">⏱ ${fmtClock(rem)}</span>`
+      + `<span class="lhold-tok">${(r.tokens || []).length} tok</span>`
+      + `<button class="btn danger sm" data-act="reject" data-id="${esc(r.id)}">REJECT</button>`
+      + `<button class="btn primary sm" data-act="approve" data-id="${esc(r.id)}">APPROVE</button>`
+      + `</div>`;
+  }).join('');
+
+  // ---- passing plaintext: non-default allow-list entries ----
+  const allowExact = (ledgerAllow.exact || []).filter(v => !DEFAULT_ALLOW.exact.has(v));
+  const allowCi = (ledgerAllow.exact_ci || []).filter(v => !DEFAULT_ALLOW.exact_ci.has(v));
+  const plainRows = [...allowExact.map(v => ({ v, ci: false })), ...allowCi.map(v => ({ v, ci: true }))];
+  $('ledgerRevealedCount').textContent = plainRows.length;
+  $('ledgerRevealed').innerHTML = plainRows.length ? plainRows.map(({ v, ci }) => {
+    const key = 'al:' + (ci ? 'ci:' : '') + v;
+    return `<div class="lrow plain">`
+      + peekChip(key, v, true)
+      + `<span class="lrow-tag">${ci ? 'ci' : 'exact'}</span>`
+      + `<button class="btn ghost sm" data-lact="remask" data-value="${attr(v)}" title="resume masking this value">RE-MASK</button>`
+      + `</div>`;
+  }).join('') : `<div class="empty-note">Nothing passes plaintext. Reveal a value below to send it unmasked.</div>`;
+
+  // Values already shown as plaintext / as a custom rule are not repeated under AUTO.
+  const allowedSet = new Set([
+    ...allowExact, ...allowExact.map(v => v.toLowerCase()), ...allowCi.map(v => v.toLowerCase()),
+  ]);
+  const customSet = new Set(ledgerCustomRules.map(c => c.pattern));
+
+  // ---- custom keyphrases ----
+  $('ledgerCustomCount').textContent = ledgerCustomRules.length;
+  $('ledgerCustom').innerHTML = ledgerCustomRules.length ? ledgerCustomRules.map(c => {
+    const key = 'cm:' + c.pattern;
+    return `<div class="lrow">`
+      + peekChip(key, c.pattern, true)
+      + `<span class="lrow-kind">${esc(c.entity_type)}</span>`
+      + `<span class="lrow-tag">${c.case_sensitive ? 'CS' : 'ci'}</span>`
+      + `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(c.pattern)}" data-pattern="${attr(c.pattern)}" data-entity="${attr(c.entity_type)}">REVEAL TO MODEL</button>`
+      + `<button class="btn ghost sm" data-lact="rm-custom" data-pattern="${attr(c.pattern)}" data-entity="${attr(c.entity_type)}">REMOVE</button>`
+      + `</div>`;
+  }).join('') : `<div class="empty-note">No custom keyphrases. Add one above, or select text in a request (inspector).</div>`;
+
+  // ---- auto-detected (durable session_tokens, dedup vs above) ----
+  const seen = new Set();
+  const autoRows = sessionTokens.filter(t => {
+    const val = t.value || '';
+    if (val && (allowedSet.has(val) || allowedSet.has(val.toLowerCase()))) return false;
+    if (val && customSet.has(val)) return false;
+    if (seen.has(t.token)) return false;
+    seen.add(t.token); return true;
+  });
+  $('ledgerTokensCount').textContent = autoRows.length;
+  $('ledgerTokens').innerHTML = autoRows.length ? autoRows.map(t => {
+    const key = 'tok:' + t.token;
+    const canReveal = t.peekable !== false && !!t.value;
+    return `<div class="lrow">`
+      + `<span class="lrow-handle">${esc(t.token)}</span>`
+      + peekChip(key, t.value, t.peekable)
+      + `<span class="lrow-kind">${esc(t.entity_kind)}</span>`
+      + (t.count > 1 ? `<span class="lrow-tag">×${t.count}</span>` : '')
+      + (canReveal ? `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(t.value)}">REVEAL TO MODEL</button>` : '')
+      + `</div>`;
+  }).join('') : `<div class="empty-note">No PII auto-detected yet this session.</div>`;
+}
+
+/* ---- ledger sources: allow-list + custom rules (fetched once + after edits) ---- */
+function applyLedgerConfig(wire) { if (wire && wire.allow_list) ledgerAllow = wire.allow_list; }
+function refreshLedgerSources() {
+  const a = api('/zlauder/config').then(r => r.ok ? r.json() : null)
+    .then(s => { if (s && s.config && s.config.allow_list) ledgerAllow = s.config.allow_list; }).catch(() => {});
+  const b = api('/zlauder/monitor/custom-mask').then(r => r.ok ? r.json() : null)
+    .then(d => { if (d) ledgerCustomRules = d.custom_replacements || []; }).catch(() => {});
+  return Promise.all([a, b]).then(renderLedger);
+}
+
+/* ---- ledger actions ---- */
+function revealToModel(value, pattern, entity) {
+  if (!value) return;
+  const ok = window.confirm(
+    `Reveal to the model?\n\n  ${value}\n\n`
+    + `This value will be sent to the model UNMASKED from now on, and the choice is `
+    + `persisted to zlauder.local.toml. Note: this does not touch values masked by a `
+    + `config regex pattern, nor masking-exempt control/schema keys. You can RE-MASK `
+    + `any time from PASSING PLAINTEXT.`
+  );
+  if (!ok) return;
+  const body = { value };
+  if (pattern) { body.pattern = pattern; body.entity_type = entity || 'CUSTOM_KEYWORD'; }
+  api('/zlauder/monitor/reveal', { method: 'POST', body: JSON.stringify(body) })
+    .then(async r => {
+      if (!r.ok) { toast('reveal failed', 'bad'); return; }
+      let res = {}; try { res = await r.json(); } catch {}
+      const note = res.session_only ? ' (live only — persist failed)' : (res.persisted ? ' (persisted)' : '');
+      toast(`revealed <b>${esc(value)}</b> to the model${note}`, 'bad');
+      applyLedgerConfig(res.config);
+      refreshLedgerSources();
+      if (!$('policyDrawer').hidden) loadCustomMasks();
+    })
+    .catch(() => toast('reveal failed', 'bad'));
+}
+function remaskValue(value) {
+  if (!value) return;
+  api('/zlauder/monitor/reveal', { method: 'DELETE', body: JSON.stringify({ value }) })
+    .then(async r => {
+      if (!r.ok) { toast('re-mask failed', 'bad'); return; }
+      let res = {}; try { res = await r.json(); } catch {}
+      toast(`re-masking <b>${esc(value)}</b>${res.removed_live ? '' : ' (was not allow-listed)'}`, 'good');
+      applyLedgerConfig(res.config);
+      refreshLedgerSources();
+    })
+    .catch(() => toast('re-mask failed', 'bad'));
+}
+function removeCustomRule(pattern, entity_type) {
+  api('/zlauder/monitor/custom-mask', { method: 'DELETE', body: JSON.stringify({ pattern, entity_type }) })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('remove failed')))
+    .then(res => {
+      toast(`removed mask <b>${esc(pattern)}</b>${res.removed_persisted ? ' (live + persisted)' : ' (live only)'}`, 'good');
+      refreshLedgerSources();
+      if (!$('policyDrawer').hidden) loadCustomMasks();
+    })
+    .catch(() => toast('mask remove failed', 'bad'));
+}
+function ledgerAdd() {
+  const pat = ($('ledgerAddInput').value || '').trim();
+  if (!pat) return;
+  const entity = ($('ledgerAddEntity').value || '').trim() || 'CUSTOM_KEYWORD';
+  const caseSensitive = $('ledgerAddCase').checked;
+  api('/zlauder/monitor/custom-mask', { method: 'POST', body: JSON.stringify({ pattern: pat, entity_type: entity, case_sensitive: caseSensitive }) })
+    .then(async r => {
+      if (!r.ok) { toast('keyphrase rejected', 'bad'); return; }
+      let res = {}; try { res = await r.json(); } catch {}
+      const note = res.session_only ? ' (session-only — lost on reload)' : (res.persisted ? ' (persisted)' : '');
+      toast(`masking <b>${esc(pat)}</b>${note}`, 'good');
+      $('ledgerAddInput').value = ''; $('ledgerAddEntity').value = ''; $('ledgerAddCase').checked = false;
+      refreshLedgerSources();
+      if (!$('policyDrawer').hidden) loadCustomMasks();
+    })
+    .catch(() => toast('keyphrase add failed', 'bad'));
+}
+$('ledgerAddGo').addEventListener('click', ledgerAdd);
+$('ledgerAddInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); ledgerAdd(); } });
+$('ledgerAddEntity').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); ledgerAdd(); } });
+
+/* ledger-local delegation: peek toggle, hold-select, reveal/remask/remove */
+$('viewLedger').addEventListener('click', e => {
+  const peek = e.target.closest('[data-peek]');
+  if (peek) {
+    const k = peek.dataset.peek;
+    if (peeked.has(k)) peeked.delete(k); else peeked.add(k);
+    renderLedger();
+    return;
+  }
+  const la = e.target.closest('[data-lact]');
+  if (la) {
+    const v = la.dataset.value || '';
+    if (la.dataset.lact === 'reveal') revealToModel(v, la.dataset.pattern || null, la.dataset.entity || null);
+    else if (la.dataset.lact === 'remask') remaskValue(v);
+    else if (la.dataset.lact === 'rm-custom') removeCustomRule(la.dataset.pattern, la.dataset.entity);
+    return;
+  }
+  // Clicking a hold row body (not its action buttons) opens it in the inspector.
+  const hold = e.target.closest('[data-hold-select]');
+  if (hold && !e.target.closest('[data-act]')) {
+    selectedId = hold.dataset.holdSelect;
+    setView('inspector');
+    render();
+  }
+});
 
 /* ============================================================
    AUTO-SELECT: the gatekeeper must land on a held request.
@@ -668,7 +901,9 @@ document.addEventListener('change', e => {
   }
 });
 
-$('saveMode').addEventListener('click', saveMode);
+// POSTURE auto-applies on change — no SET button. The cap input still commits on
+// change / Enter (both call saveMode, which reads the current dropdown + cap).
+$('mode').addEventListener('change', saveMode);
 $('queueCap').addEventListener('change', saveMode);
 $('queueCap').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); saveMode(); } });
 function saveMode() {
@@ -775,6 +1010,7 @@ function applySnapshot(s) {
   lastSnap = s;
   records = s.records || [];
   conversations = s.conversations || [];
+  sessionTokens = s.session_tokens || [];
   if (typeof s.approval_timeout_secs === 'number') approvalTimeoutMs = s.approval_timeout_secs * 1000;
   // In OBSERVE-ONLY there is nothing to approve, so default the traffic view to
   // live activity instead of an always-empty pending queue. A hold posture keeps
@@ -794,7 +1030,7 @@ function setLink(on) {
   $('liveLabel').textContent = on ? 'LIVE' : 'LINK';
 }
 
-load();
+load().then(refreshLedgerSources);
 
 const es = new EventSource(`/zlauder/monitor/events?key=${encodeURIComponent(key)}`);
 es.onopen = () => setLink(true);

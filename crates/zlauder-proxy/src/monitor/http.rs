@@ -22,7 +22,8 @@ use crate::routes;
 use crate::state::AppState;
 
 use super::model::{
-    ApprovalDecision, CustomMaskRequest, ModeRequest, MonitorEvent, RejectRequest, TagsRequest,
+    ApprovalDecision, CustomMaskRequest, ModeRequest, MonitorEvent, RejectRequest, RemaskRequest,
+    RevealRequest, TagsRequest,
 };
 use super::persist;
 use super::store::ReviewTicket;
@@ -132,6 +133,9 @@ pub async fn custom_mask(
         token: None,
         apply_to_surfaces: None,
     };
+    // Hold the config RMW lock across snapshot→set_config→persist so a concurrent
+    // writer (reveal / profile / PUT) can't lost-update us or reorder the file write.
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let mut cfg = st.engine.config_snapshot();
     cfg.custom_replacements.push(rule.clone());
     if let Err(e) = st.engine.set_config(cfg) {
@@ -202,6 +206,7 @@ pub async fn custom_masks_remove(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "CUSTOM_KEYWORD".to_string());
 
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     let mut cfg = st.engine.config_snapshot();
     let before = cfg.custom_replacements.len();
     let mut removed_live = false;
@@ -230,6 +235,144 @@ pub async fn custom_masks_remove(
         "removed_live": removed_live,
         "removed_persisted": removed_persisted,
         "config": wire,
+    }))
+}
+
+/// The four common-word defaults `AllowList::with_common_words` always re-seeds.
+/// Entries beyond these are operator-configured or reveal-created; only those are
+/// persisted (the defaults are re-added by `from_specs` on every load).
+const DEFAULT_ALLOW_EXACT: [&str; 3] = ["Anthropic", "Claude", "127.0.0.1"];
+const DEFAULT_ALLOW_EXACT_CI: [&str; 1] = ["localhost"];
+
+fn non_default_exact(al: &zlauder_engine::AllowList) -> Vec<String> {
+    al.exact
+        .iter()
+        .filter(|v| !DEFAULT_ALLOW_EXACT.contains(&v.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn non_default_exact_ci(al: &zlauder_engine::AllowList) -> Vec<String> {
+    al.exact_ci
+        .iter()
+        .filter(|v| !DEFAULT_ALLOW_EXACT_CI.contains(&v.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Persist the live allow-list's full effective non-default sets to local TOML,
+/// returning the `(persisted, session_only, persist_error)` triple the UI expects.
+fn persist_allow_lists(st: &AppState, al: &zlauder_engine::AllowList) -> (Option<String>, bool, Option<String>) {
+    match persist::persist_local_allow_lists(
+        &st.project_root,
+        &non_default_exact(al),
+        &non_default_exact_ci(al),
+    ) {
+        Ok(path) => (Some(path.display().to_string()), false, None),
+        Err(e) => (None, true, Some(e)),
+    }
+}
+
+/// `POST /zlauder/monitor/reveal` — reveal a value TO THE MODEL: add it to the
+/// allow-list (so future requests egress it plaintext) and, if it was backed by a
+/// custom keyphrase rule, drop that rule too. Durable: re-persists the full effective
+/// allow-list to `zlauder.local.toml`. Privacy-reducing — the UI gates this behind a
+/// confirm. All under `config_control` (snapshot→set_config→persist held together).
+pub async fn reveal_keyphrase(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    axum::Json(req): axum::Json<RevealRequest>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let value = req.value.trim().to_string();
+    if value.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "value must not be empty");
+    }
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
+    let mut cfg = st.engine.config_snapshot();
+
+    // If this value is a custom keyphrase, remove its backing rule (live + persisted)
+    // so it does not immediately re-mask the value the allow-list now lets through.
+    let mut removed_rule = false;
+    let backing = req
+        .pattern
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(pattern) = backing {
+        let entity_type = req
+            .entity_type
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "CUSTOM_KEYWORD".to_string());
+        let before = cfg.custom_replacements.len();
+        let mut done = false;
+        cfg.custom_replacements.retain(|c| {
+            if !done && c.pattern == pattern && c.entity_type == entity_type {
+                done = true;
+                false
+            } else {
+                true
+            }
+        });
+        removed_rule = cfg.custom_replacements.len() != before;
+        let _ = persist::remove_custom_replacement(&st.project_root, pattern, &entity_type);
+    }
+
+    cfg.allow_list.add_exact(&value);
+    if let Err(e) = st.engine.set_config(cfg) {
+        return text(StatusCode::BAD_REQUEST, &format!("reveal rejected: {e}"));
+    }
+    let live = st.engine.config_snapshot();
+    let (persisted, session_only, persist_error) = persist_allow_lists(&st, &live.allow_list);
+    let wire = WireConfig::from_engine(&live);
+    json_response(&json!({
+        "ok": true,
+        "config": wire,
+        "removed_rule": removed_rule,
+        "persisted": persisted,
+        "session_only": session_only,
+        "persist_error": persist_error,
+    }))
+}
+
+/// `DELETE /zlauder/monitor/reveal` — re-mask a previously-revealed value: lift its
+/// allow-list suppression (both `exact` and `exact_ci`) so detection resumes, and
+/// re-persist the full effective allow-list. Does NOT recreate a removed custom rule,
+/// and cannot re-mask a value egressing via a config `patterns` regex (only
+/// `exact`/`exact_ci` are touched). Under `config_control`.
+pub async fn remask_keyphrase(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    axum::Json(req): axum::Json<RemaskRequest>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let value = req.value.trim().to_string();
+    if value.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "value must not be empty");
+    }
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
+    let mut cfg = st.engine.config_snapshot();
+    let removed_exact = cfg.allow_list.exact.remove(&value);
+    let removed_ci = cfg.allow_list.exact_ci.remove(&value.to_lowercase());
+    let removed_live = removed_exact || removed_ci;
+    if removed_live && let Err(e) = st.engine.set_config(cfg) {
+        return text(StatusCode::BAD_REQUEST, &format!("remask rejected: {e}"));
+    }
+    let live = st.engine.config_snapshot();
+    let (persisted, session_only, persist_error) = persist_allow_lists(&st, &live.allow_list);
+    let wire = WireConfig::from_engine(&live);
+    json_response(&json!({
+        "ok": true,
+        "removed_live": removed_live,
+        "config": wire,
+        "persisted": persisted,
+        "session_only": session_only,
+        "persist_error": persist_error,
     }))
 }
 

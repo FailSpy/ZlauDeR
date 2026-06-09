@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         port,
         monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
+        config_control: Arc::new(std::sync::Mutex::new(())),
     };
 
     // Hold an engine handle so we can kick off the background model load after we

@@ -210,6 +210,63 @@ pub struct RequestRecord {
     pub delta: TurnDelta,
 }
 
+/// Provenance class of a masked value, carried on every [`TokenLedgerEntry`].
+///
+/// FORWARD-COMPAT SEAM (plan A ↔ plan B): the secrets engine will introduce
+/// guard/broker secret values that flow through the masking manifest. Those MUST
+/// NOT be peekable in the operator UI and their plaintext MUST be redacted out of
+/// the snapshot server-side (a guard/broker value in the monitor is a leak). The
+/// `class` + [`TokenLedgerEntry::peekable`] pair is that gate, present from day one
+/// so the ledger never has to be re-founded: the secrets engine sets the reserved
+/// variants below and `is_peekable()` returns `false`, suppressing both peek and
+/// value transport. Today every masked token is detector/keyword PII, all peekable.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenClass {
+    /// A presidio/regex auto-detected PII token. Plaintext peekable locally.
+    AutoPii,
+    /// A user-defined custom keyphrase mask. Plaintext peekable locally.
+    Custom,
+    /// RESERVED (secrets engine): a guarded secret the model never sees and that is
+    /// never revealable. Not produced yet; peek + value transport are suppressed.
+    Guard,
+    /// RESERVED (secrets engine): a brokered secret resolved at the tool boundary
+    /// (interned, so it WOULD appear in the manifest). Not produced yet; tool-only,
+    /// peek + value transport suppressed.
+    Broker,
+}
+
+impl TokenClass {
+    /// Whether a value of this class may have its plaintext shown (peek) and carried
+    /// in the snapshot. Secret classes (guard/broker) are never peekable.
+    pub fn is_peekable(self) -> bool {
+        matches!(self, TokenClass::AutoPii | TokenClass::Custom)
+    }
+}
+
+/// One distinct masked value observed this proxy session, accumulated durably
+/// (independent of the 500-entry record ring) so the ledger is genuinely
+/// session-scoped. `value` is empty when `!peekable` (a secret class) — redaction
+/// is structural, not a UI courtesy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenLedgerEntry {
+    /// The `[ENTITY_xxxx]` handle that appears in masked text.
+    pub token: String,
+    /// Canonical plaintext, or empty when `!peekable`.
+    pub value: String,
+    pub entity_kind: String,
+    pub class: TokenClass,
+    /// May the UI peek the plaintext? `false` for secret classes (and then `value`
+    /// is empty). The UI gates per-row peek on this flag alone — it never needs to
+    /// know the class taxonomy.
+    pub peekable: bool,
+    /// First time this token was seen this session (ms since epoch); the ledger
+    /// sort key and the eviction (oldest-first) key.
+    pub first_seen_ms: u128,
+    /// How many times the value has been masked this session.
+    pub count: u64,
+}
+
 /// A conversation grouping shown in the sidebar/timeline.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationMeta {
@@ -236,6 +293,12 @@ pub struct MonitorSnapshot {
     /// Additive field; deserializes to the historical default when absent.
     #[serde(default = "default_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Durable, session-scoped ledger of every distinct value masked this proxy
+    /// session (sorted by `first_seen_ms`). Survives 500-record ring eviction so the
+    /// secrets ledger is genuinely session-complete. Additive; only rides full
+    /// snapshots (not per-record SSE frames). Deserializes empty when absent.
+    #[serde(default)]
+    pub session_tokens: Vec<TokenLedgerEntry>,
 }
 
 fn default_approval_timeout_secs() -> u64 {
@@ -287,6 +350,28 @@ pub struct CustomMaskRemoveRequest {
     pub(crate) pattern: String,
     #[serde(default)]
     pub(crate) entity_type: Option<String>,
+}
+
+/// Reveal a value to the model: allow-list it (so future requests egress it
+/// plaintext) and, if it was backed by a custom rule, drop that rule too. Durable.
+#[derive(Deserialize)]
+pub struct RevealRequest {
+    /// The plaintext value to start passing through unmasked.
+    pub(crate) value: String,
+    /// When the value is a custom keyphrase, its rule `pattern` (so we also remove
+    /// the backing `CustomReplacement`). Optional — auto-detected values have none.
+    #[serde(default)]
+    pub(crate) pattern: Option<String>,
+    /// `entity_type` of the backing custom rule (defaults to `CUSTOM_KEYWORD`).
+    #[serde(default)]
+    pub(crate) entity_type: Option<String>,
+}
+
+/// Re-mask a previously-revealed value: lift its allow-list suppression so
+/// detection resumes. Does NOT recreate a removed custom rule.
+#[derive(Deserialize)]
+pub struct RemaskRequest {
+    pub(crate) value: String,
 }
 
 fn default_true() -> bool {

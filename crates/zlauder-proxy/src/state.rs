@@ -30,6 +30,14 @@ pub struct AppState {
     /// reconcile resurrects a load after the last intent was *off*. Held only across
     /// the sync critical section (never across an `.await`).
     pub ml_control: Arc<std::sync::Mutex<()>>,
+    /// Serializes the config read-modify-write shared by EVERY control-plane writer
+    /// (`config_snapshot` → mutate → `set_config`, plus the synchronous local-TOML
+    /// persist). Without it two concurrent writers (reveal + profile, custom-mask +
+    /// PUT, …) lost-update each other, and a persist could be reordered against the
+    /// live swap. Held across the snapshot→set_config→persist critical section, never
+    /// across an `.await`. Lock order is fixed **`config_control` then `ml_control`**
+    /// everywhere a writer needs both, to avoid deadlock.
+    pub config_control: Arc<std::sync::Mutex<()>>,
 }
 
 impl AppState {

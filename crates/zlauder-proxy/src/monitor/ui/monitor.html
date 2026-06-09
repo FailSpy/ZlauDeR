@@ -40,7 +40,6 @@
         <option value="manual_on_detection">HOLD ON DETECTION</option>
       </select>
     </div>
-    <button id="saveMode" class="btn ghost">SET</button>
   </div>
 
   <button id="policyOpen" class="btn ghost policy-open" title="masking policy — profile, threshold, categories, ML, custom masks">POLICY</button>
@@ -58,7 +57,64 @@
   </div>
 </header>
 
-<main class="grid">
+<nav class="view-tabs" role="tablist" aria-label="monitor view">
+  <button class="view-tab" id="tabLedger" role="tab">
+    <span class="view-tab-glyph">&#9636;</span> LEDGER
+  </button>
+  <button class="view-tab" id="tabInspector" role="tab">
+    <span class="view-tab-glyph">&#9707;</span> INSPECTOR
+    <span class="view-tab-badge" id="tabInspectorBadge" hidden>0</span>
+  </button>
+  <span class="view-tabs-note">secrets masked this session &middot; what plaintext leaves this machine</span>
+</nav>
+
+<!-- ============ LEDGER VIEW (default) ============ -->
+<main class="ledger" id="viewLedger">
+  <section class="ledger-holds" id="ledgerHoldsWrap" hidden>
+    <div class="ledger-sec-head">
+      <span class="ledger-sec-title">HOLDS</span>
+      <span class="ledger-sec-sub">requests paused for approval &mdash; act before they time out</span>
+    </div>
+    <div class="ledger-holds-list" id="ledgerHolds"></div>
+  </section>
+
+  <div class="ledger-cols">
+    <section class="ledger-sec">
+      <div class="ledger-sec-head">
+        <span class="ledger-sec-title">CUSTOM KEYPHRASES</span>
+        <span class="ledger-count" id="ledgerCustomCount">0</span>
+      </div>
+      <div class="ledger-addrow">
+        <input id="ledgerAddInput" placeholder="add a keyphrase to mask&hellip;" autocomplete="off">
+        <input id="ledgerAddEntity" placeholder="entity (CUSTOM_KEYWORD)" autocomplete="off">
+        <label class="ledger-add-cs"><input type="checkbox" id="ledgerAddCase"> CS</label>
+        <button class="btn primary" id="ledgerAddGo">ADD</button>
+      </div>
+      <div class="ledger-rows" id="ledgerCustom"></div>
+    </section>
+
+    <section class="ledger-sec">
+      <div class="ledger-sec-head">
+        <span class="ledger-sec-title">AUTO-DETECTED</span>
+        <span class="ledger-count" id="ledgerTokensCount">0</span>
+      </div>
+      <div class="ledger-sec-note">PII the engine masked automatically this session.</div>
+      <div class="ledger-rows" id="ledgerTokens"></div>
+    </section>
+
+    <section class="ledger-sec ledger-sec-plain">
+      <div class="ledger-sec-head">
+        <span class="ledger-sec-title">PASSING PLAINTEXT</span>
+        <span class="ledger-count" id="ledgerRevealedCount">0</span>
+      </div>
+      <div class="ledger-sec-note">allow-listed &mdash; these values leave this machine <b>unmasked</b>. RE-MASK to resume hiding.</div>
+      <div class="ledger-rows" id="ledgerRevealed"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ============ INSPECTOR VIEW ============ -->
+<main class="grid" id="viewInspector" hidden>
   <aside class="rail rail-convos">
     <div class="rail-head">
       <span class="rail-title">CONVERSATIONS</span>

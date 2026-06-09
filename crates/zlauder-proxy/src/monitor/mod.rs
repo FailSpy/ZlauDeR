@@ -25,13 +25,13 @@ mod ui;
 // --- preserved public API surface ---
 
 pub use http::{
-    approve, custom_mask, custom_masks_list, custom_masks_remove, events, maybe_approve, reject,
-    set_mode, snapshot, tags,
+    approve, custom_mask, custom_masks_list, custom_masks_remove, events, maybe_approve,
+    reject, remask_keyphrase, reveal_keyphrase, set_mode, snapshot, tags,
 };
 pub use model::{
     ConversationMeta, CustomMaskRequest, ModeRequest, MonitorMode, MonitorSnapshot, PreviewSpan,
-    RejectRequest, RequestDecision, RequestRecord, Run, Surface, TagsRequest, TokenPreview,
-    TokenRef, TurnDelta,
+    RejectRequest, RequestDecision, RequestRecord, Run, Surface, TagsRequest, TokenClass,
+    TokenLedgerEntry, TokenPreview, TokenRef, TurnDelta,
 };
 pub use store::{CompletionGuard, Monitor, ReviewTicket};
 pub use ui::ui;

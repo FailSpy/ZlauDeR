@@ -125,6 +125,59 @@ pub fn remove_custom_replacement(
     Ok(removed)
 }
 
+/// Write the project's `zlauder.local.toml` `[engine.allow_list]` `exact` /
+/// `exact_ci` arrays to the **full effective non-default sets** passed in, replacing
+/// whatever was there. Returns the written path.
+///
+/// Why the *full* set, not an append: config layers merge **arrays wholesale**
+/// (user < project < local), and `build_allow_list` reads only the final merged
+/// `exact`/`exact_ci`. Appending one value to local would DROP project/user entries
+/// on the next `/zlauder/reload`, and a local-only removal couldn't durably re-mask a
+/// value seeded by a lower layer. Making local authoritative (the complete effective
+/// set) preserves lower-layer entries (they're already in the live set the caller
+/// derives this from) AND lets re-mask durably drop any of them. `patterns` is left
+/// untouched — reveal/remask never touch regex allow-patterns. Comments/formatting in
+/// the file are preserved via the `toml_edit` round-trip.
+pub fn persist_local_allow_lists(
+    project_root: &str,
+    exact: &[String],
+    exact_ci: &[String],
+) -> Result<PathBuf, String> {
+    let path = local_scope_path(project_root)
+        .ok_or_else(|| "no project root to persist to".to_string())?;
+
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+
+    // Indexing auto-vivifies `[engine]` and `[engine.allow_list]` as tables without
+    // clobbering existing sibling keys; assigning the arrays replaces them wholesale.
+    doc["engine"]["allow_list"]["exact"] = toml_edit::value(str_array(exact));
+    doc["engine"]["allow_list"]["exact_ci"] = toml_edit::value(str_array(exact_ci));
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// A TOML array of strings (sorted for stable diffs).
+fn str_array(items: &[String]) -> toml_edit::Array {
+    let mut sorted: Vec<&String> = items.iter().collect();
+    sorted.sort();
+    let mut arr = toml_edit::Array::new();
+    for s in sorted {
+        arr.push(s.as_str());
+    }
+    arr
+}
+
 /// Serialize one [`CustomReplacement`] as a `toml_edit::Table`, emitting only the
 /// fields the monitor's custom-mask sets (so the persisted entry stays minimal and
 /// readable). The remaining fields take their serde defaults on reload.
@@ -196,5 +249,59 @@ mod tests {
         assert!(persist_custom_replacement("", &rule("X", "Y")).is_err());
         // Removal with no root is a clean false (nothing persisted to remove).
         assert!(!remove_custom_replacement("", "X", "Y").unwrap());
+        // Allow-list persistence likewise needs a root.
+        assert!(persist_local_allow_lists("", &["R".into()], &[]).is_err());
+    }
+
+    // The audit #1/#2 regression: a reveal must persist the FULL effective set so a
+    // lower-layer (project) entry survives the next reload, and a re-mask must durably
+    // drop a value even when it was seeded by a lower layer (local is authoritative
+    // because layered arrays replace wholesale).
+    #[test]
+    fn allow_list_persist_survives_reload_and_remask_is_durable() {
+        use crate::config::{ConfigLayers, reload_engine};
+
+        let dir = std::env::temp_dir().join(format!("zlauder-al-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let root = dir.to_string_lossy().to_string();
+        let project = dir.join("zlauder.toml");
+        let local = dir.join("zlauder.local.toml");
+
+        // A project-scope allow-list entry `P` (a pre-configured passthrough).
+        std::fs::write(
+            &project,
+            "[engine.allow_list]\nexact = [\"projvalue\"]\n",
+        )
+        .unwrap();
+        // Seed the local file with a comment to prove formatting is preserved.
+        std::fs::write(&local, "# local scope\n").unwrap();
+
+        let layers = ConfigLayers {
+            user: std::path::PathBuf::from("/nonexistent/zlauder/config.toml"),
+            project: Some(project.clone()),
+            local: Some(local.clone()),
+        };
+
+        // Reveal `R`: the caller derives the full effective non-default set (`P` is
+        // already live + `R` the new reveal) and writes it to local, authoritative.
+        persist_local_allow_lists(&root, &["projvalue".into(), "revealed".into()], &[]).unwrap();
+        let text = std::fs::read_to_string(&local).unwrap();
+        assert!(text.contains("# local scope"), "comment preserved: {text}");
+
+        let cfg = reload_engine(&layers).unwrap();
+        assert!(cfg.allow_list.is_allowed("projvalue"), "project entry survives reveal");
+        assert!(cfg.allow_list.is_allowed("revealed"), "revealed entry is live");
+
+        // Re-mask `P`: write the full effective set MINUS `projvalue`. Because local
+        // replaces the merged array wholesale, the lower-layer value is durably gone.
+        persist_local_allow_lists(&root, &["revealed".into()], &[]).unwrap();
+        let cfg = reload_engine(&layers).unwrap();
+        assert!(!cfg.allow_list.is_allowed("projvalue"), "remask durably drops the project value");
+        assert!(cfg.allow_list.is_allowed("revealed"), "the other reveal stays");
+        // The four common-word defaults are always re-seeded.
+        assert!(cfg.allow_list.is_allowed("Anthropic"));
+        assert!(cfg.allow_list.is_allowed("localhost"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
