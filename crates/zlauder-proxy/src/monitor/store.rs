@@ -457,6 +457,15 @@ impl Monitor {
         let _ = self.events.send(event);
     }
 
+    /// Push the live masking policy to every monitor subscriber. The `snapshot`
+    /// payload is the `GET /zlauder/config` JSON (`{ config, ml, … }`). Called by
+    /// every control-plane writer after a successful change so open policy panels
+    /// re-render to match — whether the change came from the UI itself, the
+    /// `/zlauder:privacy` CLI, a profile apply, an ML toggle, or a file reload.
+    pub fn broadcast_policy(&self, snapshot: serde_json::Value) {
+        self.emit(MonitorEvent::Policy(Box::new(snapshot)));
+    }
+
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
         self.events.subscribe()
     }

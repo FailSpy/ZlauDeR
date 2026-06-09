@@ -217,13 +217,13 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .ledger-count { margin-left: auto; font-size: 10px; color: var(--cyan); background: var(--cyan-glow);
   border: 1px solid var(--cyan-dim); border-radius: 99px; padding: 1px 8px; min-width: 22px; text-align: center; }
 
-.ledger-rows, .ledger-holds-list { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px 16px; }
-.lrow, .lhold {
+/* holds strip rows keep the simple inset-card flex layout */
+.ledger-holds-list { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px 16px; }
+.lhold {
   display: flex; align-items: center; gap: 10px; padding: 8px 11px; flex-wrap: wrap;
   background: var(--bg-inset); border: 1px solid var(--line-soft); border-radius: var(--radius);
+  cursor: pointer; transition: border-color .12s;
 }
-.lrow.plain { border-color: var(--amber-dim); }
-.lhold { cursor: pointer; transition: border-color .12s; }
 .lhold:hover { border-color: var(--pending); }
 .lhold-turn { font-family: var(--disp); font-weight: 600; font-size: 13px; color: var(--cyan); min-width: 30px; }
 .lhold-ep { font-size: 11px; color: var(--ink); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -232,12 +232,41 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .lhold-clock.crit { color: var(--bad); font-weight: 700; animation: blink 1s step-end infinite; }
 .lhold-tok { font-size: 10px; color: var(--amber); }
 
+/* ---- ledger rows as an aligned grid "table" ----
+   Each section (#ledgerTokens / #ledgerCustom / #ledgerRevealed) is one CSS grid;
+   every .lrow spills its cells into it via display:contents, so columns line up
+   row-to-row no matter how long a value is (the old flex rows scattered by value
+   width). Cell chrome (.lcell) recreates the inset row "bar"; the 1fr spacer
+   column pins the action buttons to the right edge. */
+.ledger-rows { display: grid; row-gap: 6px; column-gap: 0; align-items: stretch; padding: 12px 16px 16px; }
+#ledgerTokens   { grid-template-columns: auto auto auto auto 1fr auto; }
+#ledgerCustom   { grid-template-columns: auto auto auto 1fr auto auto; }
+#ledgerRevealed { grid-template-columns: auto auto 1fr auto; }
+.ledger-rows > .empty-note { grid-column: 1 / -1; }
+.lrow { display: contents; }
+.lcell {
+  display: flex; align-items: center; gap: 7px; min-width: 0;
+  padding: 8px 7px; background: var(--bg-inset);
+  border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+}
+.lrow > .lcell:first-child {
+  padding-left: 11px; border-left: 1px solid var(--line-soft);
+  border-top-left-radius: var(--radius); border-bottom-left-radius: var(--radius);
+}
+.lrow > .lcell:last-child {
+  padding-right: 11px; border-right: 1px solid var(--line-soft);
+  border-top-right-radius: var(--radius); border-bottom-right-radius: var(--radius);
+}
+/* passing-plaintext rows carry the amber "leaving unmasked" accent */
+#ledgerRevealed .lcell { border-color: var(--amber-dim); }
+.lspace { padding: 0; }
+
 .lrow-handle { color: var(--amber); font-size: 11px; }
 .lrow-kind { font-size: 9px; letter-spacing: .08em; color: var(--amber); text-transform: uppercase; }
 .lrow-tag { font-size: 9px; color: var(--ink-faint); border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; font-variant-numeric: tabular-nums; }
 
-/* masked value chip + local peek */
-.lv-val { font-family: var(--mono); font-size: 12px; color: var(--ink); word-break: break-all; }
+/* masked value chip + local peek (show plaintext in THIS browser only — never sent) */
+.lv-val { font-family: var(--mono); font-size: 12px; color: var(--ink); word-break: break-all; max-width: 260px; }
 .lv-val.peek { cursor: pointer; letter-spacing: .14em; color: var(--ink-dim); border-bottom: 1px dashed var(--ink-faint); border-radius: 2px; padding: 0 2px; transition: .12s; }
 .lv-val.peek:hover { color: var(--ink); border-bottom-color: var(--ink-dim); }
 .lv-val.peek:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
@@ -248,8 +277,28 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .btn.sm { font-size: 9px; padding: 4px 9px; letter-spacing: .08em; }
 .btn.warn { border-color: var(--amber-dim); color: var(--amber); }
 .btn.warn:hover { border-color: var(--amber); color: #fff; box-shadow: 0 0 14px -4px var(--amber); }
-/* push a row's action buttons to the right edge */
-.lrow > button.btn:first-of-type { margin-left: auto; }
+
+/* ---- PEEK ALL master switch (top of the ledger) — flips every peekable row to
+   its local plaintext at once. Local-only, defaults off (anti shoulder-surf). ---- */
+.ledger-bar {
+  display: flex; align-items: center; gap: 14px; max-width: 920px; margin-bottom: 14px;
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-panel);
+}
+.peek-all { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+.peek-all input { position: absolute; opacity: 0; width: 0; height: 0; }
+.peek-all-track {
+  position: relative; width: 42px; height: 22px; border-radius: 99px;
+  background: var(--bg-inset); border: 1px solid var(--line); transition: .18s;
+}
+.peek-all-knob {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--ink-faint); transition: .18s;
+}
+.peek-all input:checked + .peek-all-track { background: var(--amber-glow); border-color: var(--amber); }
+.peek-all input:checked + .peek-all-track .peek-all-knob { left: 22px; background: var(--amber); box-shadow: 0 0 10px var(--amber); }
+.peek-all-label { font-family: var(--disp); font-size: 11px; letter-spacing: .2em; font-weight: 600; color: var(--ink-dim); text-transform: uppercase; }
+.peek-all input:checked ~ .peek-all-label { color: var(--amber); }
+.ledger-bar-note { font-size: 9.5px; letter-spacing: .04em; color: var(--ink-faint); }
 
 /* add-keyphrase row */
 .ledger-addrow { display: flex; gap: 8px; padding: 12px 16px 0; flex-wrap: wrap; align-items: center; }
@@ -562,6 +611,26 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .toast.bad .toast-bar { background: var(--bad); }
 .toast-msg { padding: 9px 13px; font-size: 11px; color: var(--ink); }
 
+/* Policy-change confirmation toast. A single SINGLETON toast is reused for every
+   policy edit (see policyToast() in the JS): on each change its text is swapped and
+   this gentle flicker is REPLAYED, so a repeat edit is unmistakable even when the
+   toast is already on screen — no pile-up of stacked toasts. polFlick (not toastIn)
+   drives both entrance and replay so re-flashing never re-slides the element. The
+   flicker is deliberately low-amplitude and slow (two soft dips over .72s, ~2.7/s,
+   min opacity .8) to stay well under any photosensitivity threshold; it is disabled
+   entirely under prefers-reduced-motion (a static green ring stands in). */
+.toast.policy { animation: none; }
+.toast.policy .toast-bar { background: var(--good); box-shadow: 0 0 10px -1px var(--good); }
+.toast.policy.flick { animation: polFlick .72s ease-in-out; }
+@keyframes polFlick {
+  0%   { opacity: 1;   box-shadow: 0 16px 40px -16px #000, 0 0 0 0 transparent; }
+  20%  { opacity: .8;  box-shadow: 0 16px 40px -16px #000, 0 0 0 1px var(--good), 0 0 18px -3px var(--good); }
+  40%  { opacity: 1; }
+  60%  { opacity: .86; box-shadow: 0 16px 40px -16px #000, 0 0 0 1px var(--good), 0 0 18px -3px var(--good); }
+  80%  { opacity: 1; }
+  100% { opacity: 1;   box-shadow: 0 16px 40px -16px #000, 0 0 0 0 transparent; }
+}
+
 /* ---------- header: editable cap + backpressure ---------- */
 .queue-wrap { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; }
 .queue-meter { cursor: pointer; }
@@ -718,6 +787,9 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
     animation: none !important;
   }
   .surface.is-new { background: linear-gradient(180deg, rgba(255,180,84,.07), transparent 70%); }
+  /* No flicker — stand in a static green ring so a policy change is still distinct.
+     The aria-live region still re-announces the new text on every change. */
+  .toast.policy { box-shadow: 0 16px 40px -16px #000, 0 0 0 1px var(--good); }
 }
 
 @media (max-width: 1100px) {
@@ -794,7 +866,12 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .pol-hint { font-size: 10px; line-height: 1.5; color: var(--ink-faint); margin-top: 9px; }
 .pol-hint b { color: var(--ink-dim); }
 .pol-hint code { font-family: var(--mono); color: var(--ink-dim); }
-/* live config has drifted from the selected profile (re-APPLY would clobber edits) */
+.pol-hint kbd {
+  font-family: var(--mono); font-size: 9px; color: var(--ink-dim);
+  background: var(--bg-inset); border: 1px solid var(--line);
+  border-radius: 3px; padding: 0 4px; line-height: 1.4;
+}
+/* live config has drifted from the selected profile (switching profile would reset edits) */
 .pol-hint.pol-warn { color: var(--warn); }
 .pol-modified { box-shadow: 0 0 0 1px var(--warn) inset; }
 
@@ -804,6 +881,12 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
   font-family: var(--disp); font-size: 9.5px; letter-spacing: .2em;
   color: var(--ink-faint);
 }
+/* "PERSIST CHANGE TO" row — the profile-apply destination. Its own labelled row so
+   the two PROFILE dropdowns stack vertically instead of cramming side-by-side (the
+   old collision); the scope select sits flush-right. */
+.pol-persist { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; cursor: pointer; }
+.pol-persist .select-wrap { flex: 0 0 auto; }
+.pol-persist select { font-size: 10.5px; }
 
 .pol-range {
   flex: 1; min-width: 0; -webkit-appearance: none; appearance: none;

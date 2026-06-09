@@ -70,6 +70,15 @@
 
 <!-- ============ LEDGER VIEW (default) ============ -->
 <main class="ledger" id="viewLedger">
+  <div class="ledger-bar">
+    <label class="peek-all" title="show every masked value in this browser — local only, never sent anywhere">
+      <input type="checkbox" id="peekAllToggle">
+      <span class="peek-all-track"><span class="peek-all-knob"></span></span>
+      <span class="peek-all-label">PEEK ALL</span>
+    </label>
+    <span class="ledger-bar-note">peek every value locally &middot; plaintext never leaves this machine</span>
+  </div>
+
   <section class="ledger-holds" id="ledgerHoldsWrap" hidden>
     <div class="ledger-sec-head">
       <span class="ledger-sec-title">HOLDS</span>
@@ -181,30 +190,31 @@
             <option value="secrets_only">SECRETS ONLY</option>
           </select>
         </div>
-        <div class="select-wrap">
-          <select id="polScope" title="where to persist the profile">
-            <option value="session">session (live only)</option>
-            <option value="project">project</option>
-            <option value="user">user</option>
-            <option value="local">local</option>
-          </select>
-        </div>
-        <button class="btn primary" id="polApplyProfile">APPLY</button>
       </div>
       <div class="pol-row pol-op-row">
         <span class="pol-op-label">OPERATOR</span>
         <span class="pol-val" id="polOperator">—</span>
       </div>
-      <div class="pol-hint" id="polProfileHint">A profile sets threshold + categories + operator together.</div>
+      <label class="pol-persist">
+        <span class="pol-op-label">PERSIST CHANGE TO</span>
+        <div class="select-wrap">
+          <select id="polScope" title="where a profile change is written (session = live only)">
+            <option value="session">session &middot; live only</option>
+            <option value="project">project</option>
+            <option value="user">user</option>
+            <option value="local">local</option>
+          </select>
+        </div>
+      </label>
+      <div class="pol-hint" id="polProfileHint">Switch profile to apply it instantly — sets threshold + categories + operator together. Pick a scope to also persist it.</div>
     </section>
 
     <section class="pol-sec">
       <div class="pol-sec-head">SCORE THRESHOLD <span class="pol-val" id="polThreshVal">0.50</span></div>
       <div class="pol-row">
         <input type="range" id="polThresh" class="pol-range" min="0" max="1" step="0.01" value="0.5">
-        <button class="btn ghost" id="polApplyThresh">SET</button>
       </div>
-      <div class="pol-hint">Lower = more aggressive (more detections, more false positives). Higher = looser. <b>Session-only</b> — lost on the next reload. Use a profile (with a scope) or the CLI <code>--scope</code> to persist.</div>
+      <div class="pol-hint">Lower = more aggressive (more detections, more false positives). Higher = looser. Release to apply instantly; <kbd>Esc</kbd> while focused reverts. <b>Session-only</b> — use a profile (with a scope) or the CLI <code>--scope</code> to persist.</div>
     </section>
 
     <section class="pol-sec">
@@ -217,10 +227,7 @@
         <label class="pol-check" id="polCheckPersonal"><input type="checkbox" value="personal"><span>Personal <em class="pol-need-ml">needs ML</em></span></label>
       </div>
       <div class="pol-ml-warn" id="polPersonalWarn" hidden></div>
-      <div class="pol-row">
-        <button class="btn ghost" id="polApplyCats">SET CATEGORIES</button>
-      </div>
-      <div class="pol-hint"><b>Session-only</b> — lost on the next reload. Use a profile (with a scope) or the CLI <code>--scope</code> to persist.</div>
+      <div class="pol-hint">Toggling a category applies instantly; <kbd>Esc</kbd> reverts. <b>Session-only</b> — use a profile (with a scope) or the CLI <code>--scope</code> to persist.</div>
     </section>
 
     <section class="pol-sec">

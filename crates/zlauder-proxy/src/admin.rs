@@ -243,7 +243,9 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
         return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
     }
     reconcile_ml(&st, &new_ml, false);
-    json_ok(&snapshot(&st))
+    let snap = snapshot(&st);
+    st.monitor.broadcast_policy(snap.clone());
+    json_ok(&snap)
 }
 
 /// `POST /zlauder/profile/{name}` — apply a detection profile (threshold +
@@ -315,6 +317,10 @@ pub async fn apply_profile(
         }
     };
 
+    // Push the new live policy to open panels (plain config snapshot, before the
+    // action-specific fields below — the panel only reads `config`/`ml`).
+    st.monitor.broadcast_policy(snapshot(&st));
+
     let mut snap = snapshot(&st);
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("profile_applied".into(), json!(name));
@@ -383,7 +389,9 @@ pub async fn ml_enable(State(st): State<AppState>, hdrs: HeaderMap) -> Response 
     }
     // An explicit enable retries a previously-failed load.
     reconcile_ml(&st, &ml, true);
-    json_ok(&snapshot(&st))
+    let snap = snapshot(&st);
+    st.monitor.broadcast_policy(snap.clone());
+    json_ok(&snap)
 }
 
 /// `POST /zlauder/ml/disable` — turn the ML recognizer off live (drops the model
@@ -400,7 +408,9 @@ pub async fn ml_disable(State(st): State<AppState>, hdrs: HeaderMap) -> Response
         return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
     }
     st.engine.ml_disable();
-    json_ok(&snapshot(&st))
+    let snap = snapshot(&st);
+    st.monitor.broadcast_policy(snap.clone());
+    json_ok(&snap)
 }
 
 /// `POST /zlauder/enable` — flip the master switch on.
@@ -466,7 +476,9 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     // `enabled` preserved above, this never flips ML on/off — and `retry_failed =
     // false` means an unrelated edit won't re-stall a previously-failed load.
     reconcile_ml(&st, &new_ml, false);
-    json_ok(&snapshot(&st))
+    let snap = snapshot(&st);
+    st.monitor.broadcast_policy(snap.clone());
+    json_ok(&snap)
 }
 
 // --- small response helpers (mirrors routes.rs style) -----------------------

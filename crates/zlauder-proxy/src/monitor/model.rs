@@ -340,6 +340,12 @@ fn default_approval_timeout_secs() -> u64 {
 pub(crate) enum MonitorEvent {
     Snapshot(Box<MonitorSnapshot>),
     Record(Box<RequestRecord>),
+    /// The live masking policy changed. Payload is the same JSON shape as
+    /// `GET /zlauder/config` (`{ config, ml, … }`). Pushed by every control-plane
+    /// writer (UI PUT, `/zlauder:privacy` CLI, profile, ml toggle, reload) so any
+    /// open policy panel re-syncs the instant the policy moves — the panel is then
+    /// a faithful live mirror, never a stale snapshot from when it was opened.
+    Policy(Box<serde_json::Value>),
 }
 
 // --- request DTOs (HTTP input bodies) ---

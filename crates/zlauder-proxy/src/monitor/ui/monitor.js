@@ -43,6 +43,7 @@ let sessionTokens = [];              // snapshot.session_tokens (durable, sessio
 let ledgerAllow = { exact: [], exact_ci: [] };  // GET /zlauder/config .config.allow_list
 let ledgerCustomRules = [];          // GET /zlauder/monitor/custom-mask
 const peeked = new Set();            // row keys currently peeked (local plaintext, anti shoulder-surf)
+let peekAll = false;                  // PEEK ALL master: force every peekable row open (local only, default off)
 const MAX_SESSION_TOKENS = 5000;     // mirror the server cap so live SSE augmentation stays bounded
 // The four common-word defaults are always re-seeded; only NON-default allow-list
 // entries are operator-configured / reveal-created "passing plaintext".
@@ -359,7 +360,7 @@ function renderReview() {
     +   `<small title="${esc(r.id)}">${esc(r.method)} ${esc(r.endpoint)} &middot; ${esc(r.id)}</small></div>${rollHead}</div>`
     + `<div class="rh-spacer"></div>`
     + `<div class="rh-controls">`
-    +   `<label class="reveal-toggle"><input type="checkbox" id="revealToggle" ${revealValues ? 'checked' : ''}> reveal values</label>`
+    +   `<label class="reveal-toggle" title="show masked values inline in this browser — local only, never sent"><input type="checkbox" id="revealToggle" ${revealValues ? 'checked' : ''}> peek values</label>`
     +   `<div class="rh-tags">${tags.map(t =>
           `<span class="rh-tag">${esc(t)}<button class="tag-x" data-act="untag" data-id="${esc(r.id)}" data-tag="${attr(t)}" aria-label="remove tag ${attr(t)}">&times;</button></span>`).join('')}</div>`
     + `</div>`
@@ -611,24 +612,27 @@ $('tabInspector').addEventListener('click', () => setView('inspector'));
    PEEK (anti shoulder-surf; never sent anywhere), plus a holds strip that keeps
    the approve/reject loop reachable without leaving the ledger.
 
-   Two distinct "reveals" (do not conflate):
-     - PEEK   : show plaintext in THIS browser only. Pure client state (`peeked`).
-     - REVEAL TO MODEL : allow-list the value so it egresses UNMASKED upstream;
-                durable, privacy-reducing → confirm first. Server-side.
-   Auto-detected rows whose class is non-peekable (reserved for the secrets engine)
-   render locked and cannot be revealed — the value is never in the snapshot.
+   Two distinct, deliberately-separated terms (do not conflate):
+     - PEEK   : show plaintext in THIS browser only. Pure client state (`peeked`,
+                or the `peekAll` master switch). Never sent anywhere.
+     - REVEAL (to model) : allow-list the value so it egresses UNMASKED upstream to
+                the LLM/context; durable, privacy-reducing → confirm first. Server-side.
+   "reveal" is reserved strictly for sending plaintext to the model; local UI display
+   is always "peek". Auto-detected rows whose class is non-peekable (reserved for the
+   secrets engine) render locked — the value is never in the snapshot, so never peekable.
    ============================================================ */
 
-/* A value chip: masked by default; click peeks the plaintext locally. A non-peekable
-   (secret-class) row renders a static lock — no value, no peek. */
+/* A value chip: masked by default; click peeks the plaintext locally (or the PEEK ALL
+   master forces it open). A non-peekable (secret-class) row renders a static lock —
+   no value, no peek. */
 function peekChip(rowKey, value, peekable) {
   if (peekable === false) {
     return `<span class="lv-val locked" title="secret — value withheld from the UI">••••••</span>`;
   }
-  const on = peeked.has(rowKey);
+  const on = peekAll || peeked.has(rowKey);
   return `<span class="lv-val peek ${on ? 'on' : ''}" data-peek="${attr(rowKey)}" tabindex="0" role="button"`
-    + ` aria-label="${on ? 'hide value' : 'reveal value locally'}"`
-    + ` title="${on ? 'click to hide' : 'click to reveal locally — not sent anywhere'}">`
+    + ` aria-label="${on ? 'hide value' : 'peek value'}"`
+    + ` title="${peekAll ? 'PEEK ALL is on — values shown locally' : (on ? 'click to hide' : 'peek — show locally, not sent anywhere')}">`
     + `${on ? esc(value) : '••••••'}</span>`;
 }
 
@@ -656,10 +660,11 @@ function renderLedger() {
   $('ledgerRevealedCount').textContent = plainRows.length;
   $('ledgerRevealed').innerHTML = plainRows.length ? plainRows.map(({ v, ci }) => {
     const key = 'al:' + (ci ? 'ci:' : '') + v;
-    return `<div class="lrow plain">`
-      + peekChip(key, v, true)
-      + `<span class="lrow-tag">${ci ? 'ci' : 'exact'}</span>`
-      + `<button class="btn ghost sm" data-lact="remask" data-value="${attr(v)}" title="resume masking this value">RE-MASK</button>`
+    return `<div class="lrow">`
+      + `<span class="lcell lc-val">${peekChip(key, v, true)}</span>`
+      + `<span class="lcell lc-meta"><span class="lrow-tag">${ci ? 'ci' : 'exact'}</span></span>`
+      + `<span class="lcell lspace"></span>`
+      + `<span class="lcell lc-act"><button class="btn ghost sm" data-lact="remask" data-value="${attr(v)}" title="resume masking this value">RE-MASK</button></span>`
       + `</div>`;
   }).join('') : `<div class="empty-note">Nothing passes plaintext. Reveal a value below to send it unmasked.</div>`;
 
@@ -674,11 +679,12 @@ function renderLedger() {
   $('ledgerCustom').innerHTML = ledgerCustomRules.length ? ledgerCustomRules.map(c => {
     const key = 'cm:' + c.pattern;
     return `<div class="lrow">`
-      + peekChip(key, c.pattern, true)
-      + `<span class="lrow-kind">${esc(c.entity_type)}</span>`
-      + `<span class="lrow-tag">${c.case_sensitive ? 'CS' : 'ci'}</span>`
-      + `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(c.pattern)}" data-pattern="${attr(c.pattern)}" data-entity="${attr(c.entity_type)}">REVEAL TO MODEL</button>`
-      + `<button class="btn ghost sm" data-lact="rm-custom" data-pattern="${attr(c.pattern)}" data-entity="${attr(c.entity_type)}">REMOVE</button>`
+      + `<span class="lcell lc-val">${peekChip(key, c.pattern, true)}</span>`
+      + `<span class="lcell lrow-kind">${esc(c.entity_type)}</span>`
+      + `<span class="lcell lc-meta"><span class="lrow-tag">${c.case_sensitive ? 'CS' : 'ci'}</span></span>`
+      + `<span class="lcell lspace"></span>`
+      + `<span class="lcell lc-act"><button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(c.pattern)}" data-pattern="${attr(c.pattern)}" data-entity="${attr(c.entity_type)}">REVEAL TO MODEL</button></span>`
+      + `<span class="lcell lc-act"><button class="btn ghost sm" data-lact="rm-custom" data-pattern="${attr(c.pattern)}" data-entity="${attr(c.entity_type)}">REMOVE</button></span>`
       + `</div>`;
   }).join('') : `<div class="empty-note">No custom keyphrases. Add one above, or select text in a request (inspector).</div>`;
 
@@ -696,11 +702,12 @@ function renderLedger() {
     const key = 'tok:' + t.token;
     const canReveal = t.peekable !== false && !!t.value;
     return `<div class="lrow">`
-      + `<span class="lrow-handle">${esc(t.token)}</span>`
-      + peekChip(key, t.value, t.peekable)
-      + `<span class="lrow-kind">${esc(t.entity_kind)}</span>`
-      + (t.count > 1 ? `<span class="lrow-tag">×${t.count}</span>` : '')
-      + (canReveal ? `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(t.value)}">REVEAL TO MODEL</button>` : '')
+      + `<span class="lcell lrow-handle">${esc(t.token)}</span>`
+      + `<span class="lcell lc-val">${peekChip(key, t.value, t.peekable)}</span>`
+      + `<span class="lcell lrow-kind">${esc(t.entity_kind)}</span>`
+      + `<span class="lcell lc-meta">${t.count > 1 ? `<span class="lrow-tag">×${t.count}</span>` : ''}</span>`
+      + `<span class="lcell lspace"></span>`
+      + `<span class="lcell lc-act">${canReveal ? `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(t.value)}">REVEAL TO MODEL</button>` : ''}</span>`
       + `</div>`;
   }).join('') : `<div class="empty-note">No PII auto-detected yet this session.</div>`;
 }
@@ -782,6 +789,9 @@ function ledgerAdd() {
 $('ledgerAddGo').addEventListener('click', ledgerAdd);
 $('ledgerAddInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); ledgerAdd(); } });
 $('ledgerAddEntity').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); ledgerAdd(); } });
+
+/* PEEK ALL master switch: flip every peekable row open/closed at once (local only). */
+$('peekAllToggle').addEventListener('change', e => { peekAll = e.target.checked; renderLedger(); });
 
 /* ledger-local delegation: peek toggle, hold-select, reveal/remask/remove */
 $('viewLedger').addEventListener('click', e => {
@@ -893,7 +903,7 @@ $('queueMeter').addEventListener('click', e => {
   render();
 });
 
-// reveal-values toggle (delegated; lives inside the review pane)
+// peek-values toggle (local inline display; delegated; lives inside the review pane)
 document.addEventListener('change', e => {
   if (e.target.id === 'revealToggle') {
     revealValues = e.target.checked;
@@ -1037,6 +1047,10 @@ function setLink(on) {
 }
 
 load().then(refreshLedgerSources);
+// Seed the policy panel up front so `committedPolicy` is populated before the drawer is
+// ever opened: the first external (CLI/other-window) policy change then both re-syncs the
+// controls AND raises its confirming toast, instead of being silently absorbed as a seed.
+loadPolicy();
 
 const es = new EventSource(`/zlauder/monitor/events?key=${encodeURIComponent(key)}`);
 es.onopen = () => setLink(true);
@@ -1083,6 +1097,10 @@ es.onmessage = e => {
     autoSelect();
     render(isNew ? rec.id : null);
     if (isNew && rec.decision === 'pending') toast(`HOLD &mdash; turn ${rec.turn_index} awaiting review`, 'bad');
+  } else if (ev.event === 'policy') {
+    // The live masking policy moved (this panel, the /zlauder:privacy CLI, or another
+    // window). Re-sync the controls so the panel never drifts from the real policy.
+    onPolicyEvent(ev.data);
   }
 };
 
@@ -1163,17 +1181,80 @@ function closePolicy() { $('policyScrim').hidden = true;  $('policyDrawer').hidd
 $('policyOpen').addEventListener('click', openPolicy);
 $('policyClose').addEventListener('click', closePolicy);
 $('policyScrim').addEventListener('click', closePolicy);
+
+/* The drawer has NO Set/Apply buttons: changing any control applies IMMEDIATELY, and
+   the panel always mirrors the LIVE policy (a server `policy` SSE frame re-syncs it the
+   instant /zlauder:privacy or another window moves the policy — see onPolicyEvent).
+   `committedPolicy` is the last server-confirmed snapshot: the source of truth a focused
+   field reverts to on Esc, and the baseline that separates our own writes from external
+   ones (so an external change toasts but our own echo does not double-toast). */
+let committedPolicy = null;
+let selfWriteUntil = 0;            // performance.now() ceiling: suppress the external-change toast just after our own write
+function markSelfWrite() { selfWriteUntil = performance.now() + 1500; }
+
+/* Esc inside the drawer is a TWO-STAGE key: if a policy control is focused it reverts
+   that field to the live policy and unfocuses it (the in-progress edit is abandoned,
+   never applied); only a second Esc (nothing focused) closes the drawer. This runs
+   before the document-level closer below and stops it whenever it handled a field. */
+$('policyDrawer').addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  const el = document.activeElement;
+  if (el && $('policyDrawer').contains(el) && el.matches('select, input')) {
+    e.preventDefault();
+    e.stopPropagation();
+    revertControl(el);
+    el.blur();
+  }
+});
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !$('policyDrawer').hidden) closePolicy();
 });
 
-/* ---- render the live config into the controls ---- */
+/* Capture each editable control's value as its Esc-revert baseline the moment it gains
+   focus (covers a select/slider being navigated before commit). applyPolicyConfig keeps
+   these baselines current after every confirmed change, so Esc always lands on the LIVE
+   value, never a stale one. */
+$('policyDrawer').addEventListener('focusin', e => {
+  if (e.target.matches('#polProfile, #polScope, #polThresh')) e.target._baseline = e.target.value;
+});
+
+/* Revert one focused control to the committed (live) policy — the Esc action. */
+function revertControl(el) {
+  const cfg = (committedPolicy && committedPolicy.config) || {};
+  if (el === $('polThresh')) {
+    const v = (el._baseline != null) ? el._baseline
+            : (typeof cfg.score_threshold === 'number' ? cfg.score_threshold : el.value);
+    el.value = v;
+    $('polThreshVal').textContent = Number(v).toFixed(2);
+    refreshDivergence();
+  } else if (el === $('polProfile')) {
+    el.value = cfg.profile || el._baseline || el.value;
+    refreshDivergence();
+  } else if (el === $('polScope')) {
+    if (el._baseline != null) { el.value = el._baseline; refreshDivergence(); }
+  } else if (el === $('polMlToggle')) {
+    el.checked = !!(committedPolicy && committedPolicy.ml && committedPolicy.ml.enabled);
+  } else if ($('polCats').contains(el)) {
+    renderCategories(committedPolicy, true);
+    refreshPersonalTier();
+  }
+}
+
+/* ---- render the live config into the controls. Idempotent and the SINGLE place the
+   panel's displayed state is set, so "what is shown == the live policy" always holds.
+   Never overwrites the control the user is actively editing (activeElement); it only
+   refreshes that control's Esc baseline, so an external change can't yank a field
+   mid-edit yet Esc still reverts to the newest live value. ---- */
 function applyPolicyConfig(snap) {
-  const cfg = (snap && snap.config) || {};
-  const ml = (snap && snap.ml) || {};
+  if (!snap) return;
+  committedPolicy = snap;
+  const cfg = snap.config || {};
+  const ml = snap.ml || {};
+  const active = document.activeElement;
 
   // profile
-  if (cfg.profile) $('polProfile').value = cfg.profile;
+  if (cfg.profile && $('polProfile') !== active) $('polProfile').value = cfg.profile;
+  $('polProfile')._baseline = $('polProfile').value;
 
   // operator (read-only display; profiles differ on this axis — e.g. Strict now
   // tokenizes (reversible) rather than redacting, so the user must be able to SEE it)
@@ -1183,33 +1264,22 @@ function applyPolicyConfig(snap) {
                               : op;
 
   // threshold
-  if (typeof cfg.score_threshold === 'number') {
+  if (typeof cfg.score_threshold === 'number' && $('polThresh') !== active) {
     $('polThresh').value = cfg.score_threshold;
     $('polThreshVal').textContent = cfg.score_threshold.toFixed(2);
   }
+  $('polThresh')._baseline = $('polThresh').value;
 
   // categories
-  const on = new Set(cfg.enabled_categories || []);
-  $('polCats').querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = on.has(cb.value); });
+  renderCategories(snap, false);
 
-  // Has the live config drifted from the selected profile? If so the dropdown alone
-  // is misleading — mark it (modified) and warn that re-APPLY overwrites hand edits.
-  const sel = $('polProfile').value;
-  const hint = $('polProfileHint');
-  if (profileDiverged(sel, cfg)) {
-    $('polProfile').classList.add('pol-modified');
-    hint.textContent = `live config differs from "${sel}" — APPLY will overwrite your threshold/category edits.`;
-    hint.classList.add('pol-warn');
-  } else {
-    $('polProfile').classList.remove('pol-modified');
-    hint.textContent = 'A profile sets threshold + categories + operator together.';
-    hint.classList.remove('pol-warn');
-  }
+  // (modified) badge + scope-aware hint, recomputed from the displayed controls
+  refreshDivergence();
 
   // ML
   const status = ml.status || (ml.enabled ? 'loading' : 'disabled');
   mlStatus = status;
-  $('polMlToggle').checked = !!ml.enabled;
+  if ($('polMlToggle') !== active) $('polMlToggle').checked = !!ml.enabled;
   $('polMlLabel').textContent = ml.enabled ? 'enabled' : 'disabled';
   const sEl = $('polMlStatus');
   sEl.textContent = status;
@@ -1217,6 +1287,16 @@ function applyPolicyConfig(snap) {
   $('polMlModel').textContent = ml.model ? `model: ${ml.model}${ml.error ? ' — ' + ml.error : ''}` : '';
 
   refreshPersonalTier();
+}
+
+/* Tick the category checkboxes from a snapshot. Skips a checkbox being actively toggled
+   (so a live re-sync can't fight the user's click) unless `force` — the Esc-revert wants
+   the whole set restored regardless of focus. */
+function renderCategories(snap, force) {
+  const on = new Set(((snap && snap.config && snap.config.enabled_categories) || []));
+  $('polCats').querySelectorAll('input[type=checkbox]').forEach(cb => {
+    if (force || cb !== document.activeElement) cb.checked = on.has(cb.value);
+  });
 }
 
 /* Personal (PERSON/LOCATION/ORGANIZATION) is ML-only — no regex can find arbitrary
@@ -1251,10 +1331,19 @@ function loadPolicy() {
   loadCustomMasks();
 }
 
-/* Re-evaluate the divergence indicator against the CURRENTLY-displayed controls
-   (profile dropdown + threshold + checked categories), without a server round-trip.
-   Lets the (modified) badge react as the user changes the dropdown or edits controls
-   before pressing SET/APPLY. */
+/* The default PROFILE hint — also reflects the chosen persist scope. */
+function baseProfileHint() {
+  const scope = $('polScope').value;
+  return scope === 'session'
+    ? 'Switch profile to apply instantly (threshold + categories + operator). Pick a scope to also persist.'
+    : `Switch profile to apply instantly and persist to <b>${esc(scope)}</b>.`;
+}
+
+/* Re-evaluate the (modified) badge against the CURRENTLY-displayed controls (profile
+   dropdown + threshold + checked categories), no server round-trip — and keep the hint
+   in sync with the chosen scope. Marks the dropdown (modified) when the live policy has
+   been hand-tuned away from the selected profile's preset, so switching profile (which
+   resets to the preset) is never a silent surprise. */
 function refreshDivergence() {
   const cfg = {
     score_threshold: Number($('polThresh').value),
@@ -1265,62 +1354,144 @@ function refreshDivergence() {
   const hint = $('polProfileHint');
   if (profileDiverged(sel, cfg)) {
     $('polProfile').classList.add('pol-modified');
-    hint.textContent = `live config differs from "${sel}" — APPLY will overwrite your threshold/category edits.`;
+    hint.innerHTML = `live policy differs from "<b>${esc(sel)}</b>" — switching profile resets your threshold/category edits.`;
     hint.classList.add('pol-warn');
   } else {
     $('polProfile').classList.remove('pol-modified');
-    hint.textContent = 'A profile sets threshold + categories + operator together.';
+    hint.innerHTML = baseProfileHint();
     hint.classList.remove('pol-warn');
   }
 }
-$('polProfile').addEventListener('change', refreshDivergence);
-$('polCats').addEventListener('change', () => { refreshDivergence(); refreshPersonalTier(); });
 
-/* ---- profile ---- */
-$('polApplyProfile').addEventListener('click', () => {
+/* ---- live policy sync. A server `policy` SSE frame (from ANY control-plane writer —
+   this panel, the /zlauder:privacy CLI, or another browser window) re-renders the
+   controls so the panel is ALWAYS an accurate mirror of the live policy. A change we did
+   NOT initiate raises its own confirming toast; our own writes are toasted by their
+   handler (the selfWriteUntil window suppresses the echo), and an identical frame is
+   silent so nothing flashes for a no-op. ---- */
+function onPolicyEvent(snap) {
+  const seeded = !!committedPolicy;
+  const changed = seeded && !samePolicy(committedPolicy, snap);
+  applyPolicyConfig(snap);
+  if (changed && performance.now() >= selfWriteUntil) {
+    policyToast('policy changed — following turns use the new policy', 'good');
+    if (!$('policyDrawer').hidden) loadCustomMasks();
+  }
+}
+function samePolicy(a, b) {
+  const ca = (a && a.config) || {}, cb = (b && b.config) || {};
+  const ma = (a && a.ml) || {}, mb = (b && b.ml) || {};
+  if ((ca.profile || '') !== (cb.profile || '')) return false;
+  if (Number(ca.score_threshold) !== Number(cb.score_threshold)) return false;
+  if (!sameSet(ca.enabled_categories || [], cb.enabled_categories || [])) return false;
+  const oa = (ca.default_operator && ca.default_operator.kind) || 'token';
+  const ob = (cb.default_operator && cb.default_operator.kind) || 'token';
+  if (oa !== ob) return false;
+  if (!!ma.enabled !== !!mb.enabled) return false;
+  if ((ma.status || '') !== (mb.status || '')) return false;
+  if ((ma.model || '') !== (mb.model || '')) return false;
+  return true;
+}
+
+/* ---- singleton policy-change toast with the gentle re-flicker (CSS .flick). One
+   reused element means rapid edits never stack a pile of toasts; each change swaps the
+   text and REPLAYS the flicker, so it's unmistakable the change landed even if the toast
+   was already on screen. #toasts is aria-live=polite, so the new text is announced every
+   time. ---- */
+let policyToastEl = null;
+function policyToast(msg, kind) {
+  if (policyToastEl && policyToastEl.isConnected) {
+    policyToastEl.className = 'toast policy ' + (kind || 'good');
+    policyToastEl.querySelector('.toast-msg').innerHTML = msg;
+    policyToastEl.classList.remove('flick');
+    void policyToastEl.offsetWidth;            // force reflow so the animation restarts
+    policyToastEl.classList.add('flick');
+    clearTimeout(policyToastEl._dismiss);
+    policyToastEl._dismiss = setTimeout(dismissPolicyToast, 3600);
+    return;
+  }
+  const tpl = $('tpl-toast').content.cloneNode(true);
+  const el = tpl.querySelector('.toast');
+  el.className = 'toast policy flick ' + (kind || 'good');
+  el.querySelector('.toast-msg').innerHTML = msg;
+  $('toasts').appendChild(el);
+  policyToastEl = el;
+  el._dismiss = setTimeout(dismissPolicyToast, 3600);
+}
+function dismissPolicyToast() {
+  const el = policyToastEl;
+  if (!el) return;
+  el.classList.add('out');
+  setTimeout(() => { el.remove(); if (policyToastEl === el) policyToastEl = null; }, 320);
+}
+
+/* ---- profile: changing the dropdown applies the preset LIVE at the chosen scope
+   (threshold + categories + operator together). No Apply button. ---- */
+$('polProfile').addEventListener('change', () => {
   const name = $('polProfile').value;
   const scope = $('polScope').value;
+  markSelfWrite();
   api(`/zlauder/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
     .then(r => r.ok ? r.json() : Promise.reject(new Error('profile rejected')))
     .then(snap => {
       applyPolicyConfig(snap);
-      const where = snap.session_only ? 'session-only (not persisted)'
-                  : (snap.persisted ? `persisted → ${snap.persisted}` : 'applied');
-      if (snap.persist_error) toast(`profile ${esc(name)} applied LIVE but persist failed: ${esc(snap.persist_error)}`, 'bad');
-      else toast(`profile <b>${esc(name)}</b> — ${esc(where)}`, 'good');
+      const where = snap.session_only ? 'session-only'
+                  : (snap.persisted ? `persisted → ${esc(snap.persisted)}` : 'applied');
+      if (snap.persist_error) policyToast(`profile <b>${esc(name)}</b> applied LIVE — following turns use it · persist failed: ${esc(snap.persist_error)}`, 'bad');
+      else policyToast(`profile <b>${esc(name)}</b> — following turns use it · ${where}`, 'good');
     })
-    .catch(() => toast('profile change failed', 'bad'));
+    .catch(() => { revertPanelToCommitted(); toast('profile change failed', 'bad'); });
 });
 
-/* ---- threshold ---- */
+/* scope is a DESTINATION, not a policy value: changing it applies nothing now — it sets
+   where the NEXT profile change is written. Just refresh the scope-aware hint. */
+$('polScope').addEventListener('change', refreshDivergence);
+
+/* ---- threshold: drag previews (input), release applies (change) ---- */
 $('polThresh').addEventListener('input', e => { $('polThreshVal').textContent = Number(e.target.value).toFixed(2); refreshDivergence(); });
-$('polApplyThresh').addEventListener('click', () => {
+$('polThresh').addEventListener('change', () => {
   const v = Number($('polThresh').value);
-  putConfigMerge({ score_threshold: v }, `threshold ${v.toFixed(2)}`);
+  markSelfWrite();
+  putConfigMerge({ score_threshold: v }, `threshold <b>${v.toFixed(2)}</b> — following turns mask at this cutoff`);
 });
 
-/* ---- categories ---- */
-$('polApplyCats').addEventListener('click', () => {
+/* ---- categories: each toggle applies the new set immediately ---- */
+$('polCats').addEventListener('change', () => {
+  refreshDivergence();
+  refreshPersonalTier();
   const sel = [...$('polCats').querySelectorAll('input:checked')].map(cb => cb.value);
-  putConfigMerge({ enabled_categories: sel }, `categories: ${sel.join(', ') || 'none'}`);
+  markSelfWrite();
+  putConfigMerge({ enabled_categories: sel }, `categories <b>${esc(sel.join(', ') || 'none')}</b> — following turns use them`);
 });
 
-/* shared merge-PUT helper */
+/* A rejected write must leave NO trace of the rejected value: blur the focused control
+   first (applyPolicyConfig deliberately won't overwrite the active element) so the
+   rollback to the committed policy is total — displayed always equals the live policy. */
+function revertPanelToCommitted() {
+  const a = document.activeElement;
+  if (a && $('policyDrawer').contains(a)) a.blur();
+  applyPolicyConfig(committedPolicy);
+}
+
+/* shared merge-PUT helper. On success the server's authoritative snapshot re-renders the
+   controls; on failure roll the controls back to the committed policy and surface why. */
 function putConfigMerge(body, label) {
   api('/zlauder/config', { method: 'PUT', body: JSON.stringify(body) })
     .then(r => r.ok ? r.json() : r.text().then(t => Promise.reject(new Error(t))))
-    .then(snap => { applyPolicyConfig(snap); toast(`set ${esc(label)}`, 'good'); })
-    .catch(err => toast(`set failed: ${esc(err.message || 'rejected')}`, 'bad'));
+    .then(snap => { applyPolicyConfig(snap); policyToast(label, 'good'); })
+    .catch(err => { revertPanelToCommitted(); toast(`set failed: ${esc(err.message || 'rejected')}`, 'bad'); });
 }
 
-/* ---- ML toggle ---- */
+/* ---- ML toggle (already immediate) ---- */
 $('polMlToggle').addEventListener('change', e => {
   const on = e.target.checked;
+  markSelfWrite();
   api(`/zlauder/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
     .then(r => r.ok ? r.json() : Promise.reject(new Error('ml toggle failed')))
     .then(snap => {
       applyPolicyConfig(snap);
-      toast(on ? 'ML enabling — loading model in background' : 'ML disabled', on ? 'good' : 'bad');
+      policyToast(on ? 'ML enabling — following turns mask names/locations once the model is <b>ready</b>'
+                     : 'ML disabled — following turns are regex-only', on ? 'good' : 'bad');
     })
     .catch(() => { e.target.checked = !on; toast('ML toggle failed', 'bad'); });
 });
