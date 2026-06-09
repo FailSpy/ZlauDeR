@@ -44,3 +44,6 @@ uuid       = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# Test-only: lets walker tests inject a mock `Recognizer` via `MaskEngine::ml_set_ready`
+# to exercise the ML-active prewarm path without loading the real model.
+presidio-core = { workspace = true }

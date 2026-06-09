@@ -152,11 +152,16 @@ pub fn mask_request(
 ) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
     let mut req: ChatCompletionsRequest = serde_json::from_slice(body).map_err(MaskError::Json)?;
     let mut manifest = UnmaskManifest::new();
+    // Phase 1 (ML-active only): collect every leaf and batch-prewarm the detection
+    // cache so the mask pass below pays ONE batched inference, not N per-leaf ones.
+    // No-op (and zero extra cost) when ML is off — byte-identical to before.
+    prewarm_request(engine, &mut req);
     let stats = {
         let mut w = MaskWalker {
             engine,
             manifest: &mut manifest,
             stats: MaskStats::default(),
+            collect: None,
         };
         w.request(&mut req).map_err(MaskError::Engine)?;
         w.stats
@@ -164,6 +169,36 @@ pub fn mask_request(
     log_mask_stats(&stats);
     let bytes = serde_json::to_vec(&req).map_err(MaskError::Json)?;
     Ok((bytes, manifest))
+}
+
+/// Phase-1 prewarm for the chat-completions walker — see the Anthropic walker's
+/// `prewarm_request` for the full rationale. Collects every leaf in COLLECT mode and
+/// hands them to one [`MaskEngine::prewarm_batch`]; skipped entirely when ML is not
+/// `Ready`.
+///
+/// NOTE: `MaskWalker::request` folds `extra_thinking` into `extra` before walking.
+/// That fold is idempotent (`or_insert` + the source is `take`n), so running it once
+/// here in COLLECT mode and again in the mask pass yields the same `extra` the
+/// single-pass path produced — and the prewarm covers those folded leaves.
+fn prewarm_request(engine: &MaskEngine, req: &mut ChatCompletionsRequest) {
+    if !engine.ml_active() {
+        return;
+    }
+    let mut throwaway = UnmaskManifest::new();
+    let mut collector = MaskWalker {
+        engine,
+        manifest: &mut throwaway,
+        stats: MaskStats::default(),
+        collect: Some(Vec::new()),
+    };
+    if collector.request(req).is_err() {
+        return;
+    }
+    let Some(leaves) = collector.collect.take() else {
+        return;
+    };
+    let refs: Vec<(&str, Surface)> = leaves.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+    engine.prewarm_batch(&refs);
 }
 
 fn log_mask_stats(s: &MaskStats) {
@@ -193,6 +228,10 @@ struct MaskWalker<'a> {
     engine: &'a MaskEngine,
     manifest: &'a mut UnmaskManifest,
     stats: MaskStats,
+    /// When `Some`, the walker is in COLLECT mode: every leaf is cloned here (with its
+    /// surface) and nothing is masked, so the prewarm pass can gather all leaves over
+    /// the SAME traversal the mask pass uses. See `prewarm_request`.
+    collect: Option<Vec<(String, Surface)>>,
 }
 
 impl MaskWalker<'_> {
@@ -260,7 +299,14 @@ impl MaskWalker<'_> {
         Ok(())
     }
 
+    /// Single leaf sink: COLLECT mode clones the leaf for the prewarm batch (no
+    /// mutation); MASK mode masks in place. `value_safe` routes through here too, so
+    /// collect and mask cover the identical leaf set.
     fn str(&mut self, text: &mut String, surface: Surface) -> Result<(), EngineError> {
+        if let Some(leaves) = self.collect.as_mut() {
+            leaves.push((text.clone(), surface));
+            return Ok(());
+        }
         let outcome = self.engine.mask(text, surface)?;
         *text = outcome.masked_text;
         self.manifest.merge(outcome.manifest);
@@ -762,5 +808,34 @@ mod tests {
         let out = x.process(usage, &e, &masked.manifest);
         assert!(out.choices.is_empty());
         assert_eq!(out.usage.unwrap().total_tokens, 3);
+    }
+
+    // With a model `Ready`, `mask_request` runs the COLLECT → prewarm → MASK two-phase
+    // path. Confirms every marker — across user/assistant/tool messages, a duplicate,
+    // AND a top-level provider field (which `request` folds from `extra_thinking` into
+    // `extra` on BOTH passes — the fold is idempotent) — is masked, and structure is
+    // preserved.
+    #[test]
+    fn ml_active_prewarm_masks_messages_and_extra() {
+        let e = crate::test_support::engine_with_mock_ml("ZZMARK");
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "x_provider_note": "note ZZMARK here", // unknown top-level ⇒ extra/extra_thinking
+            "messages": [
+                {"role": "system", "content": "sys ZZMARK"},
+                {"role": "user", "content": "hi ZZMARK there"},
+                {"role": "user", "content": "hi ZZMARK there"}, // duplicate
+                {"role": "assistant", "content": "ok ZZMARK done"},
+                {"role": "tool", "tool_call_id": "c1", "content": "tool ZZMARK out"}
+            ]
+        });
+        let (masked, _manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let s = String::from_utf8(masked.clone()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+
+        assert_eq!(v["model"], serde_json::json!("gpt-4o"));
+        assert!(s.contains("[EMAIL_ADDRESS_"), "markers masked: {s}");
+        // No raw marker leaks anywhere (messages OR the folded top-level field).
+        assert_eq!(s.matches("ZZMARK").count(), 0, "no marker should leak: {s}");
     }
 }

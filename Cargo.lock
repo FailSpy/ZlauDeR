@@ -3911,6 +3911,7 @@ dependencies = [
  "futures",
  "http",
  "openai-wire",
+ "presidio-core",
  "reqwest",
  "serde",
  "serde_json",

@@ -35,11 +35,18 @@ pub fn mask_request(
     let mut manifest = UnmaskManifest::new();
     match serde_json::from_slice::<ApiRequest>(body) {
         Ok(mut req) => {
+            // Phase 1 (ML-active only): collect every leaf in one read-only-equivalent
+            // pass and batch-prewarm the detection cache, so the mask pass below pays
+            // ONE batched inference instead of N serialized per-leaf ones. Gated on a
+            // live model: with ML off there is nothing expensive to batch, so we skip
+            // straight to the mask pass — byte-identical to before this change.
+            prewarm_request(engine, &mut req);
             let stats = {
                 let mut w = MaskWalker {
                     engine,
                     manifest: &mut manifest,
                     stats: MaskStats::default(),
+                    collect: None,
                 };
                 w.request(&mut req).map_err(MaskError::Engine)?;
                 w.stats
@@ -56,6 +63,7 @@ pub fn mask_request(
                     engine,
                     manifest: &mut manifest,
                     stats: MaskStats::default(),
+                    collect: None,
                 };
                 w.value_safe(&mut value, Surface::UserMessage)
                     .map_err(MaskError::Engine)?;
@@ -66,6 +74,41 @@ pub fn mask_request(
             Ok((bytes, manifest))
         }
     }
+}
+
+/// Phase-1 prewarm: when a model is live, walk `req` in COLLECT mode to gather every
+/// text leaf (cloned, with its surface) and hand them to one
+/// [`MaskEngine::prewarm_batch`], which runs the cache-missing leaves through a
+/// single batched ML forward and populates the detection cache. The subsequent mask
+/// walk then hits cache on every prewarmed leaf and pays no per-leaf inference.
+///
+/// Best-effort and side-effect-free w.r.t. the masked output: COLLECT mode never
+/// masks, and `prewarm_batch` is purely additive (see its docs), so this only ever
+/// makes the mask pass faster — never different. Skipped entirely when ML is not
+/// `Ready`, so the no-ML path keeps its exact prior behavior (no extra traversal,
+/// no clones).
+fn prewarm_request(engine: &MaskEngine, req: &mut ApiRequest) {
+    if !engine.ml_active() {
+        return;
+    }
+    let mut throwaway = UnmaskManifest::new();
+    let mut collector = MaskWalker {
+        engine,
+        manifest: &mut throwaway,
+        stats: MaskStats::default(),
+        collect: Some(Vec::new()),
+    };
+    // COLLECT mode masks nothing and never calls the engine, so `request` cannot
+    // error here; if it somehow did, just skip the prewarm (the mask pass is correct
+    // on its own).
+    if collector.request(req).is_err() {
+        return;
+    }
+    let Some(leaves) = collector.collect.take() else {
+        return;
+    };
+    let refs: Vec<(&str, Surface)> = leaves.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+    engine.prewarm_batch(&refs);
 }
 
 /// Emit the per-request detection-cache instrumentation once (Component 2). On a
@@ -100,6 +143,13 @@ struct MaskWalker<'a> {
     manifest: &'a mut UnmaskManifest,
     /// Accumulated detection-cache stats across every leaf this walk masks.
     stats: MaskStats,
+    /// When `Some`, the walker is in COLLECT mode: every leaf is cloned into this
+    /// vec (with its surface) and NOTHING is mutated/masked, so a second, masking
+    /// pass over the same request sees the original text. Used to gather all leaves
+    /// for one batched [`MaskEngine::prewarm_batch`] before the real mask walk. The
+    /// SAME traversal serves both phases, so collect can never visit a different
+    /// leaf set than mask (zero divergence).
+    collect: Option<Vec<(String, Surface)>>,
 }
 
 impl MaskWalker<'_> {
@@ -201,7 +251,16 @@ impl MaskWalker<'_> {
         Ok(())
     }
 
+    /// The single leaf sink for this walker. In COLLECT mode it clones the leaf for
+    /// the prewarm batch and leaves the text untouched; in MASK mode it masks in
+    /// place. Every text-bearing field routes through here (the `value*` walkers
+    /// included), so the collect and mask passes are guaranteed to cover the exact
+    /// same leaf set.
     fn str(&mut self, text: &mut String, surface: Surface) -> Result<(), EngineError> {
+        if let Some(leaves) = self.collect.as_mut() {
+            leaves.push((text.clone(), surface));
+            return Ok(());
+        }
         let outcome = self.engine.mask(text, surface)?;
         *text = outcome.masked_text;
         self.manifest.merge(outcome.manifest);
@@ -211,12 +270,7 @@ impl MaskWalker<'_> {
 
     fn value(&mut self, v: &mut Value, surface: Surface) -> Result<(), EngineError> {
         match v {
-            Value::String(s) => {
-                let outcome = self.engine.mask(s, surface)?;
-                *s = outcome.masked_text;
-                self.manifest.merge(outcome.manifest);
-                self.stats.merge(&outcome.stats);
-            }
+            Value::String(s) => self.str(s, surface)?,
             Value::Array(a) => {
                 for item in a.iter_mut() {
                     self.value(item, surface)?;
@@ -242,12 +296,7 @@ impl MaskWalker<'_> {
         surface: Surface,
     ) -> Result<(), EngineError> {
         match v {
-            Value::String(s) => {
-                let outcome = self.engine.mask(s, surface)?;
-                *s = outcome.masked_text;
-                self.manifest.merge(outcome.manifest);
-                self.stats.merge(&outcome.stats);
-            }
+            Value::String(s) => self.str(s, surface)?,
             Value::Array(a) => {
                 for item in a.iter_mut() {
                     self.value_skipping_protocol_keys(item, surface)?;
@@ -271,12 +320,7 @@ impl MaskWalker<'_> {
     /// unknown-shaped request without corrupting embedded images/documents.
     fn value_safe(&mut self, v: &mut Value, surface: Surface) -> Result<(), EngineError> {
         match v {
-            Value::String(s) => {
-                let outcome = self.engine.mask(s, surface)?;
-                *s = outcome.masked_text;
-                self.manifest.merge(outcome.manifest);
-                self.stats.merge(&outcome.stats);
-            }
+            Value::String(s) => self.str(s, surface)?,
             Value::Array(a) => {
                 for item in a.iter_mut() {
                     self.value_safe(item, surface)?;
@@ -768,5 +812,116 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("bob@example.com"), "not unmasked: {s}");
         assert!(!s.contains(&token));
+    }
+
+    // With a model `Ready`, `mask_request` runs the COLLECT → prewarm → MASK two-phase
+    // path. Every marker across every leaf kind — system, user, assistant, tool_result,
+    // tool_use input, tool `description`, request `metadata`, and a duplicate — must
+    // still be masked exactly as the per-leaf path would; a `>>bypass<<` must pass
+    // through; structure (incl. tool `input_schema`) is preserved; and the result
+    // round-trips. This is the walker-level guard that the prewarm collect pass neither
+    // corrupts the request nor changes the masked output, across the full leaf surface.
+    #[test]
+    fn ml_active_prewarm_masks_every_leaf_and_round_trips() {
+        let e = crate::test_support::engine_with_mock_ml("ZZMARK");
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "system": [{"type": "text", "text": "sys ZZMARK here"}],
+            "tools": [{
+                "name": "send",
+                "description": "tool desc ZZMARK here",
+                // input_schema is structural and must NOT be masked even with a marker.
+                "input_schema": {"type": "object", "properties": {"q": {"const": "ZZMARK"}}}
+            }],
+            "metadata": {"note": "meta ZZMARK value"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello ZZMARK world"}]},
+                // Byte-identical duplicate ⇒ prewarm dedupe path; both must mask.
+                {"role": "user", "content": [{"type": "text", "text": "hello ZZMARK world"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "reply ZZMARK ok"}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "result ZZMARK end"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "u1", "name": "do", "input": {"q": "input ZZMARK val"}}
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "keep >>ZZMARK<< verbatim"}]}
+            ]
+        });
+        let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let s = String::from_utf8(masked.clone()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+
+        // Structure preserved (model is never walked).
+        assert_eq!(v["model"], serde_json::json!("claude-opus-4-8"));
+        // tool input_schema is left verbatim, so its structural "ZZMARK" const survives.
+        assert_eq!(
+            v["tools"][0]["input_schema"]["properties"]["q"]["const"],
+            serde_json::json!("ZZMARK")
+        );
+        // Markers were masked to email tokens.
+        assert!(s.contains("[EMAIL_ADDRESS_"), "markers should be masked: {s}");
+        // tool description + metadata markers were masked (not left as plaintext).
+        assert!(
+            !v["tools"][0]["description"].as_str().unwrap().contains("ZZMARK"),
+            "tool description marker should be masked: {}",
+            v["tools"][0]["description"]
+        );
+        assert!(
+            !v["metadata"]["note"].as_str().unwrap().contains("ZZMARK"),
+            "metadata marker should be masked: {}",
+            v["metadata"]["note"]
+        );
+        // Exactly TWO raw markers survive: the `>>bypass<<` span and the structural
+        // tool input_schema const (both correct passthroughs). Everything else masked.
+        assert_eq!(
+            s.matches("ZZMARK").count(),
+            2,
+            "only the bypass marker and the input_schema const should survive: {s}"
+        );
+        assert!(!s.contains(">>") && !s.contains("<<"), "bypass wrappers stripped: {s}");
+
+        // The masked user text round-trips back to the original.
+        let masked_user = v["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            e.unmask(masked_user, &manifest).unwrap(),
+            "hello ZZMARK world"
+        );
+    }
+
+    // The prewarm phase must NOT change the masked output relative to the per-leaf
+    // path. We can't toggle prewarm off inside the walker, but we CAN assert the
+    // ML-active walker output equals masking each leaf through `engine.mask` directly
+    // (the proven per-leaf reference) on a fresh engine with the same mock + session.
+    #[test]
+    fn ml_active_prewarm_output_equals_per_leaf_reference() {
+        let walked = {
+            let e = crate::test_support::engine_with_mock_ml("ZZMARK");
+            let body = serde_json::json!({
+                "model": "m", "max_tokens": 10,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "a ZZMARK b"}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": "c ZZMARK d"}
+                    ]}
+                ]
+            });
+            let (masked, _m) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+            let v: Value = serde_json::from_slice(&masked).unwrap();
+            (
+                v["messages"][0]["content"][0]["text"].as_str().unwrap().to_string(),
+                v["messages"][1]["content"][0]["content"].as_str().unwrap().to_string(),
+            )
+        };
+        // Per-leaf reference: same mock, same fixed session bytes ⇒ identical tokens.
+        let reference = {
+            let e = crate::test_support::engine_with_mock_ml("ZZMARK");
+            (
+                e.mask("a ZZMARK b", Surface::UserMessage).unwrap().masked_text,
+                e.mask("c ZZMARK d", Surface::ToolResult).unwrap().masked_text,
+            )
+        };
+        assert_eq!(walked, reference, "prewarm path diverged from per-leaf masking");
     }
 }

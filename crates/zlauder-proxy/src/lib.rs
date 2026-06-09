@@ -15,3 +15,6 @@ pub mod walk;
 
 pub use routes::router;
 pub use state::AppState;
+
+#[cfg(test)]
+mod test_support;
