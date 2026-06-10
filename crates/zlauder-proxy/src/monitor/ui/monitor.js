@@ -209,18 +209,39 @@ function renderRuns(runs) {
   }).join('');
 }
 
-function renderSurface(s, addedSet) {
-  const isNew = addedSet && addedSet.has(s.block_hash);
+/* `direction` defaults to 'outbound' (a request surface, masked text headed to the
+   provider). 'inbound' marks a RESPONSE surface: text the provider sent us, with its
+   tokens already re-hydrated LOCALLY for review — it is NOT egressing, so it never wears
+   the red NEW/egress framing. The direction is a property of WHICH panel renders the
+   surface (response vs request), not of provenance: the same assistant text is inbound in
+   the RESPONSE panel and outbound (re-masked) when the harness re-sends it as request
+   transcript next turn. */
+function renderSurface(s, addedSet, direction) {
+  const inbound = direction === 'inbound';
+  // Egress framing (NEW / amber) is for outbound surfaces only; a received reply is never
+  // "new plaintext leaving the machine".
+  const isNew = !inbound && addedSet && addedSet.has(s.block_hash);
+  const hasTokenRun = (s.runs || []).some(run => run.token);
   const kindClass = 'kind-' + s.kind;
   const role = s.role ? ` &middot; ${esc(s.role)}` : '';
-  return `<div class="surface ${isNew ? 'is-new' : ''}">`
+  const dirTag = inbound
+    ? `<span class="dir-tag dir-in" title="received from the provider and re-hydrated locally for your review — this content is NOT egressing">RECEIVED &larr; MODEL</span>`
+    : '';
+  // The "re-hydrated locally" note only makes sense when something was actually un-masked
+  // here; plain prose with no token runs gets no note.
+  const rehydNote = (inbound && hasTokenRun)
+    ? `<div class="surface-note">values below are re-hydrated locally — the provider sent tokens; nothing here egresses</div>`
+    : '';
+  return `<div class="surface ${inbound ? 'surface-in' : ''} ${isNew ? 'is-new' : ''}">`
     + `<div class="surface-head">`
     +   `<span class="kind-tag ${kindClass}">${esc(s.kind)}</span>`
+    +   dirTag
     +   `<span class="surface-label">${esc(s.label)}${role}</span>`
     +   (isNew ? `<span class="new-flag">NEW</span>` : '')
     +   (isUnmaskedToolSurface(s) ? `<span class="new-flag warn-flag" title="tool output with nothing masked — eyeball for unredacted data">UNMASKED</span>` : '')
     +   `<span class="surface-hash" title="block hash ${esc(s.block_hash)}">${esc(s.block_hash)}</span>`
     + `</div>`
+    + rehydNote
     + `<pre class="payload">${renderRuns(s.runs)}</pre>`
   + `</div>`;
 }
@@ -518,20 +539,33 @@ function renderReview() {
   const respSurfaces = r.response_surfaces || [];
   const respHasTokenRun = respSurfaces.some(s => (s.runs || []).some(run => run.token));
   const streaming = r.decision === 'in_flight';
+  // `hasResp` (any response field at all) decides whether the panel EXISTS;
+  // `respHasContent` (real surfaces or NON-EMPTY preview) decides content-vs-empty. The
+  // first streaming progress frame can carry response_preview === "" before any text
+  // accumulates — that must show the waiting state, not an empty bordered <pre>.
   const hasResp = r.response_preview != null || respSurfaces.length;
+  const respHasContent = respSurfaces.length || (r.response_preview != null && r.response_preview !== '');
   // Auto-open while the reply streams so the operator watches it land; the live badge
   // makes the in-progress state unmistakable. Count shows HTTP status once finalized.
   const respCount = streaming
     ? `<span class="stream-live">&#9679; streaming</span>`
     : (r.response_status ? 'HTTP ' + r.response_status : '');
-  const fullResponse = (hasResp || streaming) ? `<details class="panel"${streaming ? ' open' : ''}>`
-    + `<summary><span class="panel-title">RESPONSE</span><span class="panel-count">${respCount}</span></summary>`
+  // The RESPONSE panel is INBOUND — provider → here → you. Its surfaces show values
+  // re-hydrated locally; they are not egressing, so the panel reads in the calm inbound
+  // (cyan) register, never the red egress register. A streaming tail sentinel lets the
+  // SSE handler keep the growing reply in view (sticky-follow) without yanking the
+  // operator if they scrolled up to read the request.
+  const fullResponse = (hasResp || streaming) ? `<details class="panel panel-response"${streaming ? ' open' : ''}>`
+    + `<summary><span class="panel-title">RESPONSE</span>`
+    +   `<span class="dir-tag dir-in" title="received from the provider and re-hydrated locally — not egressing">&larr; FROM MODEL</span>`
+    +   `<span class="panel-count">${respCount}</span></summary>`
     + `<div class="panel-body">`
-    +   (hasResp
+    +   (respHasContent
           ? (respHasTokenRun
-              ? respSurfaces.map(s => renderSurface(s, null)).join('')
-              : `<pre class="payload">${renderSpanned(r.response_preview, r.response_spans)}</pre>`)
-          : `<div class="empty-note">Waiting for the model&rsquo;s reply&hellip;</div>`)
+              ? respSurfaces.map(s => renderSurface(s, null, 'inbound')).join('')
+              : `<pre class="payload payload-in">${renderSpanned(r.response_preview, r.response_spans)}</pre>`)
+          : `<div class="empty-note">${streaming ? 'Waiting for the model&rsquo;s reply&hellip;' : 'No reviewable response content.'}</div>`)
+    +   (streaming ? `<div id="streamTail" aria-hidden="true"></div>` : '')
     + `</div></details>`
     : '';
 
@@ -542,7 +576,12 @@ function renderReview() {
     +   `<button class="btn ghost" data-act="tag" data-id="${esc(r.id)}">TAG</button>`
     + `</div></div></details>`;
 
-  d.innerHTML = head + verdict + plaintextBlock + spotlight + tokenLedger + fullRequest + fullResponse + tagComposer;
+  // Detail ordering is DELTA-first then RESPONSE-first: the two things that actually change
+  // turn-to-turn (what's newly egressing = the spotlight, and what came back = the response)
+  // lead, and the static bookkeeping (full token ledger + full re-sent request) follows. For
+  // a held/pending request there is no response yet (fullResponse === '') so this collapses
+  // to the egress-review order; once a reply streams/finalizes it rises above the request dump.
+  d.innerHTML = head + verdict + plaintextBlock + spotlight + fullResponse + tokenLedger + fullRequest + tagComposer;
 }
 
 /* ============================================================
@@ -1414,7 +1453,21 @@ es.onmessage = e => {
       rec.response_preview = p.response_preview;
       rec.response_surfaces = p.response_surfaces;
       rec.response_status = p.status;
-      if (selectedId === p.id) renderReview();
+      if (selectedId === p.id) {
+        // Sticky-follow the streaming tail: re-rendering rewrites #detail's innerHTML and
+        // resets its scroll, so decide BEFORE the re-render whether the tail was already in
+        // view. If it was (or hasn't rendered yet), scroll the fresh sentinel back into view
+        // after re-render; if the operator scrolled UP to read the request, leave them be.
+        const d = $('detail');
+        const tail = document.getElementById('streamTail');
+        let follow = true;
+        if (tail) {
+          const tr = tail.getBoundingClientRect(), dr = d.getBoundingClientRect();
+          follow = tr.top <= dr.bottom + 160; // tail at/near the visible bottom
+        }
+        renderReview();
+        if (follow) document.getElementById('streamTail')?.scrollIntoView({ block: 'nearest' });
+      }
     }
   } else if (ev.event === 'policy') {
     // The live masking policy moved (this panel, the /zlauder:privacy CLI, or another
