@@ -82,11 +82,13 @@ ZlauDeR is licensed under the Business Source License 1.1
 ## Install into Claude Code
 
 zlauder installs as a **Claude Code plugin** — that is the only supported
-interface. Add the marketplace and enable the plugin:
+interface. Run these **inside a `claude` session** (they are Claude Code slash
+commands, not shell/PowerShell commands):
 
 ```
 /plugin marketplace add FailSpy/zlauder
 /plugin install zlauder
+/reload-plugins                 # make the new plugin's commands live now (no restart)
 ```
 
 That's it for setup — **installed = routed**. The plugin's `SessionStart` hook
@@ -97,15 +99,33 @@ line that wraps any existing one as `🛡 … │ {your line}`; `ZLAUDER_STATUSL
 tunes or hides the `🛡` segment). The plugin also writes a `.claude/.gitignore` for that
 file, so the machine-specific `http://127.0.0.1:<port>` can't be committed.
 
+By default `/plugin install` lands the plugin at **user scope**, so its `/zlauder:*`
+commands and `SessionStart` hook are available in *every* project — and the hook then
+auto-plumbs each project the first time it sees it.
+
+> **Thin-slice to a single project.** Prefer to scope the *whole plugin* to one
+> repo instead of every project? Claude Code asks the install scope
+> (`user` / `project` / `local`) during `/plugin install` — choose `project` and
+> only that repo ever loads zlauder (and only it is auto-plumbed).
+
+After install, masking comes on by itself:
+
 1. **Send your next message.** Claude Code re-reads `ANTHROPIC_BASE_URL` from
    `settings.local.json` **live** (no restart in the common case): the first session
    writes the route, the next routes through the proxy and masking is on.
 2. **`/zlauder:privacy`** — confirm routing + masking, or flip masking on/off live.
 
 You rarely run anything by hand. `/zlauder:enable` does the same write explicitly (and
-seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:disable`. Before
-**uninstalling** the plugin, run `/zlauder:disable --all` to sweep every plumbed project
-so none is left pointing at a proxy that's gone.
+seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:disable`.
+
+> **⚠ Before removing zlauder, run `/zlauder:disable --all` first.** The routing patch
+> lives in each project's `.claude/settings.local.json`, not in the plugin, so removing
+> the plugin does not remove it. Uninstall (or switch it off in the `/plugin` UI)
+> *without* disabling first and that project's `ANTHROPIC_BASE_URL` keeps pointing at a
+> proxy that no longer launches → **every request in that project fails** (Claude Code
+> hangs for minutes, then errors) until you hand-edit `.claude/settings.local.json`. The
+> `--all` sweep reverts the routing patch (and restores your status line) across every
+> plumbed project; once the plugin is gone there is no hook left to self-heal it.
 
 `zlauder-proxy` / `zlauder-hooks` are **shipped prebuilt per-platform** with the plugin
 (precedence: PATH → shipped `bin/<triple>` → cached/in-repo build), so a marketplace

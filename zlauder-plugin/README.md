@@ -57,22 +57,64 @@ To stop routing: `/zlauder:disable` (this project; effective on your next messag
 restart in the common case). **Before uninstalling the plugin, run `/zlauder:disable --all`** to sweep
 every project the plugin plumbed, so none is left pointing at a proxy that's about to
 disappear — a dead `ANTHROPIC_BASE_URL` makes Claude Code hang for minutes then fail,
-and once the plugin is gone there's no hook left to self-heal it.
+and once the plugin is gone there's no hook left to self-heal it. (The patch lives in
+the project's `.claude/settings.local.json`, not in the plugin, so it persists until you
+disable it — there is no uninstall lifecycle hook to undo it for you.)
 
 ## Install
 
-Add the marketplace and enable the plugin:
+Run these **inside a `claude` session** (they are slash commands, not shell
+commands), then reload so the freshly installed plugin activates without
+restarting Claude Code:
 
 ```
 /plugin marketplace add FailSpy/zlauder
 /plugin install zlauder
+/reload-plugins
 ```
 
+By default `/plugin install` lands the plugin at **user scope** (commands and the
+`SessionStart` hook available in every project); Claude Code asks the scope, so
+pick `project` if you'd rather load zlauder in only one repo.
 (Or add this directory as a local marketplace if you are working in-repo.)
 Installing the plugin wires up the `SessionStart` hook and the `/zlauder:*`
 commands, and the hook auto-plumbs routing on the first session it sees in each
 project (see the activation flow above). **This plugin is the only supported
 install interface** — there is no separate CLI setup step.
+
+### Troubleshooting: `git@github.com: Permission denied (publickey)`
+
+If `/plugin marketplace add` or `/plugin install` fails with
+
+```
+Failed to clone repository: Cloning into '…/plugins/cache/temp_github_…'
+git@github.com: Permission denied (publickey).
+```
+
+it is **not** this plugin. Claude Code clones marketplace plugins over **HTTPS**, but a
+global git rule on your machine is rewriting that HTTPS URL to SSH:
+
+```
+git config --global --get-regexp 'url\..*\.insteadof'
+# e.g.  url.git@github.com:.insteadof https://github.com/
+```
+
+That `insteadOf` rewrites **every** `https://github.com/…` clone to `git@github.com:…`. The repo
+being **public is irrelevant**: public visibility only grants *anonymous HTTPS* access — GitHub's
+SSH transport is **never anonymous**, it always authenticates the *account* behind the key, not the
+repo. So the rule turns a clone that needed **no** auth (public HTTPS) into one that **requires** a
+usable SSH key, and the install fails (`Permission denied (publickey)`) when Claude Code's git
+subprocess has no key/agent available. There is no Claude Code setting to force HTTPS, so the fix is
+in your git config. The clean option keeps
+SSH for your **pushes** while letting HTTPS clones (including this install) through — swap
+`insteadOf` for `pushInsteadOf`:
+
+```
+git config --global --unset url.git@github.com:.insteadof
+git config --global url."git@github.com:".pushInsteadOf "https://github.com/"
+```
+
+(Or just drop the rule with the `--unset` line alone, or make `ssh -T git@github.com` authenticate.)
 
 ## Commands
 
