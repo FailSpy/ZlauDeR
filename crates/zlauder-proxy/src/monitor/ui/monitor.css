@@ -494,6 +494,15 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .spotlight.warn .spotlight-head { border-color: var(--bad); background: linear-gradient(90deg, rgba(255,93,108,.12), transparent); }
 .spotlight.warn .spotlight-icon, .spotlight.warn .spotlight-title { color: var(--bad); }
 .new-flag.warn-flag { color: #fff; background: var(--bad); box-shadow: 0 0 12px -2px var(--bad); }
+/* Framing-only churn (e.g. the per-request billing nonce): muted, never the loud amber. */
+.new-flag.framing-flag { color: var(--ink-dim); background: var(--bg-inset); border: 1px solid var(--line); box-shadow: none; font-weight: 500; }
+/* Folded Claude Code framing inside the spotlight: dashed, de-emphasized, one-click. */
+.spotlight-scaffold { margin: 4px 0 2px; border: 1px dashed var(--line); border-radius: 6px; background: var(--bg-inset); }
+.spotlight-scaffold > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 8px; padding: 7px 12px; }
+.spotlight-scaffold > summary::-webkit-details-marker { display: none; }
+.spotlight-scaffold > summary::before { content: '▸'; color: var(--ink-faint); font-size: 10px; }
+.spotlight-scaffold[open] > summary::before { content: '▾'; }
+.spotlight-scaffold > .spotlight-body { padding: 2px 12px 8px; }
 
 /* panels */
 .panel { border: 1px solid var(--line); border-radius: 6px; margin-bottom: 14px; background: var(--bg-panel); overflow: hidden; }

@@ -284,6 +284,23 @@ function newPlaintext(r) {
    observe mode where the held-request plaintext block never renders. */
 function newPiiCount(r) { return newPlaintext(r).length; }
 
+/* ---------- new-surface provenance partition (information hierarchy) ----------
+   A turn's delta mixes two very different things: genuinely-new CONTENT (your message, a
+   tool result, a file) and Claude Code SCAFFOLDING that merely re-hashed — most notably the
+   billing header, whose per-request `cch=` nonce changes on EVERY request, so that surface
+   is flagged "new" every single turn while carrying no plaintext to vet. Partition new
+   surfaces by the server's provenance lane (LANE_META.fold marks the foldable scaffolding
+   lanes) so the spotlight and the traffic rail LEAD with content and fold the framing churn
+   one click away. Never hides: folded surfaces are still rendered, counted, and one click
+   from view, and an unknown lane is treated as content (shown) — matching the server's
+   fail-toward-showing default. */
+function isScaffoldSurface(s) { return laneMeta(s && s.provenance).fold === true; }
+function splitNewSurfaces(r) {
+  const added = new Set((r.delta && r.delta.added_surface_hashes) || []);
+  const ns = (r.request_surfaces || []).filter(s => added.has(s.block_hash));
+  return { content: ns.filter(s => !isScaffoldSurface(s)), scaffold: ns.filter(isScaffoldSurface) };
+}
+
 /* ============================================================
    DELTA SPOTLIGHT  (the heart of the review)
    ============================================================ */
@@ -371,15 +388,66 @@ function renderSpotlight(r) {
   }
 
   const piiCount = newPiiCount(r);
+  const { content, scaffold } = splitNewSurfaces(r);
+  // A foldable framing lane (harness_frame/harness_meta) USUALLY carries no plaintext (the
+  // billing nonce just re-hashed), but it CAN smuggle a new masked token — a <system-reminder>,
+  // a SessionStart-hook context, a slash-command wrapper with PII. So never assert "no new
+  // plaintext" about the framing unconditionally — check whether it actually carries any.
+  const scaffoldHasPii = scaffold.some(s => (s.runs || []).some(run => run.token));
+  // Claude Code framing / transport surfaces that re-hashed this turn (e.g. the billing
+  // nonce). Folded, not dropped: still rendered with full NEW framing inside, still counted,
+  // one click away — kept out of the lead so genuinely-new content reads first. Auto-expanded
+  // (and badged) when it carries new plaintext, so a token riding the framing isn't buried.
+  const scaffoldFold = scaffold.length
+    ? `<details class="spotlight-scaffold"${scaffoldHasPii ? ' open' : ''}>`
+      + `<summary><span class="fold-tag">CLAUDE CODE FRAMING</span>`
+      +   `<span class="fold-sub">+${scaffold.length} scaffolding/transport surface(s) changed &middot; `
+      +     (scaffoldHasPii ? `<span class="spotlight-pii">carries new plaintext &mdash; vet</span>` : `no new plaintext`)
+      +     ` &middot; click to inspect</span></summary>`
+      + `<div class="spotlight-body">${scaffold.map(s => renderSurface(s, addedSet)).join('')}</div>`
+      + `</details>`
+    : '';
+
+  // Only framing churned (the common case: the per-request billing nonce moved while the
+  // whole transcript is resent). Nothing the operator must vet is newly egressing — read it
+  // as calm with the framing one click away, not a red "1 NEW SURFACE".
+  if (!content.length) {
+    // ...but a framing lane can carry a new masked token. content.length === 0 here, so
+    // piiCount is exactly the framing lanes' plaintext: when it's non-zero, this is NOT
+    // "no new exposure" — lead with the PII, surfaces shown (not a false all-clear).
+    if (piiCount > 0) {
+      return `<div class="spotlight warn">`
+        + `<div class="spotlight-head">`
+        +   `<span class="spotlight-icon">&#9888;</span>`
+        +   `<span class="spotlight-title">NEW PII IN FRAMING &middot; <span class="spotlight-pii">${piiCount} NEW PII</span></span>`
+        +   `<span class="spotlight-sub">turn ${r.turn_index} resends prior context, but ${scaffold.length} Claude Code framing/transport surface(s) carry new plaintext &mdash; vet below</span>`
+        + `</div>`
+        + `<div class="spotlight-body">`
+        +   scaffold.map(s => renderSurface(s, addedSet)).join('')
+        + `</div></div>`;
+    }
+    return `<div class="spotlight calm">`
+      + `<div class="spotlight-head">`
+      +   `<span class="spotlight-icon">&#9679;</span>`
+      +   `<span class="spotlight-title">NO NEW EXPOSURE</span>`
+      +   `<span class="spotlight-sub">turn ${r.turn_index} resends prior context &middot; only Claude Code framing changed</span>`
+      + `</div>`
+      + `<div class="spotlight-body"><div class="empty-note">`
+      +   `Nothing new is exposed this turn &mdash; ${scaffold.length} transport/framing surface(s) re-hashed, carrying no new plaintext.`
+      + `</div>${scaffoldFold}</div></div>`;
+  }
+
   return `<div class="spotlight">`
     + `<div class="spotlight-head">`
     +   `<span class="spotlight-icon">&#9650;</span>`
-    +   `<span class="spotlight-title">DELTA &middot; ${newSurfaces.length} NEW SURFACE${newSurfaces.length === 1 ? '' : 'S'}`
+    +   `<span class="spotlight-title">DELTA &middot; ${content.length} NEW SURFACE${content.length === 1 ? '' : 'S'}`
     +     (piiCount ? ` &middot; <span class="spotlight-pii">${piiCount} NEW PII</span>` : '') + `</span>`
-    +   `<span class="spotlight-sub">new this turn vs turn ${delta.prev_turn ?? '-'}</span>`
+    +   `<span class="spotlight-sub">new this turn vs turn ${delta.prev_turn ?? '-'}`
+    +     (scaffold.length ? ` &middot; +${scaffold.length} framing` : '') + `</span>`
     + `</div>`
     + `<div class="spotlight-body">`
-    +   newSurfaces.map(s => renderSurface(s, addedSet)).join('')
+    +   content.map(s => renderSurface(s, addedSet)).join('')
+    +   scaffoldFold
     + `</div></div>`;
 }
 
@@ -728,7 +796,11 @@ function renderTraffic(flashId) {
     const tc = (r.tokens || []).length;
     const di = decisionInfo(r.decision);
     const risk = isNothingMaskedRisk(r);
-    const newCount = (r.delta && !r.delta.is_first) ? (r.delta.added_surface_hashes || []).length : -1;
+    // Glance pip leads with NEW CONTENT count (the billing nonce re-hashes every turn, so a
+    // raw +N would never drop below 1); framing-only churn shows a muted "framing" chip.
+    const split = (r.delta && !r.delta.is_first && !r.delta.prev_unavailable) ? splitNewSurfaces(r) : null;
+    const newContent = split ? split.content.length : -1;
+    const newScaffold = split ? split.scaffold.length : 0;
     const piiCount = newPiiCount(r);
     const pending = r.decision === 'pending';
     const inflight = r.decision === 'in_flight';
@@ -751,7 +823,11 @@ function renderTraffic(flashId) {
       +   (inflight ? `<span class="rec-clock live" data-elapsed="${esc(r.id)}">&#9201; ${fmtClock(ela)} streaming</span>` : '')
       +   (r.delta && r.delta.is_first ? `<span class="new-flag">FIRST</span>`
             : (r.delta && r.delta.prev_unavailable ? `<span class="new-flag warn-flag">?</span>`
-            : (newCount > 0 ? `<span class="new-flag">+${newCount}</span>` : '')))
+            : (newContent > 0
+                ? `<span class="new-flag" title="${newContent} new content surface(s)${newScaffold ? ' &middot; +' + newScaffold + ' Claude Code framing' : ''}">+${newContent}</span>`
+                : (newScaffold > 0
+                    ? `<span class="new-flag framing-flag" title="${newScaffold} Claude Code framing/transport surface(s) re-hashed">framing</span>`
+                    : ''))))
       +   (piiCount > 0 ? `<span class="new-flag pii-flag" title="${piiCount} new plaintext value(s) about to leave this machine this turn">${piiCount} PII</span>` : '')
       + `</div>`
       + `<div class="rec-meta">`

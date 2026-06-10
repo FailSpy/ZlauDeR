@@ -68,39 +68,6 @@ pub(crate) fn compute_delta(
     }
 }
 
-/// Compute the delta when only the previous turn's surface `block_hash`es are
-/// available (its full record was evicted from the ring, but the hashes were
-/// cached). The cached baseline is the prior REQUEST surfaces only — the reply is
-/// captured after the request record is minted, so it is not in this fallback set.
-/// A still-resident prior record (the common path) folds the reply via
-/// [`compute_delta`]; once it ages out the reply can momentarily re-surface as
-/// delta, which is the safe over-show direction (never hides).
-pub(crate) fn compute_delta_from_hashes(
-    current: &[Surface],
-    prev_turn: u32,
-    prev_hashes: &[String],
-) -> TurnDelta {
-    let prev: HashSet<&str> = prev_hashes.iter().map(String::as_str).collect();
-
-    let mut seen = HashSet::new();
-    let mut added = Vec::new();
-    for s in current {
-        if prev.contains(s.block_hash.as_str()) {
-            continue;
-        }
-        if seen.insert(s.block_hash.as_str()) {
-            added.push(s.block_hash.clone());
-        }
-    }
-
-    TurnDelta {
-        prev_turn: Some(prev_turn),
-        is_first: false,
-        prev_unavailable: false,
-        added_surface_hashes: added,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,18 +152,6 @@ mod tests {
             vec!["x".to_string()],
             "assistant content the masker never saw must remain reviewable"
         );
-    }
-
-    #[test]
-    fn delta_from_hashes_matches_full_compare() {
-        let prev = [surface("a"), surface("b")];
-        let cur = vec![surface("a"), surface("b"), surface("c")];
-        let prev_hashes: Vec<String> = prev.iter().map(|s| s.block_hash.clone()).collect();
-        let d = compute_delta_from_hashes(&cur, 1, &prev_hashes);
-        assert!(!d.is_first);
-        assert!(!d.prev_unavailable);
-        assert_eq!(d.prev_turn, Some(1));
-        assert_eq!(d.added_surface_hashes, vec!["c".to_string()]);
     }
 
     #[test]

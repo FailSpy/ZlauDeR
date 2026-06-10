@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, oneshot};
 use zlauder_engine::UnmaskManifest;
 
 use super::capture::{CapKind, ResponseCapture};
-use super::delta::{compute_delta, compute_delta_from_hashes};
+use super::delta::compute_delta;
 use super::model::{
     ApprovalDecision, ConversationMeta, MonitorEvent, MonitorMode, MonitorSnapshot,
     RequestDecision, RequestRecord, ResponseProgress, Surface, TokenClass, TokenLedgerEntry,
@@ -29,8 +29,8 @@ const PROGRESS_FLUSH_BYTES: usize = 160;
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(APPROVAL_TIMEOUT_SECS);
 const DEFAULT_MAX_PENDING_APPROVALS: usize = 32;
-/// Cap on the per-conversation cache of last-turn surface hashes. Keeps deltas
-/// computable even after the prior turn's record is evicted from the global ring.
+/// Cap on the per-conversation tracking maps (`conversation_anchors`, `labels`,
+/// `turn_counts`, `last_seen`, …), evicted as a set by least-recently-seen.
 const MAX_TRACKED_CONVERSATIONS: usize = 1024;
 /// Hard cap on the durable session-token ledger. Generous (the secrets ledger
 /// should hold a whole session's distinct values), oldest-evicted past it — a real
@@ -80,11 +80,6 @@ struct Inner {
     /// here (rather than reading the prior record) keeps the signal alive after the prior
     /// turn's record is evicted from the ring. Evicted with the per-conversation map set.
     prev_user_input_counts: HashMap<String, u32>,
-    /// Per-conversation cache of the most recent turn's `(turn_index, surface
-    /// block_hashes)`. Lets the delta survive eviction of the prior turn's full
-    /// record from the global ring, so a resent transcript is not mis-flagged as
-    /// "first contact / all new". Bounded by [`MAX_TRACKED_CONVERSATIONS`].
-    last_turn_hashes: HashMap<String, (u32, Vec<String>)>,
     /// Content-derived conversation anchors: auto-id → the conversation's current
     /// ordered sequence of non-system surface `block_hash`es. A new request with
     /// no explicit id is matched to the conversation whose anchor is a clean
@@ -92,7 +87,7 @@ struct Inner {
     /// [`resolve_content_conversation`]. Bounded by [`MAX_TRACKED_CONVERSATIONS`].
     conversation_anchors: HashMap<String, Vec<String>>,
     /// Per-conversation last-seen timestamp (ms), used as the LRU key when
-    /// evicting `last_turn_hashes` / `conversation_anchors` / `labels`.
+    /// evicting `conversation_anchors` / `labels`.
     last_seen: HashMap<String, u128>,
     /// Per-conversation display label, cached at mint time (a snippet of the
     /// first user message). Recomputing it from the ring is wrong — records are
@@ -124,7 +119,6 @@ impl Monitor {
                 turn_counts: HashMap::new(),
                 human_turn_counts: HashMap::new(),
                 prev_user_input_counts: HashMap::new(),
-                last_turn_hashes: HashMap::new(),
                 conversation_anchors: HashMap::new(),
                 last_seen: HashMap::new(),
                 labels: HashMap::new(),
@@ -202,6 +196,8 @@ impl Monitor {
         let tokens = token_previews(manifest);
         let request_spans = spans_from_manifest(manifest, &request_preview);
         let request_surfaces = surfaces_from_body(masked_body, &tokens);
+        // This turn's surface hashes — used to overlap-select the genuine predecessor turn
+        // (see `previous_turn_surfaces`). Computed before the lock (blake3 over each surface).
         let this_turn_hashes: Vec<String> = request_surfaces
             .iter()
             .map(|s| s.block_hash.clone())
@@ -265,23 +261,33 @@ impl Monitor {
             *c
         };
 
-        // Delta vs the most recent prior turn of this conversation.
+        // Delta vs the genuine PREDECESSOR turn of this conversation.
         //
-        // Prefer the prior turn's live record (full surface compare). If that
-        // record has been evicted from the global ring, fall back to the cached
-        // last-turn hashes so a resent transcript is not mislabeled. Only the
-        // genuine first turn (turn_index == 1) is `is_first`; a non-first turn
-        // with no prior data is `prev_unavailable`, not "all new".
+        // The baseline is the prior turn whose request surfaces overlap THIS turn's the
+        // most (tie-broken by recency), NOT merely the highest prior turn_index. A
+        // side-branch that shares the conversation id but diverges in content — most
+        // notably Claude Code's background title / "memory" generation fork, which rides
+        // the same `metadata.user_id` session_id and so lands in this conversation —
+        // otherwise becomes the baseline for the next REAL turn and mis-flags the whole
+        // resent transcript as new (the "T2 = entire conversation is delta" bug). Overlap
+        // selection skips it: the true predecessor is a near-superset of this turn and shares
+        // far more surfaces than a divergent fork. Safe either way — a surface only folds when
+        // it byte-matches one in a REAL prior recorded turn, and a fully divergent turn just
+        // over-shows (never hides).
+        //
+        // This requires the predecessor's LIVE record (full surface compare). Once every prior
+        // record of the conversation has aged out of the ring there is nothing to overlap-select
+        // against — and a single cached hash set cannot be trusted as the baseline (it may be the
+        // fork, in which case folding against it could HIDE a genuinely-new surface that happens
+        // to byte-match a fork surface). So we never fold from one unverified cache: a non-first
+        // turn with no live predecessor is `prev_unavailable` (audit the full request — over-show,
+        // never hide), and only the genuine first turn (turn_index == 1) is `is_first`.
+        let current_hashes: HashSet<&str> =
+            this_turn_hashes.iter().map(String::as_str).collect();
         let delta = if let Some((pt, prev_req, prev_resp)) =
-            previous_turn_surfaces(&inner.records, &conversation_id, turn_index)
+            previous_turn_surfaces(&inner.records, &conversation_id, turn_index, &current_hashes)
         {
             compute_delta(&request_surfaces, Some((pt, &prev_req, &prev_resp)))
-        } else if let Some((pt, hashes)) = inner
-            .last_turn_hashes
-            .get(&conversation_id)
-            .filter(|(pt, _)| *pt < turn_index)
-        {
-            compute_delta_from_hashes(&request_surfaces, *pt, hashes)
         } else if turn_index == 1 {
             TurnDelta::first()
         } else {
@@ -316,17 +322,12 @@ impl Monitor {
             *c
         };
 
-        // Cache this turn's surface hashes (computed before the lock) for future
-        // delta computation after the full record is evicted from the ring; stamp
-        // last-seen (the LRU eviction key); cache the conversation label once (from
+        // Stamp last-seen (the LRU eviction key) and cache the conversation label once (from
         // the resent transcript's first user message — works on any turn).
         {
             // Reborrow through the guard so the field accesses are seen as
             // disjoint by the borrow checker.
             let inner = &mut *inner;
-            inner
-                .last_turn_hashes
-                .insert(conversation_id.clone(), (turn_index, this_turn_hashes));
             inner.last_seen.insert(conversation_id.clone(), now);
             if !inner.labels.contains_key(&conversation_id) {
                 let label = first_message_label(&request_surfaces, endpoint, &conversation_id);
@@ -893,20 +894,35 @@ fn ingest_tokens_into(
     }
 }
 
-/// Find the most recent record in the same conversation with a smaller turn
-/// index, returning its turn index and a clone of its request surfaces.
+/// Find the genuine PREDECESSOR record in the same conversation: among prior turns
+/// (turn_index < `turn_index`), the one whose request surfaces overlap `current_hashes`
+/// the most, tie-broken by recency (highest turn_index). Returns its turn index and a
+/// clone of its request + captured-response surfaces.
 ///
-/// `records` is newest-first, so the first match older than `turn_index` is the
-/// immediately-previous turn.
+/// Selecting by overlap rather than by raw turn_index keeps a content-divergent
+/// side-branch that merely shares the conversation id — e.g. Claude Code's background
+/// title/"memory" fork riding the same session_id — from becoming the delta baseline:
+/// the true predecessor is a near-superset of this turn and shares far more surfaces,
+/// while the fork shares almost none. In the common monotone-growth case the
+/// immediately-prior turn has both the largest overlap and the highest turn_index, so the
+/// recency tie-break preserves the old behavior exactly.
 fn previous_turn_surfaces(
     records: &VecDeque<RequestRecord>,
     conversation_id: &str,
     turn_index: u32,
+    current_hashes: &HashSet<&str>,
 ) -> Option<(u32, Vec<Surface>, Vec<Surface>)> {
     records
         .iter()
         .filter(|r| r.conversation_id == conversation_id && r.turn_index < turn_index)
-        .max_by_key(|r| r.turn_index)
+        .max_by_key(|r| {
+            let overlap = r
+                .request_surfaces
+                .iter()
+                .filter(|s| current_hashes.contains(s.block_hash.as_str()))
+                .count();
+            (overlap, r.turn_index)
+        })
         .map(|r| {
             (
                 r.turn_index,
@@ -919,8 +935,8 @@ fn previous_turn_surfaces(
 }
 
 /// Bound every per-conversation map by evicting the least-recently-seen
-/// conversations until back under cap. All seven maps (`turn_counts`,
-/// `human_turn_counts`, `prev_user_input_counts`, `last_seen`, `last_turn_hashes`,
+/// conversations until back under cap. All six maps (`turn_counts`,
+/// `human_turn_counts`, `prev_user_input_counts`, `last_seen`,
 /// `conversation_anchors`, `labels`) are evicted as a SET for the same victim, so they
 /// never disagree. Choosing the victim by
 /// `last_seen` (recency) — not by turn count — guarantees the victim is genuinely
@@ -941,7 +957,6 @@ fn evict_stale_conversation_state(inner: &mut Inner) {
         inner.turn_counts.remove(&victim);
         inner.human_turn_counts.remove(&victim);
         inner.prev_user_input_counts.remove(&victim);
-        inner.last_turn_hashes.remove(&victim);
         inner.conversation_anchors.remove(&victim);
         inner.labels.remove(&victim);
     }
@@ -1306,6 +1321,52 @@ mod tests {
         );
         assert_eq!(convo_of(&m, &a2), "cc-sess-A");
         assert_eq!(turn_of(&m, &a2), 2);
+    }
+
+    #[test]
+    fn delta_baseline_picks_genuine_predecessor_over_divergent_fork() {
+        // Regression for the "T2 marked the entire conversation as delta" bug. Claude Code's
+        // background title / "memory" generation fork rides the SAME session_id, so it lands in
+        // this conversation and takes a turn_index between two real turns. The next real turn
+        // must diff against its genuine predecessor (turn 1), not the fork (turn 2).
+        let m = Monitor::new();
+        // Turn 1: the real opener, with a model reply already in the resent transcript.
+        record(
+            &m,
+            &body_with_session(
+                "sess-1",
+                &[
+                    ("user", json!("the real conversation opener")),
+                    ("assistant", json!("real reply")),
+                ],
+            ),
+        );
+        // Turn 2: the divergent fork — same session_id, unrelated content (shares no surface).
+        record(
+            &m,
+            &body_with_session(
+                "sess-1",
+                &[("user", json!("Generate a concise title for the conversation"))],
+            ),
+        );
+        // Turn 3: a genuine continuation of turn 1 plus one new user message.
+        let t3 = record(
+            &m,
+            &body_with_session(
+                "sess-1",
+                &[
+                    ("user", json!("the real conversation opener")),
+                    ("assistant", json!("real reply")),
+                    ("user", json!("a genuinely new message")),
+                ],
+            ),
+        );
+        let r3 = find(&m, &t3);
+        // Baseline is the genuine predecessor (turn 1, overlap 2), not the fork (turn 2, overlap 0).
+        assert_eq!(r3.delta.prev_turn, Some(1));
+        // Only the genuinely-new message is flagged new; the resent opener + reply fold out.
+        // Diffing against the fork (the old max-turn_index behavior) would flag all three.
+        assert_eq!(r3.delta.added_surface_hashes.len(), 1);
     }
 
     #[test]
