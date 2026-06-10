@@ -131,6 +131,28 @@ async fn fake_openai_chat_stream_upstream(
     (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
 }
 
+/// A chat stream whose reply ENDS on a viable-but-incomplete token prefix (no closing
+/// `]`), so the relay's carry buffer holds the trailing fragment — which the relay used to
+/// drop at stream end. Exercises the held-tail drain on the chat path.
+async fn fake_openai_chat_stream_held_tail_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    *cap.body.lock().unwrap() = String::from_utf8_lossy(&body).to_string();
+    let data1 = serde_json::json!({
+        "id": "chatcmpl_tail", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"content": "tail [EMAIL_ADDRESS_a1b2c3"}, "finish_reason": null}]
+    });
+    // A dedicated finish_reason chunk before [DONE] — a client may stop here, so the held
+    // tail must be flushed BEFORE this chunk, not only before [DONE].
+    let data2 = serde_json::json!({
+        "id": "chatcmpl_tail", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {data1}\n\ndata: {data2}\n\ndata: [DONE]\n\n");
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
 async fn fake_responses_upstream(
     State(cap): State<Captured>,
     body: Bytes,
@@ -362,6 +384,72 @@ async fn openai_chat_completions_streaming_unmasks_and_preserves_done() {
     assert!(
         text.contains("data: [DONE]"),
         "DONE marker not preserved: {text}"
+    );
+}
+
+// A chat stream that ends mid-incomplete-token must flush the held tail to BOTH the wire
+// (before [DONE]) and the monitor record — not silently drop it. Regression for the
+// cumulative-audit finding that the OpenAI relays never drained their carry buffer, and
+// the first integration coverage of the OpenAI chat capture→record path.
+#[tokio::test]
+async fn openai_chat_stream_held_tail_reaches_client_and_monitor() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(fake_openai_chat_stream_held_tail_upstream),
+        )
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "tail-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let text = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // The held trailing fragment is flushed to the client BEFORE the finish_reason chunk
+    // (and thus before [DONE]) — a client that stops at finish_reason still receives it.
+    let tail_idx = text
+        .find("[EMAIL_ADDRESS_a1b2c3")
+        .unwrap_or_else(|| panic!("held tail dropped from the wire: {text}"));
+    let finish_idx = text.find("\"stop\"").expect("finish_reason chunk present");
+    let done_idx = text.find("[DONE]").expect("[DONE] present");
+    assert!(tail_idx < finish_idx, "held tail must precede the finish_reason chunk: {text}");
+    assert!(finish_idx < done_idx, "[DONE] is last: {text}");
+
+    // And it is captured onto the monitor record — the reply is not truncated.
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "tail-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = snap["records"]
+        .as_array()
+        .and_then(|rs| rs.first())
+        .expect("one recorded request");
+    assert_eq!(rec["decision"], "completed");
+    let preview = rec["response_preview"].as_str().unwrap_or_default();
+    assert!(
+        preview.contains("tail [EMAIL_ADDRESS_a1b2c3"),
+        "captured streamed reply was truncated: {preview}"
     );
 }
 

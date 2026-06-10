@@ -11,9 +11,10 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{StatusCode, header::CONTENT_TYPE};
 use openai_wire::{
-    ResponseCompletedEvent, ResponseContentPart, ResponseFunctionCallItem,
-    ResponseFunctionCallOutputItem, ResponseInputItem, ResponseMessageContent, ResponseMessageItem,
-    ResponseObject, ResponseOutputItem, ResponseStreamEvent, ResponsesInput, ResponsesRequest,
+    ResponseCompletedEvent, ResponseContentPart, ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallItem, ResponseFunctionCallOutputItem, ResponseInputItem,
+    ResponseMessageContent, ResponseMessageItem, ResponseObject, ResponseOutputItem,
+    ResponseOutputTextDeltaEvent, ResponseStreamEvent, ResponsesInput, ResponsesRequest,
 };
 use serde_json::{Map, Value};
 use sse_core::{SseClient, SseEvent};
@@ -564,6 +565,9 @@ pub fn unmask_sse_body(
                     st.done = true;
                 }
                 None => {
+                    // Upstream closed without a [DONE] sentinel: still flush held tails
+                    // (no-op if [DONE] already drained them) before finalizing.
+                    flush_held(&mut st);
                     st.guard.complete();
                     st.done = true;
                 }
@@ -678,6 +682,75 @@ impl ResponsesSseUnmasker {
             .unmask(safe, manifest)
             .unwrap_or_else(|_| safe.to_string())
     }
+
+    /// Drain any still-held partial-token tails at stream end: output-text tails per
+    /// (item_id, output_index, content_index), function-arg tails per (item_id,
+    /// output_index). Mirrors the Anthropic relay so a stream ending mid-incomplete-token
+    /// does not silently drop its final fragment.
+    fn drain(&mut self) -> (Vec<(TextCarryKey, String)>, Vec<(ArgsCarryKey, String)>) {
+        let text: Vec<(TextCarryKey, String)> =
+            self.text_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        let args: Vec<(ArgsCarryKey, String)> =
+            self.args_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        (text, args)
+    }
+}
+
+/// Flush held partial-token tails (output text + function args) BEFORE the stream's
+/// terminal sentinel — re-emitting each downstream as its true delta event and capturing
+/// it through the same keys as the streaming path, so neither the client nor the monitor
+/// loses a reply that ends mid-incomplete-token. Idempotent (a second call finds the
+/// carries already drained).
+fn flush_held(st: &mut StreamState) {
+    let (text, args) = st.xform.drain();
+    for ((item_id, output_index, content_index), held) in text {
+        let emitted = st
+            .engine
+            .unmask_assistant(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        // Same key shape as capture_event so the tail concatenates onto the right block.
+        let key = format!("t:{item_id:?}:{output_index:?}:{content_index:?}");
+        st.guard
+            .capture(&key, monitor::CapKind::Text, "assistant", &emitted);
+        let ev = ResponseStreamEvent::ResponseOutputTextDelta(ResponseOutputTextDeltaEvent {
+            item_id,
+            output_index,
+            content_index,
+            delta: emitted,
+            ..Default::default()
+        });
+        if let Ok(data) = serde_json::to_string(&ev) {
+            st.queue
+                .push_back(frame(Some("response.output_text.delta"), &data));
+        }
+    }
+    for ((item_id, output_index), held) in args {
+        let emitted = st
+            .engine
+            .unmask(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        let key = format!("a:{item_id:?}:{output_index:?}");
+        st.guard
+            .capture(&key, monitor::CapKind::ToolUse, "tool_call", &emitted);
+        let ev = ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+            ResponseFunctionCallArgumentsDeltaEvent {
+                item_id,
+                output_index,
+                delta: emitted,
+                ..Default::default()
+            },
+        );
+        if let Ok(data) = serde_json::to_string(&ev) {
+            st.queue
+                .push_back(frame(Some("response.function_call_arguments.delta"), &data));
+        }
+    }
 }
 
 fn unmask_completed(
@@ -693,6 +766,8 @@ fn unmask_completed(
 
 fn enqueue(st: &mut StreamState, sse: SseEvent) {
     if sse.data.trim() == "[DONE]" {
+        // Flush held tails BEFORE the terminal sentinel (a client stops at [DONE]).
+        flush_held(st);
         st.queue.push_back(frame(sse.event.as_deref(), "[DONE]"));
         return;
     }
@@ -704,6 +779,20 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
             // Mirror the unmasked reply onto the monitor record as it streams.
             for o in &out {
                 capture_event(&mut st.guard, o);
+            }
+            // A response.completed/failed/incomplete event is stream-terminal for a client;
+            // flush any held tail BEFORE it so a delta-accumulating client that stops there
+            // still receives the final fragment, not only one that reads through to [DONE].
+            let terminal = out.iter().any(|o| {
+                matches!(
+                    o,
+                    ResponseStreamEvent::ResponseCompleted(_)
+                        | ResponseStreamEvent::ResponseFailed(_)
+                        | ResponseStreamEvent::ResponseIncomplete(_)
+                )
+            });
+            if terminal {
+                flush_held(st);
             }
             for o in out {
                 if let Ok(data) = serde_json::to_string(&o) {

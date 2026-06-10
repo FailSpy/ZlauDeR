@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use http::{StatusCode, header::CONTENT_TYPE};
 use openai_wire::{
     ChatCompletionsRequest, ChatCompletionsResponse, OpenAIChunk, OpenAIContent, OpenAIContentPart,
-    OpenAIMessage,
+    OpenAIDelta, OpenAIFunctionDelta, OpenAIMessage, OpenAIStreamChoice, OpenAIToolCallDelta,
 };
 use serde_json::{Map, Value};
 use sse_core::{SseClient, SseEvent};
@@ -478,6 +478,9 @@ pub fn unmask_sse_body(
                     st.done = true;
                 }
                 None => {
+                    // Upstream closed without a [DONE] sentinel: still flush held tails
+                    // (no-op if [DONE] already drained them) before finalizing.
+                    flush_held(&mut st);
                     st.guard.complete();
                     st.done = true;
                 }
@@ -488,10 +491,64 @@ pub fn unmask_sse_body(
     Body::from_stream(stream)
 }
 
+/// Envelope (id/model/created/…) of the most recent chunk, so a flushed held tail can be
+/// re-emitted as a valid chunk carrying the same stream identity, not a bare `{choices}`.
+#[derive(Default, Clone)]
+struct ChunkEnvelope {
+    id: Option<String>,
+    object: Option<String>,
+    created: Option<u64>,
+    model: Option<String>,
+    system_fingerprint: Option<String>,
+}
+
+impl ChunkEnvelope {
+    fn chunk(&self, choice: OpenAIStreamChoice) -> OpenAIChunk {
+        OpenAIChunk {
+            id: self.id.clone(),
+            object: self.object.clone(),
+            created: self.created,
+            model: self.model.clone(),
+            system_fingerprint: self.system_fingerprint.clone(),
+            choices: vec![choice],
+            ..Default::default()
+        }
+    }
+    fn content_chunk(&self, index: i64, content: String) -> OpenAIChunk {
+        self.chunk(OpenAIStreamChoice {
+            index,
+            delta: OpenAIDelta {
+                content: Some(content),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+    fn tool_chunk(&self, choice: i64, call: i64, arguments: String) -> OpenAIChunk {
+        self.chunk(OpenAIStreamChoice {
+            index: choice,
+            delta: OpenAIDelta {
+                tool_calls: Some(vec![OpenAIToolCallDelta {
+                    index: call,
+                    function: Some(OpenAIFunctionDelta {
+                        arguments: Some(arguments),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+}
+
 #[derive(Default)]
 struct OpenAISseUnmasker {
     content_carry: HashMap<i64, String>,
     tool_carry: HashMap<(i64, i64), String>,
+    /// Envelope of the latest chunk, used to mint a valid flushed-tail chunk at stream end.
+    envelope: ChunkEnvelope,
 }
 
 impl OpenAISseUnmasker {
@@ -501,6 +558,14 @@ impl OpenAISseUnmasker {
         engine: &MaskEngine,
         manifest: &UnmaskManifest,
     ) -> OpenAIChunk {
+        // Remember this chunk's envelope so a held-tail flush can reuse its identity.
+        self.envelope = ChunkEnvelope {
+            id: chunk.id.clone(),
+            object: chunk.object.clone(),
+            created: chunk.created,
+            model: chunk.model.clone(),
+            system_fingerprint: chunk.system_fingerprint.clone(),
+        };
         for choice in chunk.choices.iter_mut() {
             if let Some(content) = choice.delta.content.take() {
                 choice.delta.content =
@@ -572,10 +637,67 @@ impl OpenAISseUnmasker {
             Some(emitted)
         }
     }
+
+    /// Drain any still-held partial-token tails at stream end: content tails per choice
+    /// index, tool-arg tails per (choice, call). Mirrors the Anthropic relay's drain so a
+    /// stream ending mid-incomplete-token does not silently drop its final fragment.
+    fn drain(&mut self) -> (Vec<(i64, String)>, Vec<((i64, i64), String)>) {
+        let content: Vec<(i64, String)> =
+            self.content_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        let tool: Vec<((i64, i64), String)> =
+            self.tool_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        (content, tool)
+    }
+}
+
+/// Flush held partial-token tails (content + tool args) BEFORE the stream's terminal
+/// sentinel — re-emitting each downstream as a valid chunk (reusing the last envelope) and
+/// capturing it into the monitor through the same keys as the streaming path, so neither
+/// the client nor the monitor loses a reply that ends mid-incomplete-token. Idempotent: a
+/// second call after `drain()` emptied the carries is a no-op.
+fn flush_held(st: &mut StreamState) {
+    let (content, tool) = st.xform.drain();
+    for (index, held) in content {
+        let emitted = st
+            .engine
+            .unmask_assistant(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        st.guard
+            .capture(&format!("c{index}"), monitor::CapKind::Text, "assistant", &emitted);
+        let chunk = st.xform.envelope.content_chunk(index, emitted);
+        if let Ok(data) = serde_json::to_string(&chunk) {
+            st.queue.push_back(frame(None, &data));
+        }
+    }
+    for ((choice, call), held) in tool {
+        let emitted = st
+            .engine
+            .unmask(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        st.guard.capture(
+            &format!("c{choice}t{call}"),
+            monitor::CapKind::ToolUse,
+            "tool_call",
+            &emitted,
+        );
+        let chunk = st.xform.envelope.tool_chunk(choice, call, emitted);
+        if let Ok(data) = serde_json::to_string(&chunk) {
+            st.queue.push_back(frame(None, &data));
+        }
+    }
 }
 
 fn enqueue(st: &mut StreamState, sse: SseEvent) {
     if sse.data.trim() == "[DONE]" {
+        // Flush any held tail BEFORE the terminal sentinel — a client stops reading at
+        // [DONE], so a tail emitted after it would be lost.
+        flush_held(st);
         st.queue.push_back(frame(sse.event.as_deref(), "[DONE]"));
         return;
     }
@@ -586,6 +708,15 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
                 .process(chunk, st.engine.as_ref(), st.manifest.as_ref());
             // Mirror the unmasked reply onto the monitor record as it streams.
             capture_chunk(&mut st.guard, &out);
+            // A finish_reason (or trailing usage) chunk is protocol-terminal for a client;
+            // flush any held tail BEFORE it so a client that stops at finish_reason still
+            // receives the final fragment, not only one that reads through to [DONE]. Real
+            // OpenAI streams carry finish_reason / usage in their own empty-delta chunk, so
+            // the flushed tail lands after the last content and before the terminal chunk.
+            let terminal = out.usage.is_some() || out.choices.iter().any(|c| c.finish_reason.is_some());
+            if terminal {
+                flush_held(st);
+            }
             if let Ok(data) = serde_json::to_string(&out) {
                 st.queue.push_back(frame(sse.event.as_deref(), &data));
             }
