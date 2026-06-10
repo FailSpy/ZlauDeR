@@ -284,6 +284,12 @@ pub enum TokenClass {
     /// (non-peekable). Defense-in-depth backstop to the C8 `Redact` default (cvv-plan.md
     /// Part 3 C8); the primary protection is that CVV redacts out of the box.
     Sad,
+    /// A `Local` ("owner-reveal") token (`Operator::Local`, today the proxy admin key):
+    /// REVEALED to the user on the display wire, but NON-peekable in the monitor — its
+    /// plaintext is re-masked to the handle in the captured reply (via `redaction_pairs`)
+    /// so the capture matches the re-masked re-send (fold-safe) and the monitor ledger
+    /// withholds the value, like a secret.
+    Local,
 }
 
 impl TokenClass {
@@ -316,6 +322,8 @@ impl TokenClass {
             TokenClass::Sad
         } else if e.broker {
             TokenClass::Broker
+        } else if e.local {
+            TokenClass::Local
         } else {
             TokenClass::AutoPii
         }

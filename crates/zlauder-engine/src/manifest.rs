@@ -21,6 +21,11 @@ pub struct ManifestEntry {
     /// only at the tool-input boundary, never on display. The monitor reads this to
     /// suppress the value from any `TokenPreview`, and the display unmask refuses it.
     pub broker: bool,
+    /// True iff this is a LOCAL "owner-reveal" token (`Operator::Local`): REVEALED on the
+    /// display path (so the user gets the value, e.g. the monitor URL) but REFUSED into
+    /// tool inputs unless the handle was promoted for the session. Mutually exclusive with
+    /// `broker`. The monitor treats it non-peekable (re-masked in the capture copy).
+    pub local: bool,
 }
 
 #[derive(Clone, Debug)]

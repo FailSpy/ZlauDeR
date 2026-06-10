@@ -93,8 +93,16 @@ pub(crate) fn redact_secret_values(text: &str, pairs: &[(String, String)]) -> St
 /// escape-free (CVV is digits; brokered secrets never egress on the display path), so this
 /// is defense-in-depth for any future escapable secret class. Longest-needle-first.
 pub(crate) fn json_body_redaction_pairs(manifest: &UnmaskManifest) -> Vec<(String, String)> {
+    json_body_expand(redaction_pairs(manifest))
+}
+
+/// Expand raw `(value, handle)` pairs into the json-body needle set: each value PLUS its
+/// JSON-escaped form (so a value embedded in a serialized body is matched in the escaped
+/// form the raw needle misses), longest-first. Shared by [`json_body_redaction_pairs`] and
+/// the capture scrub's session-`Local` pairs.
+pub(crate) fn json_body_expand(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for (value, handle) in redaction_pairs(manifest) {
+    for (value, handle) in pairs {
         if let Ok(json) = serde_json::to_string(&value) {
             // Strip the surrounding quotes serde adds, leaving the inner escaped form.
             let escaped = json[1..json.len().saturating_sub(1)].to_string();
@@ -207,6 +215,7 @@ mod tests {
             arrow_origin: Surface::UserMessage,
             exposed_at: None,
             broker,
+            local: false,
         }
     }
 
@@ -222,6 +231,37 @@ mod tests {
         assert!(
             !values.contains(&"joe@x.com".to_string()),
             "peekable PII must never be scrubbed (it is intentionally re-hydrated)"
+        );
+    }
+
+    // A `Local` (owner-reveal) token is REVEALED on the display wire, but the monitor must
+    // treat it non-peekable: its value is re-masked to the handle in the captured reply
+    // (so the capture matches the re-masked re-send → the fold converges) and withheld
+    // from the ledger preview.
+    #[test]
+    fn local_class_is_non_peekable_and_scrubbed() {
+        let mut m = UnmaskManifest::new();
+        let mut e = entry("0ee276deadbeef", "[ZLAUDER_ADMIN_KEY_aabbccddeeff]", "ZLAUDER_ADMIN_KEY", false);
+        e.local = true;
+        m.push(e);
+        assert_eq!(
+            TokenClass::for_manifest_entry(&m.entries[0]),
+            TokenClass::Local
+        );
+        assert!(!TokenClass::Local.is_peekable(), "Local must be non-peekable");
+        // In the capture redaction pairs (so a revealed reply is re-masked to the handle).
+        let pairs = redaction_pairs(&m);
+        assert!(
+            pairs
+                .iter()
+                .any(|(v, h)| v == "0ee276deadbeef" && h == "[ZLAUDER_ADMIN_KEY_aabbccddeeff]"),
+            "a Local value must be scrubbed back to its handle on the monitor copy"
+        );
+        // Ledger preview withholds the value.
+        let prev = token_previews(&m);
+        assert!(
+            prev[0].value.is_empty(),
+            "Local value must be withheld from the ledger preview"
         );
     }
 

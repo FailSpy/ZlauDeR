@@ -16,8 +16,8 @@ use super::model::{
     TokenPreview, TurnDelta,
 };
 use super::spans::{
-    json_body_redaction_pairs, now_ms, preview, redact_secret_values, redaction_pairs,
-    spans_from_manifest, spans_from_values, token_previews,
+    json_body_expand, json_body_redaction_pairs, now_ms, preview, redact_secret_values,
+    redaction_pairs, spans_from_manifest, spans_from_values, token_previews,
 };
 use super::surfaces::{surfaces_from_body, surfaces_from_response_body};
 
@@ -98,6 +98,14 @@ struct Inner {
     /// 500-record ring eviction and also captures count_tokens traffic that never
     /// becomes a record. Bounded by [`MAX_SESSION_TOKENS`] (oldest-evicted).
     session_tokens: HashMap<String, TokenLedgerEntry>,
+    /// Session-stable `Local` ("owner-reveal") `(plaintext, handle)` pairs (today the proxy
+    /// admin key). A `Local` value is REVEALED on the display path, so it can surface in a
+    /// captured reply CROSS-TURN — when the model echoes the token in a turn whose request
+    /// carries no plaintext there is no `local` manifest entry that turn, so the manifest-only
+    /// `redaction_pairs`/`json_body_redaction_pairs` would miss it. The capture scrub also
+    /// re-masks against this set, so the admin key never persists in a monitor record. Seeded
+    /// from the engine when the reserved admin-key rule (and any future Local secret) installs.
+    local_redactions: Vec<(String, String)>,
 }
 
 impl Default for Monitor {
@@ -123,9 +131,28 @@ impl Monitor {
                 last_seen: HashMap::new(),
                 labels: HashMap::new(),
                 session_tokens: HashMap::new(),
+                local_redactions: Vec::new(),
             })),
             events,
         }
+    }
+
+    /// Install the session-stable `Local` ("owner-reveal") `(plaintext, handle)` pairs the
+    /// capture scrub re-masks against (see [`Inner::local_redactions`]). The proxy calls this
+    /// when the reserved admin-key rule (and any future Local secret) installs — synchronously
+    /// BEFORE the listener serves, so no captured reply can predate it.
+    pub fn set_local_redactions(&self, pairs: Vec<(String, String)>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.local_redactions = pairs;
+        }
+    }
+
+    /// Snapshot of the session `Local` scrub pairs (cheap; one entry per Local secret).
+    fn local_redactions(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .map(|i| i.local_redactions.clone())
+            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> MonitorSnapshot {
@@ -399,7 +426,12 @@ impl Monitor {
         // CVV/secret the request side withholds — peekable PII stays re-hydrated. Computed
         // off the lock; the forwarded `out` buffer is untouched. The body is serialized
         // JSON, so match both the raw and JSON-escaped forms of each secret value.
-        let pairs = json_body_redaction_pairs(manifest);
+        let mut pairs = json_body_redaction_pairs(manifest);
+        // Re-mask any session `Local` ("owner-reveal") value too: the admin key revealed
+        // CROSS-TURN carries no `local` manifest entry this turn, so the manifest-derived
+        // pairs miss it — without this it would persist UNMASKED in the captured reply.
+        pairs.extend(json_body_expand(self.local_redactions()));
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let scrubbed: Option<Vec<u8>> = body.map(|b| {
             redact_secret_values(&String::from_utf8_lossy(b), &pairs).into_bytes()
         });
@@ -643,13 +675,19 @@ pub struct CompletionGuard {
 
 impl CompletionGuard {
     pub fn new(monitor: Monitor, id: String, status: u16, manifest: &UnmaskManifest) -> Self {
+        // Streaming scrub runs on already-extracted reply fragments (not a JSON body), so
+        // the raw `Local` pairs suffice here (no json-escape expansion). Union them with the
+        // manifest pairs so a CROSS-TURN-revealed admin key is re-masked before it is captured.
+        let mut redactions = redaction_pairs(manifest);
+        redactions.extend(monitor.local_redactions());
+        redactions.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         Self {
             monitor,
             id,
             status,
             armed: true,
             tokens: token_previews(manifest),
-            redactions: redaction_pairs(manifest),
+            redactions,
             capture: ResponseCapture::new(),
             flushed_len: 0,
         }
@@ -1562,6 +1600,7 @@ mod tests {
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
             broker: false,
+            local: false,
         });
         m
     }
@@ -1578,6 +1617,7 @@ mod tests {
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
             broker: false,
+            local: false,
         });
         m
     }
@@ -1627,6 +1667,62 @@ mod tests {
         assert!(!preview.contains("987"), "secret-class CVV must not be persisted: {preview}");
         assert!(preview.contains("[CVV_0001]"), "CVV re-masked to its handle: {preview}");
         assert!(preview.contains("joe@example.com"), "peekable email stays re-hydrated: {preview}");
+    }
+
+    #[test]
+    fn cross_turn_revealed_local_scrubbed_via_session_set() {
+        // Regression: a `Local` (owner-reveal) admin key revealed CROSS-TURN in a reply has NO
+        // `local` manifest entry that turn (the request carried only the token, not the
+        // plaintext), so the manifest-only scrub misses it. The monitor's session `Local` set
+        // (seeded from the engine) must still re-mask it, so the admin key never persists.
+        let m = Monitor::new();
+        m.set_local_redactions(vec![(
+            "AdminKeyPlain123".to_string(),
+            "[ZLAUDER_ADMIN_KEY_aabbccdd]".to_string(),
+        )]);
+        // The turn's request carries NO local plaintext → empty manifest (the gap condition).
+        let manifest = UnmaskManifest::new();
+        let id = m
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("show the url"))]), &manifest)
+            .id()
+            .to_string();
+        m.record_dispatched(&id);
+        // The relay forwarded the reply UNMASKED → the revealed admin key plaintext is present.
+        let reply = serde_json::to_vec(&json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "the monitor url key is AdminKeyPlain123 here"}]
+        }))
+        .unwrap();
+        m.record_response(&id, 200, Some(&reply), &manifest);
+        let preview = find(&m, &id).response_preview.unwrap();
+        assert!(!preview.contains("AdminKeyPlain123"), "admin key must NOT persist: {preview}");
+        assert!(
+            preview.contains("[ZLAUDER_ADMIN_KEY_aabbccdd]"),
+            "cross-turn admin key re-masked to its handle: {preview}"
+        );
+    }
+
+    #[test]
+    fn cross_turn_revealed_local_scrubbed_in_stream() {
+        // Same gap on the STREAMING path (`CompletionGuard`): the session `Local` set re-masks
+        // a cross-turn-revealed admin key captured from a streamed fragment.
+        let m = Monitor::new();
+        m.set_local_redactions(vec![(
+            "AdminKeyPlain123".to_string(),
+            "[ZLAUDER_ADMIN_KEY_aabbccdd]".to_string(),
+        )]);
+        let id = record(&m, &body(&[("user", json!("show the url"))]));
+        m.record_dispatched(&id);
+        // Empty manifest this turn (cross-turn reveal); the stream fragment carries the plaintext.
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200, &UnmaskManifest::new());
+        g.capture("t0", CapKind::Text, "assistant", "url key AdminKeyPlain123 done");
+        g.complete();
+        let preview = find(&m, &id).response_preview.unwrap();
+        assert!(!preview.contains("AdminKeyPlain123"), "admin key must NOT persist (stream): {preview}");
+        assert!(
+            preview.contains("[ZLAUDER_ADMIN_KEY_aabbccdd]"),
+            "cross-turn admin key re-masked to its handle (stream): {preview}"
+        );
     }
 
     #[test]
@@ -1688,6 +1784,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         m.ingest_session_tokens(&man);
@@ -1711,6 +1808,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         m.ingest_session_tokens(&old);
@@ -1730,6 +1828,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         m.ingest_session_tokens(&fresh);
@@ -1752,6 +1851,7 @@ mod tests {
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
             broker: false,
+            local: false,
         });
         m
     }
@@ -1813,6 +1913,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         m.ingest_session_tokens(&fill);
@@ -1830,6 +1931,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         m.ingest_session_tokens(&reuse);
@@ -1863,6 +1965,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         ingest_tokens_into(&mut guard, &fill, t, &HashMap::new());
@@ -1876,6 +1979,7 @@ mod tests {
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
                 broker: false,
+                local: false,
             });
         }
         ingest_tokens_into(&mut guard, &reuse, t, &HashMap::new()); // SAME `now` → ties the whole ledger
@@ -1932,6 +2036,7 @@ mod tests {
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
             broker: false,
+            local: false,
         }
     }
 

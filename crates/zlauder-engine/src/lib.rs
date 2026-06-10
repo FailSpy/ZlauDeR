@@ -25,13 +25,16 @@ pub use config::{
     ExposureRedactionScope, MlConfig, Operator, Profile, Quantization, RevealMarker, SaltScope,
 };
 pub use error::EngineError;
-pub use broker::{BrokerAllow, BrokerDecision, BrokerPolicy, DenyReason, DestRule};
+pub use broker::{
+    BrokerAllow, BrokerDecision, BrokerPolicy, DenyReason, DestRule, RESERVED_NONDEREF_SECRET,
+};
 pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
 pub use secrets::{SecretRule, SecretValue};
 pub use store::{Revealed, TokenKind};
 pub use surface::{Direction, Surface};
 pub use token::{
-    BROKER_PREFIX, MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, is_broker_token, make_token, token_regex,
+    BROKER_PREFIX, MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, is_broker_token, make_token, slugify,
+    token_regex,
 };
 
 use std::borrow::Cow;
@@ -69,17 +72,15 @@ impl Policy {
         // old config field parseable for compatibility, but do not let persisted
         // `fail_closed = false` or stale control-plane clients weaken the policy.
         config.fail_closed = true;
-        // `Operator::Broker` is reachable ONLY via a registered secret (it needs a
-        // secret name + a broker rule); reject it in the serialized PII operator
-        // surface so it can never appear in `WireConfig`/`GET /zlauder/config`.
-        if config.default_operator == Operator::Broker
-            || config
-                .entity_operators
-                .values()
-                .any(|op| *op == Operator::Broker)
-        {
+        // `Operator::Broker` and `Operator::Local` are reachable ONLY via a registered
+        // secret (they need a secret name); reject them in the serialized PII operator
+        // surface so they can never appear in `WireConfig`/`GET /zlauder/config`. (Local
+        // is also `#[serde(skip)]`, so this is belt-and-suspenders for a programmatic
+        // config; the message stays specific to what a user can actually type.)
+        let bad_op = |op: &Operator| *op == Operator::Broker || *op == Operator::Local;
+        if bad_op(&config.default_operator) || config.entity_operators.values().any(bad_op) {
             return Err(EngineError::InvalidSecret(
-                "Operator::Broker is only valid for a registered secret, \
+                "Operator::Broker/Local is only valid for a registered secret, \
                  not default_operator/entity_operators"
                     .into(),
             ));
@@ -385,13 +386,31 @@ impl MaskEngine {
     }
 
     /// Install (hot-swap) the registered-secret set. Recompiles matchers and
-    /// recomputes `secrets_fp`; the session store is untouched (already-minted broker
-    /// tokens keep resolving). A registration error (invalid operator, empty value,
+    /// recomputes `secrets_fp`; the session store is untouched EXCEPT that each `Local`
+    /// ("owner-reveal") secret's token is eagerly interned now (so the monitor capture seed
+    /// is populated from install — see the loop below), and already-minted broker/local
+    /// tokens keep resolving. A registration error (invalid operator, empty value,
     /// broker slug collision) leaves the previous set in place. Registering/rotating
     /// moves `secrets_fp` → a fresh cache key space (stale detections age out by LRU).
     pub fn set_secret_rules(&self, rules: Vec<SecretRule>) -> Result<(), EngineError> {
         let compiled = compile_secrets(rules)?;
         let secrets_fp = secrets_fingerprint(&compiled);
+        // Eagerly intern each LOCAL ("owner-reveal") secret's token NOW, at install — so its
+        // deterministic handle exists in the store BEFORE the first masking turn. The monitor
+        // seeds its capture-scrub set from the store (`local_redaction_pairs`); without this
+        // eager intern that seed would be EMPTY until the first admin-key masking turn (tokens
+        // are otherwise minted lazily by `mask()`), and a cross-turn reveal in the gap could
+        // persist the admin key unmasked. `intern_local` is mint-or-reuse + deterministic and
+        // keys off the secret `name` exactly as `mask()` does (`d.entity_type == name`), so the
+        // install handle equals the masked handle; the REPLACE re-install is an idempotent no-op.
+        for c in &compiled {
+            if c.operator == Operator::Local {
+                self.store
+                    .lock()
+                    .expect("store mutex poisoned")
+                    .intern_local(&c.name, c.value())?;
+            }
+        }
         let set = SecretSet {
             compiled,
             secrets_fp,
@@ -726,6 +745,27 @@ impl MaskEngine {
                         arrow_origin: surface,
                         exposed_at: Some(start..start + token.len()),
                         broker: false,
+                        local: false,
+                    });
+                    token
+                }
+                Operator::Local => {
+                    // Owner-reveal: reversible token (standard grammar, so the display
+                    // unmask resolves it), but `local: true` ⇒ the tool-input unmask
+                    // refuses it unless the handle is promoted. Reachable only via a
+                    // registered secret (the proxy admin key).
+                    let token = {
+                        let mut store = self.store.lock().expect("store mutex poisoned");
+                        store.intern_local(&d.entity_type, slice)?
+                    };
+                    manifest.push(ManifestEntry {
+                        canonical_form: slice.to_string(),
+                        token_handle: token.clone(),
+                        entity_kind: d.entity_type.clone(),
+                        arrow_origin: surface,
+                        exposed_at: Some(start..start + token.len()),
+                        broker: false,
+                        local: true,
                     });
                     token
                 }
@@ -745,6 +785,7 @@ impl MaskEngine {
                         arrow_origin: surface,
                         exposed_at: Some(start..start + token.len()),
                         broker: true,
+                        local: false,
                     });
                     token
                 }
@@ -977,7 +1018,9 @@ impl MaskEngine {
     /// tokens minted in earlier turns). Never re-masks; unknown tokens are left
     /// verbatim.
     pub fn unmask(&self, text: &str, manifest: &UnmaskManifest) -> Result<String, EngineError> {
-        self.unmask_inner(text, manifest, None)
+        // Tool-input / compaction / citation path (Arrow 3 + machine context): `Local`
+        // ("owner-reveal") tokens are REFUSED here (left verbatim) unless promoted.
+        self.unmask_inner(text, manifest, None, false)
     }
 
     /// Unmask assistant prose (Arrow 2 → display) and, when the live config's
@@ -993,7 +1036,9 @@ impl MaskEngine {
     ) -> Result<String, EngineError> {
         let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
         let marker = &policy.config.reveal_marker;
-        self.unmask_inner(text, manifest, marker.is_active().then_some(marker))
+        // Display path (Arrow 2 → the user): `Local` ("owner-reveal") tokens ARE revealed
+        // here so the user sees their own value (e.g. the monitor URL the model relays).
+        self.unmask_inner(text, manifest, marker.is_active().then_some(marker), true)
     }
 
     /// Strip the terminal reveal-marker decoration from already-unmasked assistant
@@ -1020,6 +1065,10 @@ impl MaskEngine {
         text: &str,
         manifest: &UnmaskManifest,
         marker: Option<&RevealMarker>,
+        // True ONLY on the display path (`unmask_assistant`): reveal `Local` ("owner-
+        // reveal") tokens. False everywhere else (tool input / compaction / citation),
+        // where a `Local` token is refused unless its handle was promoted this session.
+        reveal_local: bool,
     ) -> Result<String, EngineError> {
         let store = self.store.lock().expect("store mutex poisoned");
         let re = token_regex();
@@ -1038,12 +1087,26 @@ impl MaskEngine {
                 last = m.end();
                 continue;
             }
+            // LOCAL ("owner-reveal") tokens: within-turn the manifest entry's `local`
+            // flag is authoritative; cross-turn fall back to the store kind. On the
+            // tool/non-display path they are refused (left verbatim) unless the handle
+            // was promoted for the session — mirroring the broker tool-deny, but with the
+            // display path allowed.
+            let mentry = manifest.entries.iter().find(|e| e.token_handle == tok);
+            let is_local = mentry.map_or_else(|| store.is_local(tok), |e| e.local);
+            if is_local && !reveal_local && !store.is_tool_promoted(tok) {
+                out.push_str(tok);
+                last = m.end();
+                continue;
+            }
             // Resolve to plaintext (manifest first, then the cross-turn store); only a
-            // genuine resolution is wrapped — an unknown token stays verbatim.
-            let plain = manifest
-                .lookup(tok)
-                .map(str::to_string)
-                .or_else(|| store.reveal(tok));
+            // genuine resolution is wrapped — an unknown token stays verbatim. A `Local`
+            // token resolves cross-turn via the kind-gated `reveal_for`.
+            let plain = mentry.map(|e| e.canonical_form.clone()).or_else(|| {
+                store
+                    .reveal(tok)
+                    .or_else(|| store.reveal_for(tok, TokenKind::Local).map(|r| r.value))
+            });
             match (plain, marker) {
                 (Some(p), Some(mk)) => out.push_str(&mk.wrap(&p)),
                 (Some(p), None) => out.push_str(&p),
@@ -1056,8 +1119,10 @@ impl MaskEngine {
 
         // Custom literal tokens that don't match the standard token grammar.
         for e in &manifest.entries {
-            // Never reveal a broker value on the display path.
-            if e.broker {
+            // Never reveal a broker value on the display path; a `local` custom literal
+            // (none today — `Local` mints standard-grammar tokens) is likewise skipped
+            // here so it can never bypass the surface-aware gate above.
+            if e.broker || e.local {
                 continue;
             }
             if !re.is_match(&e.token_handle) {
@@ -1077,6 +1142,30 @@ impl MaskEngine {
             .lock()
             .expect("store mutex poisoned")
             .reveal(token)
+    }
+
+    /// Promote a `Local` ("owner-reveal") token handle for SESSION tool-input use — the
+    /// operator's "allow this value into tool inputs" action. After this, the tool-input
+    /// unmask resolves the handle (instead of refusing it) for the rest of the session;
+    /// never persisted. Scaffolding for the deferred monitor promote UI — no reachable
+    /// caller wires it yet, so by default every `Local` token stays tool-denied.
+    pub fn promote_token(&self, token: &str) {
+        self.store
+            .lock()
+            .expect("store mutex poisoned")
+            .promote(token);
+    }
+
+    /// Session-wide `Local` ("owner-reveal") `(plaintext, handle)` pairs, for the monitor
+    /// capture scrub. A `Local` value is revealed on the display path, so it can surface in
+    /// a captured reply CROSS-TURN (no `local` manifest entry that turn); re-masking against
+    /// this set keeps the admin key out of the persisted monitor record. The proxy seeds the
+    /// monitor with this when the reserved admin-key rule (and any future Local secret) installs.
+    pub fn local_redaction_pairs(&self) -> Vec<(String, String)> {
+        self.store
+            .lock()
+            .expect("store mutex poisoned")
+            .local_pairs()
     }
 
     /// Export the session key + salt so a sibling process can decrypt for audit.
@@ -2608,6 +2697,117 @@ mod tests {
         // ...also via the assistant (marker-capable) display path.
         let shown2 = e.unmask_assistant(&out.masked_text, &out.manifest).unwrap();
         assert!(!shown2.contains("sk-LIVE-9999"));
+    }
+
+    // `local` (owner-reveal): minted as a standard `[ENTITY_hex]` token (NOT broker-
+    // prefixed); REVEALED on the display path so the user gets the value, but REFUSED into
+    // tool inputs until the handle is promoted for the session.
+    #[test]
+    fn local_secret_reveals_on_display_denies_tool_until_promoted() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("zlauder_admin_key", "AdminKeyValue123", Operator::Local)])
+            .unwrap();
+        let out = e
+            .mask("open AdminKeyValue123 now", Surface::UserMessage)
+            .unwrap();
+        assert!(!out.masked_text.contains("AdminKeyValue123"), "value leaked: {}", out.masked_text);
+        assert!(
+            out.masked_text.contains("[ZLAUDER_ADMIN_KEY_"),
+            "expected standard Local token, got {}",
+            out.masked_text
+        );
+        assert!(!out.masked_text.contains("[BROKER__"), "Local must not be broker-prefixed");
+
+        let token = out.manifest.entries[0].token_handle.clone();
+
+        // DISPLAY (Arrow 2): revealed.
+        assert!(
+            e.unmask_assistant(&out.masked_text, &out.manifest).unwrap().contains("AdminKeyValue123"),
+            "Local must reveal on the display path"
+        );
+        // TOOL INPUT (Arrow 3): refused — left as the token (this is the real deny gate,
+        // exercised directly on `unmask`, the function tool-input strings route through).
+        let tool = e.unmask(&out.masked_text, &out.manifest).unwrap();
+        assert!(!tool.contains("AdminKeyValue123"), "Local must NOT reveal into a tool input: {tool}");
+        assert!(tool.contains("[ZLAUDER_ADMIN_KEY_"));
+
+        // PROMOTE the handle for the session → now the tool path resolves it too.
+        e.promote_token(&token);
+        assert!(
+            e.unmask(&out.masked_text, &out.manifest).unwrap().contains("AdminKeyValue123"),
+            "a promoted Local token must resolve on the tool-input path"
+        );
+        // Display still reveals (unaffected by promote).
+        assert!(e.unmask_assistant(&out.masked_text, &out.manifest).unwrap().contains("AdminKeyValue123"));
+    }
+
+    // Cross-turn: a Local token echoed in a LATER turn (no manifest entry this turn) is
+    // still display-revealed / tool-denied via the store kind, using an EMPTY manifest.
+    #[test]
+    fn local_token_cross_turn_via_store_kind() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("zlauder_admin_key", "AdminKeyValue123", Operator::Local)])
+            .unwrap();
+        let minted = e.mask("AdminKeyValue123", Surface::UserMessage).unwrap();
+        let token = minted.manifest.entries[0].token_handle.clone();
+        let line = format!("see {token} there");
+        let empty = UnmaskManifest::new();
+        // Display: revealed cross-turn (store kind = Local).
+        assert!(e.unmask_assistant(&line, &empty).unwrap().contains("AdminKeyValue123"));
+        // Tool: refused cross-turn.
+        assert!(!e.unmask(&line, &empty).unwrap().contains("AdminKeyValue123"));
+        assert!(e.unmask(&line, &empty).unwrap().contains(&token));
+    }
+
+    // Regression (monitor capture seed): a `Local` secret is interned at `set_secret_rules`
+    // time, so `local_redaction_pairs()` returns its (value → handle) pair BEFORE any mask()
+    // call. Without the eager intern the pair appears only after the first admin-key masking
+    // turn, so the monitor's capture-scrub seed would be empty and a cross-turn reveal in the
+    // gap could persist the admin key unmasked. The install handle must equal the masked one.
+    #[test]
+    fn local_redaction_pairs_seeded_at_install_not_lazily() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule(
+            "zlauder_admin_key",
+            "AdminKeyValue123",
+            Operator::Local,
+        )])
+        .unwrap();
+        // BEFORE any mask() call the pair is already present.
+        let pairs = e.local_redaction_pairs();
+        assert_eq!(pairs.len(), 1, "the Local secret must be interned at install");
+        assert_eq!(pairs[0].0, "AdminKeyValue123");
+        assert!(pairs[0].1.starts_with("[ZLAUDER_ADMIN_KEY_"), "got {}", pairs[0].1);
+        // The install-seeded handle must equal the one a real mask() mints (same name).
+        let out = e.mask("AdminKeyValue123", Surface::UserMessage).unwrap();
+        assert_eq!(
+            pairs[0].1, out.manifest.entries[0].token_handle,
+            "install-seeded handle must match the masked handle"
+        );
+    }
+
+    // `Operator::Local` is internal-only: it can't be set via serialized config (serde
+    // skip) nor via `default_operator`/`entity_operators` (rejected in `Policy::new`).
+    #[test]
+    fn local_operator_is_not_user_settable() {
+        assert!(
+            serde_json::from_str::<Operator>(r#"{"kind":"local"}"#).is_err(),
+            "Operator::Local must not be deserializable from config"
+        );
+        let cfg = EngineConfig {
+            default_operator: Operator::Local,
+            ..Default::default()
+        };
+        assert!(
+            MaskEngine::new(cfg).is_err(),
+            "Local as default_operator must be rejected"
+        );
+        let mut cfg2 = EngineConfig::default();
+        cfg2.entity_operators.insert("EMAIL_ADDRESS".into(), Operator::Local);
+        assert!(
+            MaskEngine::new(cfg2).is_err(),
+            "Local in entity_operators must be rejected"
+        );
     }
 
     // A9: a registered secret that also matches the allow-list is STILL masked.

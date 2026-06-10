@@ -24,6 +24,9 @@ use crate::token::{BROKER_PREFIX, make_token, slugify};
 pub enum TokenKind {
     Pii,
     Broker,
+    /// "Owner-reveal" (local): reversible like `Pii`, but the display path reveals it
+    /// while the tool-input path refuses it unless the handle is in `tool_promoted`.
+    Local,
 }
 
 /// A successful kind-gated reveal: the plaintext plus, for a broker token, the EXACT
@@ -55,6 +58,11 @@ pub struct SessionStore {
     /// persists these handles (DeletionLog) and replays them on restart so a
     /// salt-stable token can't resurrect after a checkpoint restore.
     tombstoned: HashSet<String>,
+    /// Session-only set of `Local` token handles the operator has explicitly promoted
+    /// for tool-input use ("allow this value into tool inputs"). In-memory, NEVER
+    /// persisted — a fresh process starts with every local token tool-denied. Empty
+    /// until the (deferred) promote UI/endpoint sets it.
+    tool_promoted: HashSet<String>,
 }
 
 impl Default for SessionStore {
@@ -75,6 +83,7 @@ impl SessionStore {
             salt,
             token_map: HashMap::new(),
             tombstoned: HashSet::new(),
+            tool_promoted: HashSet::new(),
         }
     }
 
@@ -86,6 +95,7 @@ impl SessionStore {
             salt,
             token_map: HashMap::new(),
             tombstoned: HashSet::new(),
+            tool_promoted: HashSet::new(),
         }
     }
 
@@ -101,6 +111,7 @@ impl SessionStore {
             salt,
             token_map: HashMap::new(),
             tombstoned: HashSet::new(),
+            tool_promoted: HashSet::new(),
         }
     }
 
@@ -174,6 +185,19 @@ impl SessionStore {
         Ok(token)
     }
 
+    /// Mint-or-reuse a deterministic LOCAL ("owner-reveal") token for a registered secret
+    /// `name`. Reversible like [`Self::intern`] (standard `[ENTITY_xxx]` grammar, NOT a
+    /// `[BROKER__…]` prefix, so the display unmask resolves it), but `kind: Local`, so the
+    /// tool-input unmask refuses it unless the handle was promoted. The name is slugified
+    /// (like [`Self::intern_broker`]) so a name with a space/punctuation still mints a
+    /// token-grammar-safe handle (today `Local` is bound to the clean `zlauder_admin_key`,
+    /// but this keeps the door open for other owner-reveal secrets).
+    pub fn intern_local(&mut self, name: &str, plaintext: &str) -> Result<String, EngineError> {
+        let token = make_token(&slugify(name), plaintext, &self.salt);
+        self.insert_if_absent(token.clone(), plaintext, TokenKind::Local, None, None)?;
+        Ok(token)
+    }
+
     fn insert_if_absent(
         &mut self,
         token: String,
@@ -234,6 +258,48 @@ impl SessionStore {
         })
     }
 
+    /// Every live LOCAL ("owner-reveal") token as a `(plaintext, handle)` pair. The monitor
+    /// capture uses this to re-mask a `Local` value (the admin key) that is revealed on the
+    /// display path and so can appear in a captured reply CROSS-TURN — when the model echoes
+    /// the token in a turn whose request carries no plaintext, there is no `local` manifest
+    /// entry that turn, so the manifest-only capture scrub would miss it. Tiny (one entry per
+    /// Local secret); plaintext is decrypted in-process and handed straight back to the scrub.
+    pub fn local_pairs(&self) -> Vec<(String, String)> {
+        self.token_map
+            .iter()
+            .filter(|(_, e)| e.kind == TokenKind::Local && Self::live(e))
+            .filter_map(|(handle, e)| {
+                self.decrypt(&e.original_encrypted, &e.nonce)
+                    .ok()
+                    .map(|plain| (plain, handle.clone()))
+            })
+            .collect()
+    }
+
+    /// True iff `token` is a known LOCAL ("owner-reveal") token. Used by the unmask path
+    /// to decide tool-input refusal for a token minted in an EARLIER turn (no manifest
+    /// entry this turn). Within-turn the manifest's `local` flag is authoritative.
+    pub fn is_local(&self, token: &str) -> bool {
+        self.token_map
+            .get(token)
+            .is_some_and(|e| e.kind == TokenKind::Local)
+    }
+
+    /// Promote a `Local` token handle for SESSION tool-input use ("allow into tools").
+    /// ONLY a `Local` handle is accepted: a `Pii` token already resolves into tools (so
+    /// promoting it is meaningless) and a `Broker`/unknown token never consults this set,
+    /// so the `tool_promoted` set is kept to exactly its documented contents. In-memory only.
+    pub fn promote(&mut self, token: &str) {
+        if matches!(self.token_map.get(token), Some(e) if e.kind == TokenKind::Local) {
+            self.tool_promoted.insert(token.to_string());
+        }
+    }
+
+    /// True iff `token` was promoted for tool-input use this session.
+    pub fn is_tool_promoted(&self, token: &str) -> bool {
+        self.tool_promoted.contains(token)
+    }
+
     /// Delete (tombstone) a token: removes the entry and records the handle so it can
     /// never resolve or be re-interned again. Returns whether it was present.
     pub fn delete(&mut self, token: &str) -> bool {
@@ -270,6 +336,34 @@ mod tests {
         assert_eq!(r.value, "hunter2");
         assert_eq!(r.secret_name.as_deref(), Some("db_password"));
         // A PII-kind reveal of a broker token is `None`.
+        assert!(s.reveal_for(&tok, TokenKind::Pii).is_none());
+    }
+
+    #[test]
+    fn promote_accepts_only_local_handles() {
+        let mut s = SessionStore::new();
+        let local = s.intern_local("ZLAUDER_ADMIN_KEY", "k").unwrap();
+        let pii = s.intern("EMAIL_ADDRESS", "a@b.com").unwrap();
+        let broker = s.intern_broker("db", "v", None).unwrap();
+        s.promote(&local);
+        s.promote(&pii); // no-op: Pii already resolves into tools
+        s.promote(&broker); // no-op: brokers never consult this set
+        s.promote("[NOPE_000000000000]"); // no-op: unknown handle
+        assert!(s.is_tool_promoted(&local), "a Local handle must be promotable");
+        assert!(!s.is_tool_promoted(&pii), "a Pii handle must not enter the promote set");
+        assert!(!s.is_tool_promoted(&broker), "a broker handle must not enter the promote set");
+    }
+
+    #[test]
+    fn local_token_reveals_as_pii_path_no_then_local_yes() {
+        let mut s = SessionStore::new();
+        let tok = s.intern_local("ZLAUDER_ADMIN_KEY", "adminval").unwrap();
+        assert!(tok.starts_with("[ZLAUDER_ADMIN_KEY_"), "got {tok}");
+        assert!(s.is_local(&tok));
+        // `reveal` (Pii-gated display fallback) does NOT resolve a Local token...
+        assert_eq!(s.reveal(&tok), None);
+        // ...it resolves via the kind-gated Local path.
+        assert_eq!(s.reveal_for(&tok, TokenKind::Local).unwrap().value, "adminval");
         assert!(s.reveal_for(&tok, TokenKind::Pii).is_none());
     }
 

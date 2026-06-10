@@ -273,6 +273,15 @@ pub enum Operator {
     /// a registered secret — rejected in `default_operator`/`entity_operators`
     /// (it is meaningless without a registered secret name + a broker rule).
     Broker,
+    /// Reversible "owner-reveal" (local) token: masked on the wire (the provider sees a
+    /// token), REVEALED on the display path (Arrow 2 → the user) so the model can relay
+    /// it, but REFUSED into tool inputs (Arrow 3) unless the operator promotes the handle
+    /// for the session. For the user's OWN credential (the proxy admin key) — fine to show
+    /// *them*, never to a tool/provider. Reachable ONLY via a registered secret (rejected
+    /// in `default_operator`/`entity_operators`, like `Broker`); `#[serde(skip)]` so it can
+    /// never be set through serialized config or appear in a config snapshot.
+    #[serde(skip)]
+    Local,
     /// Detected but left verbatim (e.g. an allow-list-by-policy passthrough).
     Keep,
 }

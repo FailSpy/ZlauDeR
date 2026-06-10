@@ -211,6 +211,7 @@ fn operator_tag(op: Operator) -> u8 {
         Operator::Hash => 3,
         Operator::Broker => 4,
         Operator::Keep => 5,
+        Operator::Local => 6,
     }
 }
 

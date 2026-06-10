@@ -92,6 +92,15 @@ async fn main() -> anyhow::Result<()> {
     // the key itself — so the 0600 state file grants control-plane access but not
     // offline decryption of the transcript.
     let admin_key = engine.control_token();
+    // Reserved `Local` (owner-reveal) secret: mask the proxy's OWN admin key so a model
+    // that echoes it (e.g. the monitor URL) cannot splice it into a tool argument — yet it
+    // is still REVEALED on the display path, so the relayed URL works. Install it
+    // SYNCHRONOUSLY before serving and FAIL CLOSED — if the engine rejects the rule we
+    // refuse to serve rather than serve with the admin key on the auto-PII unmask path.
+    // The background secret resolve (below) re-prepends it, so this is not clobbered.
+    engine
+        .set_secret_rules(vec![proxy_secrets::admin_key_rule(&admin_key)])
+        .context("installing the reserved admin-key (Local) rule")?;
     let http = reqwest::Client::builder()
         .build()
         .context("building HTTP client")?;
@@ -119,6 +128,17 @@ async fn main() -> anyhow::Result<()> {
     let engine_for_secrets = state.engine.clone();
     let secrets_ready = state.secrets_ready.clone();
     let secrets_status = state.secrets_status.clone();
+    // The background resolve re-installs ALL rules (REPLACE), so it must re-prepend the
+    // reserved admin-key rule or it would clobber the synchronous install above.
+    let admin_key_for_secrets = admin_key.clone();
+    // Seed the monitor's session `Local` scrub set BEFORE serving, so a CROSS-TURN-revealed
+    // admin key is re-masked out of the captured reply (the manifest-only capture scrub would
+    // miss a `Local` value with no current-turn manifest entry). The clone shares the monitor's
+    // inner; the background resolve re-sets it in case the REPLACE adds further Local rules.
+    let monitor_for_secrets = state.monitor.clone();
+    state
+        .monitor
+        .set_local_redactions(state.engine.local_redaction_pairs());
     let app = routes::router(state);
     let addr = format!("{bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -155,9 +175,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let registry =
                 zlauder_secrets::default_registry(Some(PathBuf::from(&proot_for_secrets)));
-            let (status, all_ok) =
-                proxy_secrets::resolve_and_install(&secret_specs, &engine_for_secrets, &registry)
-                    .await;
+            let (status, all_ok) = proxy_secrets::resolve_and_install(
+                &secret_specs,
+                &engine_for_secrets,
+                &registry,
+                &admin_key_for_secrets,
+            )
+            .await;
+            // The REPLACE re-installed the Local rule(s); refresh the monitor's scrub set.
+            monitor_for_secrets
+                .set_local_redactions(engine_for_secrets.local_redaction_pairs());
             let (resolved, total) = (status.resolved(), status.entries.len());
             if let Ok(mut slot) = secrets_status.write() {
                 *slot = status;

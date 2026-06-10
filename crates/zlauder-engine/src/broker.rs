@@ -22,6 +22,14 @@ use globset::{Glob, GlobMatcher};
 
 use crate::error::EngineError;
 
+/// The reserved registered-secret NAME for the proxy's own admin/control token. It is
+/// registered with `Operator::Local` (owner-reveal): masked on the wire, REVEALED on the
+/// display path (so the monitor URL the model relays works), and REFUSED into tool inputs
+/// (the `Local` class denies it on the tool path — it is not a broker token, so it never
+/// reaches `broker_resolve_leaf`). Used by the proxy's `admin_key_rule` and the slug-based
+/// reserved-name rejection guard. The "non-deref" name reflects the tool-input denial.
+pub const RESERVED_NONDEREF_SECRET: &str = "zlauder_admin_key";
+
 /// The full broker policy: an ordered allow-list over a default-deny base.
 #[derive(Clone, Default)]
 pub struct BrokerPolicy {
