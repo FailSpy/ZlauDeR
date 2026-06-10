@@ -13,7 +13,11 @@
      TokenRef        { token, value, entity_kind, surface }
      TurnDelta       { prev_turn?, is_first, prev_unavailable, added_surface_hashes[] }
      ConversationMeta{ id, label, turn_count, last_updated_ms, pending_count }
+     ResponseProgress{ id, status, response_preview, response_surfaces[] }  // SSE 'response_progress'
    Surfaces are rendered run-by-run with ZERO client offset arithmetic.
+   The sidebar conversation list is recomputed CLIENT-side from records (server labels
+   seed convoLabels) so a brand-new thread appears live on its first 'record' frame
+   instead of only on the next full snapshot.
    ============================================================ */
 
 /* ---------- key handling (x-zlauder-key + EventSource ?key=) ---------- */
@@ -28,6 +32,7 @@ function api(path, opts = {}) { opts.headers = { ...(opts.headers || {}), ...hdr
 /* ---------- state ---------- */
 let records = [];
 let conversations = [];
+let convoLabels = {};             // id -> label (server-authoritative from snapshots; derived for new threads)
 let selectedId = null;
 let channelFilter = null;
 let channelQuery = '';
@@ -512,13 +517,21 @@ function renderReview() {
 
   const respSurfaces = r.response_surfaces || [];
   const respHasTokenRun = respSurfaces.some(s => (s.runs || []).some(run => run.token));
+  const streaming = r.decision === 'in_flight';
   const hasResp = r.response_preview != null || respSurfaces.length;
-  const fullResponse = hasResp ? `<details class="panel">`
-    + `<summary><span class="panel-title">RESPONSE</span><span class="panel-count">${r.response_status ? 'HTTP ' + r.response_status : ''}</span></summary>`
+  // Auto-open while the reply streams so the operator watches it land; the live badge
+  // makes the in-progress state unmistakable. Count shows HTTP status once finalized.
+  const respCount = streaming
+    ? `<span class="stream-live">&#9679; streaming</span>`
+    : (r.response_status ? 'HTTP ' + r.response_status : '');
+  const fullResponse = (hasResp || streaming) ? `<details class="panel"${streaming ? ' open' : ''}>`
+    + `<summary><span class="panel-title">RESPONSE</span><span class="panel-count">${respCount}</span></summary>`
     + `<div class="panel-body">`
-    +   (respHasTokenRun
-          ? respSurfaces.map(s => renderSurface(s, null)).join('')
-          : `<pre class="payload">${renderSpanned(r.response_preview, r.response_spans)}</pre>`)
+    +   (hasResp
+          ? (respHasTokenRun
+              ? respSurfaces.map(s => renderSurface(s, null)).join('')
+              : `<pre class="payload">${renderSpanned(r.response_preview, r.response_spans)}</pre>`)
+          : `<div class="empty-note">Waiting for the model&rsquo;s reply&hellip;</div>`)
     + `</div></details>`
     : '';
 
@@ -530,6 +543,63 @@ function renderReview() {
     + `</div></div></details>`;
 
   d.innerHTML = head + verdict + plaintextBlock + spotlight + tokenLedger + fullRequest + fullResponse + tagComposer;
+}
+
+/* ============================================================
+   CONVERSATIONS derived client-side from records
+   The server computes the same list (store.rs conversations_from_records), but only
+   ships it on full snapshots. Mirroring it here means a new thread (and growing turn
+   counts) shows the instant its 'record' frame lands — no refresh, no filter-clearing.
+   Server labels seed convoLabels; an unseen thread derives one from its surfaces the
+   same way the server does (first genuine user message, skipping harness scaffolding).
+   ============================================================ */
+function deriveLabel(rec) {
+  const surfaces = rec.request_surfaces || [];
+  const notHarness = s => s.provenance !== 'harness_frame' && s.provenance !== 'harness_meta';
+  const pick = surfaces.find(s => s.provenance === 'user_input')
+    || surfaces.find(s => s.kind === 'message' && s.role === 'user' && notHarness(s))
+    || surfaces.find(s => s.kind === 'message' && notHarness(s));
+  if (!pick) return null;
+  const text = (pick.runs || []).map(r => r.text).join('').split(/\s+/).filter(Boolean).join(' ');
+  if (!text) return null;
+  const chars = [...text];
+  return chars.length > 48 ? chars.slice(0, 48).join('') + '…' : text;
+}
+/* Mirror of server store.rs::conversation_label — the fallback when no message snippet is
+   derivable, so the live sidebar matches the next snapshot's label instead of flashing the
+   raw id. (endpoint leaf + last-6 id tail, e.g. "messages · a1b2c3".) */
+function conversationLabel(endpoint, id) {
+  const parts = String(endpoint || '').split(/[/:]/).filter(Boolean);
+  const leaf = parts.length ? parts[parts.length - 1] : String(endpoint || '');
+  id = String(id || '').trim();
+  if (id === 'unknown' || id === '') return `${leaf} · unknown`;
+  const chars = [...id];
+  const tail = chars.length > 6 ? chars.slice(-6).join('') : id;
+  return tail === id ? id : `${leaf} · ${tail}`;
+}
+function conversationsFromRecords() {
+  const metas = new Map();
+  for (const r of records) {
+    let m = metas.get(r.conversation_id);
+    if (!m) {
+      // Cache ONLY a real derived snippet — never the fallback — so a later turn whose
+      // transcript surfaces the genuine prompt upgrades a thread that opened unlabeled.
+      let label = convoLabels[r.conversation_id];
+      if (label == null) {
+        const derived = deriveLabel(r);
+        if (derived) { label = derived; convoLabels[r.conversation_id] = derived; }
+        else label = conversationLabel(r.endpoint, r.conversation_id);
+      }
+      m = { id: r.conversation_id, label, turn_count: 0, last_updated_ms: 0, pending_count: 0 };
+      metas.set(r.conversation_id, m);
+    }
+    // Human turns (one prompt + its tool cycle = one turn); fall back to per-request index.
+    const ht = r.human_turn_index > 0 ? r.human_turn_index : r.turn_index;
+    m.turn_count = Math.max(m.turn_count, ht);
+    m.last_updated_ms = Math.max(m.last_updated_ms, Number(r.updated_ms));
+    if (r.decision === 'pending') m.pending_count++;
+  }
+  return [...metas.values()].sort((a, b) => b.last_updated_ms - a.last_updated_ms);
 }
 
 /* ============================================================
@@ -1253,8 +1323,11 @@ let lastSnap = null;
 function applySnapshot(s) {
   lastSnap = s;
   records = s.records || [];
-  conversations = s.conversations || [];
   sessionTokens = s.session_tokens || [];
+  // Server labels are authoritative — seed the cache, then derive the list from records so
+  // snapshot and live 'record' frames build conversations through the SAME path.
+  for (const c of (s.conversations || [])) convoLabels[c.id] = c.label;
+  conversations = conversationsFromRecords();
   if (typeof s.approval_timeout_secs === 'number') approvalTimeoutMs = s.approval_timeout_secs * 1000;
   // In OBSERVE-ONLY there is nothing to approve, so default the traffic view to
   // live activity instead of an always-empty pending queue. A hold posture keeps
@@ -1296,6 +1369,9 @@ es.onmessage = e => {
     const wasSelectedPending = rec.id === selectedId;
     const prev = records.find(r => r.id === rec.id);
     records = [rec, ...records.filter(r => r.id !== rec.id)];
+    // Recompute the sidebar from records so a NEW conversation (or a fresh turn) appears
+    // live on this frame — it otherwise only refreshed on the next full snapshot.
+    conversations = conversationsFromRecords();
     // Augment the durable ledger live from this record's tokens — the AUTO-DETECTED
     // list otherwise only refreshes on full snapshots (per-record SSE frames carry no
     // session_tokens). Dedup by token handle; the next snapshot reconciles to the
@@ -1328,6 +1404,18 @@ es.onmessage = e => {
     autoSelect();
     render(isNew ? rec.id : null);
     if (isNew && rec.decision === 'pending') toast(`HOLD &mdash; turn ${rec.turn_index} awaiting review`, 'bad');
+  } else if (ev.event === 'response_progress') {
+    // The model's reply is streaming back. Merge the (small) response delta onto the
+    // matching record so the RESPONSE panel paints live — no full-record re-broadcast,
+    // no waiting for the next turn to resend it as transcript.
+    const p = ev.data;
+    const rec = records.find(r => r.id === p.id);
+    if (rec) {
+      rec.response_preview = p.response_preview;
+      rec.response_surfaces = p.response_surfaces;
+      rec.response_status = p.status;
+      if (selectedId === p.id) renderReview();
+    }
   } else if (ev.event === 'policy') {
     // The live masking policy moved (this panel, the /zlauder:privacy CLI, or another
     // window). Re-sync the controls so the panel never drifts from the real policy.

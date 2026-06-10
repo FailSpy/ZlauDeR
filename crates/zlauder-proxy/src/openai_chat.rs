@@ -89,8 +89,12 @@ async fn chat_completions_inner(
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let guard =
-            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let guard = monitor::CompletionGuard::new(
+            st.monitor.clone(),
+            record_id.clone(),
+            status.as_u16(),
+            manifest.as_ref(),
+        );
         let body = unmask_sse_body(
             Box::pin(resp.bytes_stream()),
             st.engine.clone(),
@@ -580,11 +584,40 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
             let out = st
                 .xform
                 .process(chunk, st.engine.as_ref(), st.manifest.as_ref());
+            // Mirror the unmasked reply onto the monitor record as it streams.
+            capture_chunk(&mut st.guard, &out);
             if let Ok(data) = serde_json::to_string(&out) {
                 st.queue.push_back(frame(sse.event.as_deref(), &data));
             }
         }
         Err(_) => st.queue.push_back(frame(sse.event.as_deref(), &sse.data)),
+    }
+}
+
+/// Capture the unmasked assistant content + tool-call args from one re-emitted chunk into
+/// the monitor's response accumulator (one block per choice / per tool call).
+fn capture_chunk(guard: &mut monitor::CompletionGuard, chunk: &OpenAIChunk) {
+    for choice in &chunk.choices {
+        if let Some(content) = &choice.delta.content {
+            guard.capture(
+                &format!("c{}", choice.index),
+                monitor::CapKind::Text,
+                "assistant",
+                content,
+            );
+        }
+        if let Some(calls) = &choice.delta.tool_calls {
+            for call in calls {
+                if let Some(args) = call.function.as_ref().and_then(|f| f.arguments.as_ref()) {
+                    guard.capture(
+                        &format!("c{}t{}", choice.index, call.index),
+                        monitor::CapKind::ToolUse,
+                        "tool_call",
+                        args,
+                    );
+                }
+            }
+        }
     }
 }
 

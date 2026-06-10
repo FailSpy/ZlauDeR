@@ -454,6 +454,39 @@ async fn openai_responses_streaming_unmasks_and_preserves_sse_events() {
         !text.contains("[EMAIL_ADDRESS_"),
         "token leaked to client: {text}"
     );
+
+    // The STREAMED reply must also land on the monitor record (the headline fix): the
+    // operator sees the model's response on THIS turn, not only once the next request
+    // resends it as transcript. By the time `.text()` resolved the stream had drained, so
+    // CompletionGuard::complete() already finalized the record.
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = snap["records"]
+        .as_array()
+        .and_then(|rs| rs.first())
+        .expect("one recorded request");
+    assert_eq!(rec["decision"], "completed", "streamed turn finalized");
+    let resp_blob = rec["response_surfaces"].to_string() + &rec["response_preview"].to_string();
+    assert!(
+        resp_blob.contains("response-stream@example.com"),
+        "streamed reply not captured onto the record: {}",
+        rec["response_preview"]
+    );
+    // The captured reply text is UNMASKED (the run text + raw preview carry plaintext, not
+    // handles). The handle still rides each token run's `TokenRef` metadata — that is the
+    // same local, key-gated handle→value mapping the request surfaces carry, by design.
+    let preview = rec["response_preview"].as_str().unwrap_or_default();
+    assert!(
+        !preview.contains("[EMAIL_ADDRESS_"),
+        "masked handle leaked into the captured response text: {preview}"
+    );
 }
 
 // Deterministic placeholders within a session: the SAME request masked twice

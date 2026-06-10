@@ -510,6 +510,8 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .panel-title { font-family: var(--disp); letter-spacing: .2em; font-size: 12px; color: var(--ink); font-weight: 500; }
 .panel-count { font-size: 10px; color: var(--ink-dim); margin-left: auto; font-variant-numeric: tabular-nums; }
 .panel-body { padding: 4px 14px 14px; }
+/* live streamed-response indicator on the RESPONSE panel summary */
+.stream-live { color: var(--cyan); letter-spacing: .12em; font-weight: 600; animation: pulse 1.4s ease-in-out infinite; }
 
 /* surfaces */
 .surface { border-top: 1px solid var(--line-soft); padding: 12px 0; }

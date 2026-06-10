@@ -237,6 +237,31 @@ fn text_values_from_block(
     Vec::new()
 }
 
+/// Build one response [`Surface`] directly from already-UNMASKED streamed text
+/// (assistant prose or a tool-call argument blob), bypassing JSON parsing.
+///
+/// The streaming relay emits text the engine has already unmasked, so — like
+/// [`surfaces_from_response_body`] — we locate the canonical token VALUE (not the
+/// handle) to wrap any plaintext the model echoed back. `kind` is `message`
+/// (assistant prose) or `tool_use` (a tool call); provenance is derived exactly as
+/// for a request surface (assistant prose ⇒ `assistant`, a tool call ⇒ `tool_io`).
+pub(crate) fn response_text_surface(
+    label: String,
+    role: Option<String>,
+    kind: &str,
+    text: &str,
+    tokens: &[TokenPreview],
+) -> Surface {
+    Surface {
+        label,
+        provenance: provenance_of(kind, role.as_deref(), text).to_string(),
+        runs: segment_runs_with(text, tokens, NeedleMode::Value),
+        block_hash: block_hash(text),
+        kind: kind.to_string(),
+        role,
+    }
+}
+
 /// Segment a raw surface's text into runs by locating every token handle.
 ///
 /// Byte-correct: all slicing is done on the UTF-8 byte indices returned by

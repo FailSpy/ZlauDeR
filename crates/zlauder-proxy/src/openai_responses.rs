@@ -86,8 +86,12 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let guard =
-            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let guard = monitor::CompletionGuard::new(
+            st.monitor.clone(),
+            record_id.clone(),
+            status.as_u16(),
+            manifest.as_ref(),
+        );
         let body = unmask_sse_body(
             Box::pin(resp.bytes_stream()),
             st.engine.clone(),
@@ -694,16 +698,36 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
     }
     match serde_json::from_str::<ResponseStreamEvent>(&sse.data) {
         Ok(ev) => {
-            for out in st
+            let out = st
                 .xform
-                .process(ev, st.engine.as_ref(), st.manifest.as_ref())
-            {
-                if let Ok(data) = serde_json::to_string(&out) {
+                .process(ev, st.engine.as_ref(), st.manifest.as_ref());
+            // Mirror the unmasked reply onto the monitor record as it streams.
+            for o in &out {
+                capture_event(&mut st.guard, o);
+            }
+            for o in out {
+                if let Ok(data) = serde_json::to_string(&o) {
                     st.queue.push_back(frame(sse.event.as_deref(), &data));
                 }
             }
         }
         Err(_) => st.queue.push_back(frame(sse.event.as_deref(), &sse.data)),
+    }
+}
+
+/// Capture the unmasked output-text + function-call args from one re-emitted Responses
+/// event into the monitor's response accumulator (keyed per item / output index).
+fn capture_event(guard: &mut monitor::CompletionGuard, ev: &ResponseStreamEvent) {
+    match ev {
+        ResponseStreamEvent::ResponseOutputTextDelta(d) => {
+            let key = format!("t:{:?}:{:?}:{:?}", d.item_id, d.output_index, d.content_index);
+            guard.capture(&key, monitor::CapKind::Text, "assistant", &d.delta);
+        }
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(d) => {
+            let key = format!("a:{:?}:{:?}", d.item_id, d.output_index);
+            guard.capture(&key, monitor::CapKind::ToolUse, "tool_call", &d.delta);
+        }
+        _ => {}
     }
 }
 

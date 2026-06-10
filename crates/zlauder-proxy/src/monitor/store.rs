@@ -8,15 +8,21 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use zlauder_engine::UnmaskManifest;
 
+use super::capture::{CapKind, ResponseCapture};
 use super::delta::{compute_delta, compute_delta_from_hashes};
 use super::model::{
     ApprovalDecision, ConversationMeta, MonitorEvent, MonitorMode, MonitorSnapshot,
-    RequestDecision, RequestRecord, Surface, TokenClass, TokenLedgerEntry, TurnDelta,
+    RequestDecision, RequestRecord, ResponseProgress, Surface, TokenClass, TokenLedgerEntry,
+    TokenPreview, TurnDelta,
 };
 use super::spans::{now_ms, preview, spans_from_manifest, spans_from_values, token_previews};
 use super::surfaces::{surfaces_from_body, surfaces_from_response_body};
 
 const MAX_RECORDS: usize = 500;
+/// Bytes of newly-captured streamed response text that must accumulate before the next
+/// live progress frame is pushed. Coalesces the model's many small text deltas into a
+/// handful of UI repaints per response (the upstream may stream a token at a time).
+const PROGRESS_FLUSH_BYTES: usize = 160;
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(APPROVAL_TIMEOUT_SECS);
 const DEFAULT_MAX_PENDING_APPROVALS: usize = 32;
@@ -401,6 +407,60 @@ impl Monitor {
         });
     }
 
+    /// Live, NON-terminal update of a streaming response (see [`ResponseProgress`]).
+    /// Persists the accumulated unmasked reply onto the record (so a snapshot taken
+    /// mid-stream reflects it) and emits a lightweight `ResponseProgress` frame — NOT the
+    /// whole record — so open UIs paint the model's reply as it streams. The decision is
+    /// left untouched (stays `InFlight`); a no-op once the record is terminal.
+    pub fn record_response_progress(&self, id: &str, status: u16, preview: String, surfaces: Vec<Surface>) {
+        {
+            let mut inner = self.inner.lock().expect("monitor mutex poisoned");
+            let Some(r) = inner.records.iter_mut().find(|r| r.id == id) else {
+                return;
+            };
+            if r.decision.is_terminal() {
+                return;
+            }
+            r.response_status = Some(status);
+            r.response_spans = spans_from_values(&r.tokens, &preview);
+            r.response_preview = Some(preview.clone());
+            r.response_surfaces = surfaces.clone();
+            r.updated_ms = now_ms();
+        }
+        self.emit(MonitorEvent::ResponseProgress(Box::new(ResponseProgress {
+            id: id.to_string(),
+            status,
+            response_preview: preview,
+            response_surfaces: surfaces,
+        })));
+    }
+
+    /// Finalize a STREAMED response: stamp the captured reply and flip to `Completed`,
+    /// emitting a full `Record` frame. Terminal-idempotent like [`Self::record_response`]
+    /// — a late drain or a drop-guard firing after an abort/error must not resurrect
+    /// `Completed`. `preview == None` (an empty capture) leaves any partial already
+    /// persisted by progress frames in place and just records completion.
+    pub fn complete_response(
+        &self,
+        id: &str,
+        status: u16,
+        preview: Option<String>,
+        surfaces: Vec<Surface>,
+    ) {
+        self.update_record(id, |r| {
+            if r.decision.is_terminal() {
+                return;
+            }
+            r.response_status = Some(status);
+            if let Some(p) = &preview {
+                r.response_spans = spans_from_values(&r.tokens, p);
+                r.response_preview = Some(p.clone());
+                r.response_surfaces = surfaces.clone();
+            }
+            r.decision = RequestDecision::Completed;
+        });
+    }
+
     /// Mark a request as released upstream (awaiting / streaming the response).
     /// Only advances from an accepted/approved state — never over a terminal one.
     pub fn record_dispatched(&self, id: &str) {
@@ -547,28 +607,81 @@ pub struct CompletionGuard {
     id: String,
     status: u16,
     armed: bool,
+    /// Token previews (handle → plaintext) for this request, so the captured reply can be
+    /// segmented by VALUE (the stream is already unmasked). Built once from the manifest.
+    tokens: Vec<TokenPreview>,
+    /// The unmasked assistant reply accumulated as it streams downstream.
+    capture: ResponseCapture,
+    /// `capture.total_len()` at the last live progress flush (the throttle baseline).
+    flushed_len: usize,
 }
 
 impl CompletionGuard {
-    pub fn new(monitor: Monitor, id: String, status: u16) -> Self {
+    pub fn new(monitor: Monitor, id: String, status: u16, manifest: &UnmaskManifest) -> Self {
         Self {
             monitor,
             id,
             status,
             armed: true,
+            tokens: token_previews(manifest),
+            capture: ResponseCapture::new(),
+            flushed_len: 0,
         }
     }
 
-    /// The stream drained normally: record `Completed` and disarm.
+    /// Capture one already-unmasked downstream fragment (assistant prose or a tool-call
+    /// argument blob) keyed by its content block, flushing a live progress frame once
+    /// enough new text has accumulated since the last flush. Called by the SSE relay for
+    /// every chunk it forwards, so the monitor mirrors exactly what the client receives.
+    pub fn capture(&mut self, key: &str, kind: CapKind, label: &str, text: &str) {
+        if !self.armed {
+            return;
+        }
+        self.capture.push(key, kind, label, text);
+        if self.capture.total_len().saturating_sub(self.flushed_len) >= PROGRESS_FLUSH_BYTES {
+            self.flush_progress();
+        }
+    }
+
+    /// Push the captured-so-far reply as a live progress frame (non-terminal).
+    fn flush_progress(&mut self) {
+        if !self.armed || self.capture.is_empty() {
+            return;
+        }
+        let (preview, surfaces) = self.capture.render(&self.tokens);
+        self.flushed_len = self.capture.total_len();
+        self.monitor
+            .record_response_progress(&self.id, self.status, preview, surfaces);
+    }
+
+    /// Persist whatever streamed so far onto the record WITHOUT finalizing — used by the
+    /// abort / upstream-error paths so a partial reply isn't lost when the stream dies.
+    fn persist_partial(&self) {
+        if self.capture.is_empty() {
+            return;
+        }
+        let (preview, surfaces) = self.capture.render(&self.tokens);
+        self.monitor
+            .record_response_progress(&self.id, self.status, preview, surfaces);
+    }
+
+    /// The stream drained normally: finalize with the captured reply and disarm. An empty
+    /// capture finalizes with no body — byte-identical to the historical `record_response`
+    /// (None) call, so a response with no text surface still records `Completed`.
     pub fn complete(&mut self) {
         if std::mem::replace(&mut self.armed, false) {
-            self.monitor.record_response(&self.id, self.status, None);
+            let (preview, surfaces) = self.capture.render(&self.tokens);
+            let body = if self.capture.is_empty() { None } else { Some(preview) };
+            self.monitor
+                .complete_response(&self.id, self.status, body, surfaces);
         }
     }
 
-    /// The upstream stream errored mid-flight: record `UpstreamError` and disarm.
+    /// The upstream stream errored mid-flight: persist the partial reply, record
+    /// `UpstreamError`, and disarm.
     pub fn upstream_error(&mut self, msg: &str) {
         if std::mem::replace(&mut self.armed, false) {
+            self.persist_partial();
             self.monitor.record_upstream_error(&self.id, msg);
         }
     }
@@ -577,6 +690,9 @@ impl CompletionGuard {
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
         if self.armed {
+            // Client disconnected mid-stream: keep whatever reply streamed before the drop,
+            // then mark Aborted (which preserves the response fields, only flipping decision).
+            self.persist_partial();
             self.monitor.record_aborted(&self.id);
         }
     }
@@ -1256,7 +1372,7 @@ mod tests {
         let m = Monitor::new();
         let id = record(&m, &body(&[("user", json!("go"))]));
         m.record_dispatched(&id);
-        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200);
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200, &UnmaskManifest::new());
         g.complete();
         assert!(matches!(find(&m, &id).decision, RequestDecision::Completed));
         drop(g); // already disarmed → Drop must NOT flip it to Aborted
@@ -1271,7 +1387,7 @@ mod tests {
         let id = record(&m, &body(&[("user", json!("go"))]));
         m.record_dispatched(&id);
         {
-            let _g = CompletionGuard::new(m.clone(), id.clone(), 200);
+            let _g = CompletionGuard::new(m.clone(), id.clone(), 200, &UnmaskManifest::new());
         }
         assert!(matches!(find(&m, &id).decision, RequestDecision::Aborted));
     }
@@ -1281,13 +1397,51 @@ mod tests {
         let m = Monitor::new();
         let id = record(&m, &body(&[("user", json!("go"))]));
         m.record_dispatched(&id);
-        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200);
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200, &UnmaskManifest::new());
         g.upstream_error("boom");
         drop(g); // disarmed → stays UpstreamError, not Aborted
         assert!(matches!(
             find(&m, &id).decision,
             RequestDecision::UpstreamError
         ));
+    }
+
+    #[test]
+    fn streamed_capture_populates_response_on_complete() {
+        // The headline fix: a STREAMED reply lands on its own record at completion, instead
+        // of only appearing once the next request resends it as transcript.
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        m.record_dispatched(&id);
+        // The relay forwards already-UNMASKED assistant text (plaintext present).
+        let manifest = manifest_with("[EMAIL_0001]", "alice@example.com");
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200, &manifest);
+        g.capture("t0", CapKind::Text, "assistant", "mail alice@");
+        g.capture("t0", CapKind::Text, "assistant", "example.com now");
+        g.complete();
+        let r = find(&m, &id);
+        assert!(matches!(r.decision, RequestDecision::Completed));
+        assert_eq!(r.response_preview.as_deref(), Some("mail alice@example.com now"));
+        assert_eq!(r.response_surfaces.len(), 1);
+        assert_eq!(r.response_surfaces[0].role.as_deref(), Some("assistant"));
+        // The echoed plaintext is wrapped as a token run (segmented by value).
+        assert!(r.response_surfaces[0].runs.iter().any(|run| run.token.is_some()));
+    }
+
+    #[test]
+    fn streamed_capture_persists_partial_on_abort() {
+        // A client disconnect mid-stream keeps whatever streamed before the drop.
+        let m = Monitor::new();
+        let id = record(&m, &body(&[("user", json!("go"))]));
+        m.record_dispatched(&id);
+        {
+            let mut g = CompletionGuard::new(m.clone(), id.clone(), 200, &UnmaskManifest::new());
+            g.capture("t0", CapKind::Text, "assistant", "partial before disconnect");
+        } // drop while armed → Aborted, partial preserved
+        let r = find(&m, &id);
+        assert!(matches!(r.decision, RequestDecision::Aborted));
+        assert_eq!(r.response_preview.as_deref(), Some("partial before disconnect"));
+        assert_eq!(r.response_surfaces.len(), 1);
     }
 
     fn manifest_with(token: &str, value: &str) -> UnmaskManifest {
