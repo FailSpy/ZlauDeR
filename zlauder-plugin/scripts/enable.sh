@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Per-project setup for the zlauder masking proxy. This is the ONE piece of wiring
-# the user runs explicitly, because a Claude Code plugin cannot set `env` or the main
-# `statusLine` itself (only `agent`/`subagentStatusLine` are honored from a plugin's
-# settings.json, and there is no install-time hook). So `/zlauder:enable` patches the
-# *project's* .claude/settings.json directly:
+# Per-project setup for the zlauder masking proxy. Routing is normally AUTO-PLUMBED by the
+# SessionStart hook on first sight; this script is the EXPLICIT path (`/zlauder:enable`),
+# needed because a Claude Code plugin cannot set `env` or the main `statusLine` itself (only
+# `agent`/`subagentStatusLine` are honored from a plugin's settings.json, and there is no
+# install-time hook). So `/zlauder:enable` patches the *project's*
+# .claude/settings.local.json (gitignored) directly:
 #   - env.ANTHROPIC_BASE_URL  (load-bearing: routes Claude Code through the proxy)
 #   - env.ZLAUDER_PORT        (so the CLI/status line target this project's proxy)
 #   - statusLine              (the 🛡 masking indicator; SEAMLESSLY WRAPS an existing
@@ -31,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve (and, on first run, build) the binaries up front. This sets ZLAUDER_BIN_DIR
 # and prepends it to PATH, which we need for BOTH the port query below and the
-# absolute status-line command we bake into settings.json (the status line is
+# absolute status-line command we bake into settings.local.json (the status line is
 # evaluated in the user's bare shell, which won't have the plugin data dir on PATH).
 bins_ok=0
 if zlauder_resolve_bins; then bins_ok=1; fi
@@ -43,11 +44,25 @@ if zlauder_resolve_bins; then bins_ok=1; fi
 # is gated on the session already being routed, which a first-time enable is not). We
 # parse that, never guess.
 port=""
-if [ -n "${ZLAUDER_PORT:-}" ]; then
-  # User pinned an explicit port; honor it.
+if [ "$bins_ok" -eq 1 ]; then
+  # Compute the authoritative port with ZLAUDER_PORT UNSET for this one call: reserve-port
+  # honors ZLAUDER_PORT via its global --port, so an ambient/global value would otherwise
+  # shortcut the derivation and get baked verbatim. Unsetting it forces the real per-project
+  # derive+reserve.
+  port="$(env -u ZLAUDER_PORT "$ZLAUDER_HOOKS_BIN" reserve-port 2>/dev/null < /dev/null || true)"
+fi
+# Never bake a stale/global/foreign ZLAUDER_PORT into this project's routing: that would pin
+# the project to an unreserved or ANOTHER project's port (the runtime then refuses to mask
+# through it, and /zlauder:disable+enable couldn't even clear it while the env stays set). Use
+# the derived port; honor an explicit ZLAUDER_PORT only as a fallback when we couldn't derive
+# one, and warn when a set value disagrees. (A routed re-enable has ZLAUDER_PORT == the derived
+# port, so this stays a no-op in the common case.)
+if [ -n "$port" ]; then
+  if [ -n "${ZLAUDER_PORT:-}" ] && [ "$ZLAUDER_PORT" != "$port" ]; then
+    echo "ZlauDeR: ignoring ZLAUDER_PORT=${ZLAUDER_PORT}; using this project's derived port ${port} (a stale or global ZLAUDER_PORT must not pin a project to a foreign/unreserved port)." >&2
+  fi
+elif [ -n "${ZLAUDER_PORT:-}" ]; then
   port="$ZLAUDER_PORT"
-elif [ "$bins_ok" -eq 1 ]; then
-  port="$("$ZLAUDER_HOOKS_BIN" reserve-port 2>/dev/null < /dev/null || true)"
 fi
 
 if [ -z "$port" ]; then
@@ -73,12 +88,14 @@ else
 fi
 
 project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-settings_file="${project_dir}/.claude/settings.json"
+# Routing is written to settings.local.json (gitignored), not the committed settings.json,
+# so a machine-specific http://127.0.0.1:<port> never lands in version control.
+settings_file="${project_dir}/.claude/settings.local.json"
 
-# Patch .claude/settings.json via zlauder-hooks — no `jq` dependency (a hard blocker on
-# Windows). The binary creates the dir/file as needed, validates JSON, wraps any existing
-# status line into the sidecar, sets env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT + statusLine,
-# and writes atomically. Exit code is a contract: 0 = changed, 3 = already pointed at this
+# Patch .claude/settings.local.json via zlauder-hooks — no `jq` dependency (a hard blocker on
+# Windows). The binary creates the dir/file as needed, ensures a .claude/.gitignore so the
+# local route is never committed, validates JSON, wraps any existing status line into the
+# sidecar, sets env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT + statusLine, and writes atomically. Exit code is a contract: 0 = changed, 3 = already pointed at this
 # proxy (idempotent), non-zero = error (it printed the reason to stderr). Guard `set -e`
 # so the deliberate 3 doesn't abort us. Needs the binary resolved up front (bins_ok).
 if [ "$bins_ok" -ne 1 ]; then
@@ -118,10 +135,11 @@ fi
 cat >&2 <<'EOF'
 
 ================================================================================
-  RESTART CLAUDE CODE NOW.
+  Masking activates on your NEXT MESSAGE.
 
-  ANTHROPIC_BASE_URL is read once at process startup. Your current session is
-  still talking to the API directly and is NOT being masked. Fully quit and
-  relaunch Claude Code for this project so the proxy takes effect.
+  Claude Code re-reads the route from .claude/settings.local.json on each prompt,
+  so masking kicks in on your next message — no full restart needed in the common
+  case. (If it doesn't take effect within a message or two, restart Claude Code.)
+  Toggle masking anytime with /zlauder:privacy; remove routing with /zlauder:disable.
 ================================================================================
 EOF

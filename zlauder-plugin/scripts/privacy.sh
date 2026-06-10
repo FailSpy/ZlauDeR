@@ -47,8 +47,8 @@ case "$sub" in
     echo "Proxy health:"
     "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" statusline || true
     echo
-    echo "Routing (ANTHROPIC_BASE_URL in this project's .claude/settings.json):"
-    # zlauder-hooks reads settings.json (then settings.local.json) itself — no jq needed.
+    echo "Routing (ANTHROPIC_BASE_URL in this project's .claude/settings.local.json):"
+    # zlauder-hooks reads settings.local.json first (then legacy settings.json) — no jq needed.
     "$ZLAUDER_HOOKS_BIN" settings route-url || echo "(unset)"
     echo
     echo "Masking:"

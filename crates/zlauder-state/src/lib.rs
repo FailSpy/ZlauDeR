@@ -238,40 +238,49 @@ pub fn pick_port(project_root: &str) -> u16 {
     start
 }
 
-/// Atomically reserve and return the port for `project_root` (used by
-/// `session-start` on a project's first launch).
-///
-/// Probes like [`pick_port`], but for a free slot it writes a reservation record
-/// via `O_CREAT|O_EXCL`, so two concurrent first-launches can't claim the same port
-/// (one loses the create race and keeps probing). A port already owned by this
-/// project (reservation or live proxy) is returned as-is — re-launching is
-/// idempotent. The reservation makes the port visible to *other* projects'
-/// `pick_port`/`reserve_port` before this project's proxy has bound, which is what
-/// prevents two colliding projects from baking the same port (review finding
-/// F1/HIGH).
+/// Atomically reserve and return the port for `project_root` (used by `session-start` /
+/// auto-plumb on a project's first launch). Thin wrapper over [`reserve_port_created`] that
+/// drops the "did this call create it" flag.
 pub fn reserve_port(project_root: &str) -> Result<u16> {
+    reserve_port_created(project_root).map(|(port, _created)| port)
+}
+
+/// Like [`reserve_port`], but also returns whether THIS call CREATED the reservation
+/// (`true`) versus returning a port already owned by this project (`false` — a standing
+/// reservation, a live proxy, or one a concurrent same-project launch just created). The
+/// caller can then clean up ONLY its own freshly-created reservation on a later failure,
+/// never one a sibling launch is relying on.
+///
+/// Probes like [`pick_port`], but for a free slot it writes a reservation record via
+/// `O_CREAT|O_EXCL`, so two concurrent first-launches can't claim the same port (one loses
+/// the create race and keeps probing). A port already owned by this project (reservation or
+/// live proxy) is returned as-is — re-launching is idempotent. The reservation makes the
+/// port visible to *other* projects' `pick_port`/`reserve_port` before this project's proxy
+/// has bound, which is what prevents two colliding projects from baking the same port
+/// (review finding F1/HIGH).
+pub fn reserve_port_created(project_root: &str) -> Result<(u16, bool)> {
     let start = derive_port(project_root);
     for off in 0..PORT_SPAN {
         let p = PORT_BASE + ((start - PORT_BASE + off) % PORT_SPAN);
         match port_owner(p) {
             Some(owner) if owner != project_root => continue, // someone else's
-            Some(_) => return Ok(p),                          // already ours
+            Some(_) => return Ok((p, false)),                 // already ours — we did NOT create it
             None => {
                 if try_reserve(p, project_root)? {
-                    return Ok(p);
+                    return Ok((p, true)); // WE created this reservation
                 }
                 // Lost the create race. Re-check ownership: if a concurrent launch
                 // for THIS project just claimed it, it's ours — return it (so two
                 // same-project launches converge on ONE port, not p and p+1). If a
                 // different project won, keep probing.
                 match port_owner(p) {
-                    Some(owner) if owner == project_root => return Ok(p),
+                    Some(owner) if owner == project_root => return Ok((p, false)),
                     _ => continue,
                 }
             }
         }
     }
-    Ok(start)
+    Ok((start, false))
 }
 
 /// Atomically reserve `port` iff no state file exists yet. Returns `false` if the
@@ -340,6 +349,113 @@ fn set_mode(path: &Path, mode: u32) {
 // scope.
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) {}
+
+// ---------------------------------------------------------------------------
+// Plumbed-projects registry (persistent — per-project auto-enable state)
+// ---------------------------------------------------------------------------
+
+/// Per-project auto-enable state, persisted in the user-config dir (NOT the volatile runtime
+/// state dir), so it survives reboots. SessionStart consults it to avoid re-plumbing a
+/// project the user opted out of, and `/zlauder:disable --all` uses it to sweep every
+/// plumbed project's routing before an uninstall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlumbState {
+    /// zlauder auto-plumbed (or the user enabled) routing for this project.
+    Plumbed,
+    /// The user ran `/zlauder:disable` here — never auto-plumb it again.
+    Optout,
+}
+
+/// One project's registry record. Stored ONE FILE PER PROJECT (named by a hash of the root)
+/// rather than a single shared map: concurrent updates to DIFFERENT projects then never
+/// contend — each writes its own file via the atomic temp+rename — so there is no
+/// lost-update race (e.g. one session's auto-plumb clobbering another's opt-out), with no
+/// interprocess lock. A same-project race is idempotent (both write the same value). The
+/// `root` is stored so the sweep can recover the path from the hashed filename and so a
+/// (astronomically unlikely) hash collision is detectable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RegistryEntry {
+    root: String,
+    state: PlumbState,
+}
+
+/// Directory holding the plumbed-projects registry (one JSON file per project):
+/// `<user-config-dir>/plumbed/`.
+pub fn registry_dir() -> PathBuf {
+    user_config_path().with_file_name("plumbed")
+}
+
+fn registry_entry_path(project_root: &str) -> PathBuf {
+    registry_dir().join(format!(
+        "{}.json",
+        blake3::hash(project_root.as_bytes()).to_hex()
+    ))
+}
+
+/// The recorded auto-enable state for `project_root` (a canonical path), or `None` if
+/// zlauder has never plumbed or seen it.
+pub fn registry_get(project_root: &str) -> Option<PlumbState> {
+    let entry: RegistryEntry = std::fs::read(registry_entry_path(project_root))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    // Trust the entry only if its stored root matches (guards a hash collision).
+    (entry.root == project_root).then_some(entry.state)
+}
+
+/// Record `state` for `project_root`, replacing any prior entry (atomic temp+rename). Enable
+/// => `Plumbed` (clears a prior opt-out); disable => `Optout`.
+pub fn registry_set(project_root: &str, state: PlumbState) -> Result<()> {
+    let dir = registry_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir:?}"))?;
+    let path = registry_entry_path(project_root);
+    let entry = RegistryEntry {
+        root: project_root.to_string(),
+        state,
+    };
+    let tmp = temp_sibling(&path);
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&entry)?)
+        .with_context(|| format!("writing {tmp:?}"))?;
+    set_mode(&tmp, 0o600);
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
+    Ok(())
+}
+
+/// Remove `project_root` from the registry entirely (the disable sweep calls this once a
+/// project's routing has been stripped). A missing entry is not an error.
+pub fn registry_remove(project_root: &str) -> Result<()> {
+    match std::fs::remove_file(registry_entry_path(project_root)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("removing registry entry"),
+    }
+}
+
+/// Every project root currently in the `Plumbed` state (used by `/zlauder:disable --all`).
+pub fn registry_plumbed_roots() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(registry_dir()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        // Only the final per-project files (`<hash>.json`); skip an in-flight or crash-left
+        // temp sibling (`.<hash>.json.tmp.<pid>`, whose extension is the pid, not "json"),
+        // which could otherwise be parsed as a duplicate/stale entry by the disable sweep.
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter_map(|p| {
+            let entry: RegistryEntry = serde_json::from_slice(&std::fs::read(&p).ok()?).ok()?;
+            // Same collision/tamper guard `registry_get` applies on the read path: trust the
+            // entry only if its filename is `blake3(root).json`, so the sweep never acts on a
+            // mismatched or wrong-named (duplicated/hand-copied) record — it disables exactly the
+            // projects that were legitimately recorded here, not whatever a stray file claims.
+            let expected = format!("{}.json", blake3::hash(entry.root.as_bytes()).to_hex());
+            (p.file_name().and_then(|n| n.to_str()) == Some(expected.as_str())).then_some(entry)
+        })
+        .filter(|e| e.state == PlumbState::Plumbed)
+        .map(|e| e.root)
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -512,5 +628,47 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::remove_var("ZLAUDER_STATE_DIR") };
+    }
+
+    // The plumbed-projects registry round-trips state, filters Plumbed for the sweep, and
+    // honors an opt-out so a disabled project is never auto-re-plumbed.
+    #[test]
+    fn registry_round_trips_and_filters_plumbed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("zlauder-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: single-threaded test; points the registry at a temp config dir.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", dir.join("config.toml")) };
+
+        assert_eq!(registry_get("/proj/a"), None);
+        registry_set("/proj/a", PlumbState::Plumbed).unwrap();
+        registry_set("/proj/b", PlumbState::Optout).unwrap();
+        assert_eq!(registry_get("/proj/a"), Some(PlumbState::Plumbed));
+        assert_eq!(registry_get("/proj/b"), Some(PlumbState::Optout));
+
+        // Only Plumbed roots are swept; an opted-out project is excluded.
+        assert_eq!(registry_plumbed_roots(), vec!["/proj/a".to_string()]);
+
+        // Re-enabling clears a prior opt-out.
+        registry_set("/proj/b", PlumbState::Plumbed).unwrap();
+        let mut roots = registry_plumbed_roots();
+        roots.sort();
+        assert_eq!(roots, vec!["/proj/a".to_string(), "/proj/b".to_string()]);
+
+        registry_remove("/proj/a").unwrap();
+        assert_eq!(registry_get("/proj/a"), None);
+
+        // A wrong-named (`<hash>` != blake3(root)) registry file is NOT swept: registry_get's
+        // filename guard also applies to registry_plumbed_roots, so a mismatched/hand-copied
+        // record can't inject a foreign root into the disable sweep.
+        let stray = registry_dir().join("deadbeef.json");
+        std::fs::write(&stray, br#"{"root":"/proj/stray","state":"plumbed"}"#).unwrap();
+        assert!(
+            !registry_plumbed_roots().contains(&"/proj/stray".to_string()),
+            "a record whose filename != blake3(root) must be ignored by the sweep"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
     }
 }

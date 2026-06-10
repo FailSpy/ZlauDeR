@@ -8,11 +8,13 @@
 # stdout MUST stay valid hook JSON: it is passed through from zlauder-hooks
 # UNCHANGED. All diagnostics go to stderr.
 #
-# The one thing this plugin cannot do is set ANTHROPIC_BASE_URL (Claude Code
-# only honors "agent"/"subagentStatusLine" from a plugin settings.json). Routing
-# is wired by `/zlauder:enable` patching this project's .claude/settings.json,
-# after which Claude Code must be RESTARTED. The route guard below warns when the
-# proxy is up but traffic is not actually pointed at it.
+# The one thing this plugin cannot do is set ANTHROPIC_BASE_URL directly (Claude
+# Code only honors "agent"/"subagentStatusLine" from a plugin settings.json). So
+# `zlauder-hooks session-start` AUTO-ENABLES a never-seen project by writing the
+# route into .claude/settings.local.json (gitignored); Claude Code re-reads it on
+# the next message, so masking kicks in with no full restart in the common case.
+# The hook gates every side effect on whether THIS session is actually routed
+# through the proxy (it never announces masking for a session that isn't).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,8 +56,9 @@ CFG="$(config_path)"
 # Hand off to the real control plane and emit its hook JSON byte-for-byte. zlauder-hooks
 # owns the routing decision now: it checks whether THIS session's ANTHROPIC_BASE_URL is
 # actually pointed at the proxy and, only then, launches/recycles it and announces that
-# masking is active — otherwise it stays a silent no-op (and nudges, on stderr, if the
-# project is configured but awaiting a restart). Single source of truth, no shell guard.
+# masking is active — otherwise it auto-enables a never-seen project, nudges (on stderr)
+# a configured-but-not-yet-routed one that masking kicks in on its next message, or stays
+# a silent no-op. Single source of truth, no shell guard.
 set +e
 if [ -n "$CFG" ]; then
   "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" session-start --config "$CFG"
