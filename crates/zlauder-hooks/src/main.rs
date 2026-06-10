@@ -1027,12 +1027,20 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                 Ok(_) => {
                     let _ =
                         zlauder_state::registry_set(&root, zlauder_state::PlumbState::Plumbed);
+                    // First sight of this project: the route is now baked into
+                    // settings.local.json. Claude Code applies a route WRITTEN during this
+                    // SessionStart to the current session only unreliably; every session after
+                    // the first reads it at startup, which always works. So the sure activation
+                    // is a one-time restart — surfaced to the human on the statusline
+                    // ("⟳ ZlauDeR: restart to mask") and recommended here. We do NOT launch the
+                    // proxy this session: a restart (or the next routed session) brings it up via
+                    // the routed branch's ensure_up, so it isn't left running unused.
                     eprintln!(
                         "ZlauDeR: auto-enabled PII masking for this project (wrote \
-                         .claude/settings.local.json). It activates on your next message or \
-                         session — no restart needed in the common case. Control it live with \
-                         /zlauder:privacy; remove it with /zlauder:disable. (Set \
-                         ZLAUDER_NO_AUTO_ENABLE=1 to opt out of auto-enable globally.)"
+                         .claude/settings.local.json). RESTART Claude Code once to activate it — the \
+                         statusline shows '⟳ ZlauDeR: restart to mask' until it's live, then 🛡. Control \
+                         it with /zlauder:privacy; remove it with /zlauder:disable. \
+                         (ZLAUDER_NO_AUTO_ENABLE=1 opts out globally.)"
                     );
                     println!(
                         "{}",
@@ -1040,14 +1048,15 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                             "hookSpecificOutput": {
                                 "hookEventName": "SessionStart",
                                 "additionalContext":
-                                    "ZlauDeR just auto-enabled PII masking for this project (routing was \
-                                     written to .claude/settings.local.json). Masking is NOT active in THIS \
-                                     session yet — Claude Code applies the local-proxy route on the next \
-                                     session/message — so outbound text this session reaches the API provider \
-                                     UNMASKED (real PII, not tokens). This is only about what the provider sees; \
-                                     the user always sees their own plaintext locally. Never tell the user their \
-                                     data is hidden in this session. The user controls masking with \
-                                     /zlauder:privacy and removes it with /zlauder:disable."
+                                    "ZlauDeR just auto-enabled PII masking for this project (route written to \
+                                     .claude/settings.local.json). Masking is NOT reliably active in THIS \
+                                     session — the sure activation is a one-time restart of Claude Code, after \
+                                     which it stays on automatically. Until then, outbound text may reach the \
+                                     API provider UNMASKED (real PII, not tokens). This is only about what the \
+                                     provider sees; the user always sees their own plaintext locally. If the user \
+                                     asks why masking isn't on yet, tell them to restart Claude Code once. Never \
+                                     tell the user their data is hidden in this session. The user controls masking \
+                                     with /zlauder:privacy and removes it with /zlauder:disable."
                             }
                         })
                     );
@@ -1076,9 +1085,9 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
             // common case. Stay a route-less no-op for now; the proxy launches on the session
             // that actually routes.
             eprintln!(
-                "ZlauDeR: masking for this project activates on your next message (Claude Code \
-                 re-reads the route from .claude/settings.local.json). If it doesn't take effect \
-                 within a message or two, restart Claude Code."
+                "ZlauDeR: this project is configured but THIS session isn't masked yet. Restart \
+                 Claude Code to activate it (the statusline shows '⟳ ZlauDeR: restart to mask' until \
+                 it's live). It may also kick in on a later message, but a restart is the sure path."
             );
             println!(
                 "{}",
@@ -1086,12 +1095,12 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
                         "additionalContext":
-                            "ZlauDeR is configured for this project but masking is not active in THIS \
-                             session yet: Claude Code activates the local-proxy route on your next \
-                             message (no restart needed in the common case). Until then, outbound text \
-                             reaches the API provider UNMASKED (real PII, not tokens). This is only about \
-                             what the provider sees; the user always sees their own plaintext. Control \
-                             with /zlauder:privacy."
+                            "ZlauDeR is configured for this project but masking is NOT reliably active in \
+                             THIS session yet — the sure activation is a one-time restart of Claude Code. \
+                             Until then, outbound text may reach the API provider UNMASKED (real PII, not \
+                             tokens). This is only about what the provider sees; the user always sees their \
+                             own plaintext. If the user asks why masking isn't on, tell them to restart \
+                             Claude Code once. Control with /zlauder:privacy."
                     }
                 })
             );
@@ -1541,10 +1550,36 @@ fn compose_line(segment: Option<String>, wrapped: Option<String>) -> String {
 /// 403 / stale state / unfamiliar shape) degrades to an explicit offline/off/unverified
 /// marker — never a false shield (review finding C5).
 fn render_segment(port: u16, root: &str, mode: SlMode) -> String {
+    // Ground truth for THIS session: does its ANTHROPIC_BASE_URL (inherited from Claude
+    // Code) actually point at our proxy? That reflects the route ACTUALLY applied to this
+    // session, not merely what settings.local.json says — Claude Code applies a route
+    // written during SessionStart to the current session only unreliably. If we're not
+    // routed, traffic is NOT masked through us right now, so say so honestly rather than
+    // render a health-based shield that would lie during the silent first-run leak window.
+    let base_url = format!("http://127.0.0.1:{port}");
+    if !session_routed_through(&base_url) {
+        return match zlauder_state::registry_get(root) {
+            // Plumbed, but the baked route hasn't been applied to THIS session yet — the
+            // first-run live-reload window. A one-time restart applies it reliably (every
+            // session after the first reads the route at startup, which always works).
+            Some(zlauder_state::PlumbState::Plumbed) => match mode {
+                SlMode::Min => "\u{27f3}".to_string(), // ⟳
+                _ => "\u{27f3} ZlauDeR: restart to mask".to_string(),
+            },
+            // Opted out (or not plumbed here) — this session is NOT masked through us.
+            _ => match mode {
+                SlMode::Min => "\u{2717}".to_string(), // ✗
+                _ => "\u{2717} ZlauDeR not masking".to_string(),
+            },
+        };
+    }
+    // Routed: this session's traffic flows through our proxy. Reflect its health + masking.
     if !proxy_healthy(port) {
+        // The route is live but the proxy isn't answering — requests fail/hang
+        // (ConnectionRefused). Distinct from "not routed through us at all".
         return match mode {
             SlMode::Min => "\u{26a0}".to_string(), // ⚠
-            _ => "\u{26a0} ZlauDeR offline".to_string(),
+            _ => format!("\u{26a0} ZlauDeR routed, proxy down :{port}"),
         };
     }
     // A healthy proxy on our port owned by a DIFFERENT project (a derived-port collision)
