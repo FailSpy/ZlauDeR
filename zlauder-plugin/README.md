@@ -56,7 +56,8 @@ Installing the plugin is, in the common case, all you do — **installed = route
    masking on/off live.
 
 Set `env.ZLAUDER_STATUSLINE=off` to hide the `🛡` segment (your own status line still
-shows), or `min`/`verbose` to change how much it shows.
+shows), `shield` to show the `🛡` ONLY when masking is confirmed (nothing in any other
+state), or `min`/`verbose` to change how much it shows.
 
 To stop routing: `/zlauder:disable` (this project; stops routing reliably after a one-time
 restart, and opts the project out of auto-routing). **Before uninstalling the plugin, run `/zlauder:disable --all`** to sweep

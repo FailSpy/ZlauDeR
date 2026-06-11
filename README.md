@@ -98,8 +98,9 @@ That's it for setup — **installed = routed**. The plugin's `SessionStart` hook
 auto-plumbs each project the first time it sees it: it resolves the binaries (shipped
 prebuilt, below), launches a proxy on an OS-assigned ephemeral port, and writes
 `.claude/settings.local.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a `🛡` status
-line that wraps any existing one as `🛡 … │ {your line}`; `ZLAUDER_STATUSLINE=off|min|verbose`
-tunes or hides the `🛡` segment). The plugin also writes a `.claude/.gitignore` for that
+line that wraps any existing one as `🛡 … │ {your line}`; `ZLAUDER_STATUSLINE=off|shield|min|verbose`
+tunes or hides the `🛡` segment — `shield` shows it ONLY when masking is confirmed and
+nothing otherwise). The plugin also writes a `.claude/.gitignore` for that
 file, so the machine-specific `http://127.0.0.1:<port>` can't be committed.
 
 By default `/plugin install` lands the plugin at **user scope**, so its `/zlauder:*`

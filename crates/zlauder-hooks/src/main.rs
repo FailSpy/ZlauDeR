@@ -2576,21 +2576,30 @@ fn reserve_port_cmd(config: Option<PathBuf>, proxy_bin: String) -> Result<()> {
 /// Defaults to `Compact`. `Off` hides the zlauder segment entirely — when the status
 /// line wraps a user's original line (see [`read_wrap_original`]), that original still
 /// prints, so `off` means "show only my line, no zlauder chrome", not "blank".
+/// `ShieldOnly` is the opposite bias: render the 🛡 ONLY when masking is CONFIRMED and
+/// render NOTHING in every other state (down / off / unverified / restart-to-mask) — for
+/// users who want a quiet line that appears solely as a positive masking indicator.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SlMode {
     Off,
+    /// Show 🛡 ONLY when masking is CONFIRMED; render nothing in every other state.
+    ShieldOnly,
     Min,
     Compact,
     Verbose,
 }
 
 fn sl_mode() -> SlMode {
-    match std::env::var("ZLAUDER_STATUSLINE")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-    {
+    sl_mode_from(std::env::var("ZLAUDER_STATUSLINE").ok().as_deref())
+}
+
+/// Pure `$ZLAUDER_STATUSLINE` → mode mapping (kept separate from `sl_mode` so it's
+/// unit-testable without mutating the process environment). Case- and space-insensitive;
+/// anything unrecognized falls back to `Compact`.
+fn sl_mode_from(raw: Option<&str>) -> SlMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("off" | "none" | "hidden" | "0" | "false") => SlMode::Off,
+        Some("shield" | "shield-only" | "shieldonly" | "quiet") => SlMode::ShieldOnly,
         Some("min" | "minimal" | "compact-min") => SlMode::Min,
         Some("verbose" | "full" | "all") => SlMode::Verbose,
         _ => SlMode::Compact,
@@ -2635,6 +2644,10 @@ fn statusline(port: Option<u16>) -> Result<()> {
 /// side may be absent: `off` mode drops the segment; an unwrapped/empty original drops
 /// the right side. Kept pure (no I/O) so the join rules are unit-testable.
 fn compose_line(segment: Option<String>, wrapped: Option<String>) -> String {
+    // A blank segment (ShieldOnly renders `Some("")` in every unconfirmed state) is treated
+    // as absent, so it degrades to the wrapped-only / empty arms below instead of emitting a
+    // stray leading `│` divider against a non-empty wrapped line.
+    let segment = segment.filter(|s| !s.trim().is_empty());
     match (segment, wrapped) {
         (Some(seg), Some(w)) if !w.trim().is_empty() => format!("{seg} \u{2502} {w}"),
         (Some(seg), _) => seg,
@@ -2658,16 +2671,29 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
         .map(|p| session_routed_through(&format!("http://127.0.0.1:{p}")))
         .unwrap_or(false);
     if !routed {
-        return match zlauder_state::registry_get(root) {
-            // Plumbed, but the baked route hasn't been applied to THIS session yet — the
-            // first-run live-reload window. A one-time restart applies it reliably (every
-            // session after the first reads the route at startup, which always works).
-            Some(zlauder_state::PlumbState::Plumbed) => match mode {
+        // GROUND TRUTH, not the persistent plumbed registry: is a route actually baked into
+        // THIS project's settings.local.json — i.e. one a restart WILL apply? The registry
+        // flag persists per-user and survives an out-of-band route removal (the user hand-
+        // deletes env.ANTHROPIC_BASE_URL/ZLAUDER_PORT, or a gitignored settings.local.json is
+        // simply absent on a fresh clone while the registry still says Plumbed). Keying
+        // "restart to mask" on that stale flag is a LIE — a restart finds no route to apply —
+        // and the intake gate stands down in the same state (not plumbed on disk), so traffic
+        // would egress UNMASKED while the line promises masking. project_baked_route makes the
+        // claim falsifiable and aligns render_segment with SessionStart/intake/--all, which
+        // all already read the on-disk route.
+        return match project_baked_route(root) {
+            // A route IS baked but hasn't been applied to THIS session yet — the first-run
+            // live-reload window. A one-time restart applies it reliably (every session after
+            // the first reads the route at startup, which always works).
+            Some(_) => match mode {
+                SlMode::ShieldOnly => String::new(),
                 SlMode::Min => "\u{27f3}".to_string(), // ⟳
                 _ => "\u{27f3} ZlauDeR: restart to mask".to_string(),
             },
-            // Opted out (or not plumbed here) — this session is NOT masked through us.
-            _ => match mode {
+            // No route baked here — this session is NOT masked through us, and a restart
+            // won't change that (opted out, never plumbed, or the route was removed).
+            None => match mode {
+                SlMode::ShieldOnly => String::new(),
                 SlMode::Min => "\u{2717}".to_string(), // ✗
                 _ => "\u{2717} ZlauDeR not masking".to_string(),
             },
@@ -2679,6 +2705,7 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
         // The route is live but the proxy isn't answering — requests fail/hang
         // (ConnectionRefused). Distinct from "not routed through us at all".
         return match mode {
+            SlMode::ShieldOnly => String::new(),
             SlMode::Min => "\u{26a0}".to_string(), // ⚠
             _ => format!("\u{26a0} ZlauDeR routed, proxy down :{port}"),
         };
@@ -2695,6 +2722,7 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
             Ok(s) if s.enabled => render_on(&s, port, mode),
             Ok(_) => match mode {
+                SlMode::ShieldOnly => String::new(),
                 SlMode::Min => "\u{26a0}".to_string(),
                 _ => format!("\u{26a0} ZlauDeR OFF :{port}"),
             },
@@ -2706,6 +2734,7 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
 
 fn unverified(port: u16, mode: SlMode) -> String {
     match mode {
+        SlMode::ShieldOnly => String::new(),
         SlMode::Min => "\u{2754}".to_string(), // ❔
         _ => format!("\u{2754} ZlauDeR :{port} (unverified)"),
     }
@@ -2717,6 +2746,9 @@ fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
     let ml = ml_indicator(s.ml.as_ref());
     match mode {
         SlMode::Off => String::new(),
+        // ShieldOnly's whole purpose: the bare 🛡, and ONLY here (confirmed-masking). Every
+        // other render path returns an empty string for ShieldOnly.
+        SlMode::ShieldOnly => "\u{1f6e1}".to_string(),
         SlMode::Min => "\u{1f6e1}".to_string(), // 🛡 only
         SlMode::Compact => format!(
             "\u{1f6e1} :{port} {}{}{}{}",
@@ -4179,6 +4211,88 @@ mod route_gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Q4: the not-routed statusline state is keyed on the ON-DISK baked route (ground
+    /// truth), not a persistent Plumbed registry flag. `port == None` ⇒ not routed ⇒ this
+    /// hits the not-routed branch directly, so the check is hermetic (no proxy/env/registry).
+    #[test]
+    fn render_segment_not_routed_keys_on_baked_route() {
+        let dir = std::env::temp_dir().join(format!("zlauder-rseg-q4-{}", std::process::id()));
+        let claude = dir.join(".claude");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&claude).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let settings = claude.join("settings.local.json");
+
+        // No route baked on disk → honest "not masking", NEVER a false "restart to mask"
+        // (a restart would find no route to apply). Holds even if a Plumbed registry entry
+        // existed for this root — the fix makes render_segment registry-independent.
+        assert_eq!(
+            render_segment(None, &root, SlMode::Compact),
+            "\u{2717} ZlauDeR not masking"
+        );
+
+        // A route baked into settings.local.json → honest "restart to mask": a restart WILL
+        // read and apply it (the legit first-run live-reload window).
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:41999","ZLAUDER_PORT":"41999"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_segment(None, &root, SlMode::Compact),
+            "\u{27f3} ZlauDeR: restart to mask"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4: ShieldOnly renders NOTHING in every non-masking state (the inverse of Min, which
+    /// always renders a glyph) — so the line appears solely as a positive masking indicator.
+    #[test]
+    fn shield_only_is_empty_in_non_masking_states() {
+        let dir = std::env::temp_dir().join(format!("zlauder-rseg-sh-{}", std::process::id()));
+        let claude = dir.join(".claude");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&claude).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let settings = claude.join("settings.local.json");
+
+        // Not routed, no baked route (Compact would show "✗ not masking") → empty.
+        assert_eq!(render_segment(None, &root, SlMode::ShieldOnly), "");
+        // Not routed, route baked (Compact would show "⟳ restart to mask") → still empty.
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:41999","ZLAUDER_PORT":"41999"}}"#,
+        )
+        .unwrap();
+        assert_eq!(render_segment(None, &root, SlMode::ShieldOnly), "");
+        // The unverified state (identity mismatch / parse failure) → empty under ShieldOnly.
+        assert_eq!(unverified(41999, SlMode::ShieldOnly), "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4: `$ZLAUDER_STATUSLINE` aliases map to ShieldOnly, and the ONE state it renders
+    /// non-empty is confirmed masking — a bare 🛡 (identical to Min's shield, via render_on).
+    #[test]
+    fn shield_only_parsing_and_confirmed_render() {
+        for s in ["shield", "Shield-Only", " SHIELDONLY ", "quiet"] {
+            assert_eq!(sl_mode_from(Some(s)), SlMode::ShieldOnly, "alias {s:?}");
+        }
+        assert_eq!(sl_mode_from(Some("min")), SlMode::Min);
+        assert_eq!(sl_mode_from(Some("off")), SlMode::Off);
+        assert_eq!(sl_mode_from(None), SlMode::Compact);
+
+        let snap: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]}
+        }))
+        .unwrap();
+        assert_eq!(render_on(&snap, 18820, SlMode::ShieldOnly), "\u{1f6e1}");
+        // Compact carries port/profile chrome, so it is NOT the bare shield.
+        assert_ne!(render_on(&snap, 18820, SlMode::Compact), "\u{1f6e1}");
+    }
+
     #[test]
     fn intake_gate_blocks_only_plumbed_unrouted_no_escape() {
         // The one BLOCK state: plumbed, not routed, not opted out, no escape hatch.
@@ -4445,6 +4559,19 @@ mod statusline_tests {
         );
         assert_eq!(compose_line(Some("🛡 off".into()), None), "🛡 off");
         assert_eq!(compose_line(None, None), "");
+    }
+
+    #[test]
+    fn compose_normalizes_blank_segment() {
+        // A blank ShieldOnly segment + a real wrapped line => just the wrapped line, with NO
+        // stray leading "│" divider (the bug this normalization closes).
+        assert_eq!(
+            compose_line(Some("".into()), Some("⎇ main".into())),
+            "⎇ main"
+        );
+        // Whitespace-only segment is likewise treated as absent.
+        assert_eq!(compose_line(Some("   ".into()), None), "");
+        assert_eq!(compose_line(Some("  ".into()), Some("⎇ main".into())), "⎇ main");
     }
 
     #[test]

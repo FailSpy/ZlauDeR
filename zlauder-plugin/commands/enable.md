@@ -19,7 +19,8 @@ and a `🛡` status line — wrapping any
 line you already had as `🛡 … │ {your line}` (the original is saved and restored on
 `/zlauder:disable`) — and seeds a practical starter `zlauder.toml` if absent. The
 exhaustive reference is `zlauder.toml.example`. Hide the `🛡` segment with
-`env.ZLAUDER_STATUSLINE=off`.
+`env.ZLAUDER_STATUSLINE=off`, or show it ONLY when masking is confirmed with
+`env.ZLAUDER_STATUSLINE=shield`.
 
 Report the result above, then make the activation model clear: a freshly-written route
 takes effect reliably only after a **one-time restart** of Claude Code (it reads

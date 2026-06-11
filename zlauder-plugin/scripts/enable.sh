@@ -20,7 +20,8 @@ set -euo pipefail
 # statusline` runs that original (forwarding stdin) and prints `🛡 … │ {their line}`,
 # and `/zlauder:disable` restores it from the sidecar. If the slot was empty, our
 # segment stands alone. Set `env.ZLAUDER_STATUSLINE=off` to hide our segment (the
-# wrapped line still shows); `min`/`verbose` change how much it shows.
+# wrapped line still shows); `shield` shows the 🛡 ONLY when masking is confirmed and
+# nothing in any other state; `min`/`verbose` change how much it shows.
 # Idempotent: re-running is a no-op once the values are already present.
 
 # Share the SessionStart resolver so the binaries are found the SAME way (PATH ->
