@@ -33,8 +33,9 @@ sleep 1.2
 log "proxy_healthz=$(curl -sS -m 3 http://127.0.0.1:18820/healthz)"
 
 # 2b) /privacy control plane: the same endpoints the slash command drives.
-#     KEY is the proxy's session key (admin_key) from the state file it wrote.
-KEY=$(grep -oE '"admin_key": "[0-9a-f]+"' state/proxy-18820.json | grep -oE '[0-9a-f]{64}')
+#     KEY is the proxy's session key (admin_key) from the project-keyed rendezvous record
+#     it published (state/proxy/<hash>.json — the one file in this isolated state dir).
+KEY=$(grep -oE '"admin_key": "[0-9a-f]+"' state/proxy/*.json | grep -oE '[0-9a-f]{64}')
 log "config_show=$("$BIN/zlauder-hooks" config show --port 18820 2>&1 | head -1)"
 # Unauthenticated disable must be refused (the prompt-injection defense).
 log "unauth_disable_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18820/zlauder/disable)"
