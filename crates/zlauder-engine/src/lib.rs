@@ -305,6 +305,9 @@ impl MaskEngine {
         analyzer.add_recognizer(Arc::new(recognizers::DateOfBirthRecognizer::new()));
         analyzer.add_recognizer(Arc::new(recognizers::CardExpiryRecognizer::new()));
         analyzer.add_recognizer(Arc::new(recognizers::CvvRecognizer::new()));
+        // Context-based in-URL/config credential recognizer → URL_CREDENTIAL (Secrets).
+        // Stays effective when `Network` (the URL entity) is off — design §3.
+        analyzer.add_recognizer(Arc::new(recognizers::UrlCredentialRecognizer::new()));
         let cache_cap = config.detection_cache_cap;
         let policy = Policy::new(config)?;
         Ok(Self {
@@ -1556,11 +1559,15 @@ mod tests {
         assert_eq!(out.manifest.len(), 1);
     }
 
-    // presidio's strict UrlRecognizer (default) drops scheme-less filenames/code
-    // (`CLAUDE.md`, `opts.la`) while still masking real URLs.
+    // presidio's strict UrlRecognizer drops scheme-less filenames/code
+    // (`CLAUDE.md`, `opts.la`) while still masking real URLs. URL lives in the
+    // `Network` category (OFF in the default Balanced profile), so this test enables
+    // it explicitly to exercise the recognizer.
     #[test]
     fn strict_url_skips_filenames_keeps_real_urls() {
-        let e = engine();
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(Category::Network);
+        let e = MaskEngine::new(cfg).unwrap();
         let text = "edit CLAUDE.md and opts.la then open https://corp.example.com/secret and mail bob@example.com";
         let out = e.mask(text, Surface::UserMessage).unwrap();
         assert!(
@@ -1581,6 +1588,228 @@ mod tests {
         assert!(!out.masked_text.contains("bob@example.com"));
         assert!(out.masked_text.contains("[URL_"));
         assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
+    }
+
+    // Taxonomy: Network is its own category holding the infra identifiers; Contact
+    // keeps only the person-reachable PII. Locks the split so a future edit can't
+    // silently fold URL/IP back into Contact (which would re-enable them by default).
+    #[test]
+    fn network_category_split_membership() {
+        assert_eq!(Category::ALL.len(), 6, "Network must be a distinct category");
+        let net = Category::Network.entity_types();
+        for e in ["IP_ADDRESS", "URL", "MAC_ADDRESS"] {
+            assert!(net.contains(&e), "Network must list {e}");
+        }
+        let contact = Category::Contact.entity_types();
+        assert_eq!(contact, &["EMAIL_ADDRESS", "PHONE_NUMBER"]);
+        for e in ["IP_ADDRESS", "URL", "MAC_ADDRESS"] {
+            assert!(!contact.contains(&e), "Contact must NOT list {e} anymore");
+        }
+    }
+
+    // Default (Balanced) profile: infra identifiers pass through verbatim (model keeps
+    // the context) while person-PII still masks. The whole point of the Network split.
+    #[test]
+    fn balanced_default_passes_network_masks_contact() {
+        let e = engine();
+        let text =
+            "GET https://api.example.com/v1/x from 192.168.1.5 (also 0.0.0.0:3000); ping bob@example.com";
+        let out = e.mask(text, Surface::UserMessage).unwrap();
+        // Infra: untouched.
+        assert!(
+            out.masked_text.contains("https://api.example.com/v1/x"),
+            "URL must pass through at Balanced: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("192.168.1.5"),
+            "IP must pass through at Balanced: {}",
+            out.masked_text
+        );
+        assert!(!out.masked_text.contains("[URL_"));
+        assert!(!out.masked_text.contains("[IP_ADDRESS_"));
+        // Person-PII: still masked.
+        assert!(!out.masked_text.contains("bob@example.com"));
+        assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
+    }
+
+    // The crux of the Network split: at the DEFAULT profile (Network OFF, so the URL
+    // itself is NOT masked), an opaque credential *inside* a URL — one with no
+    // recognizable secret shape — is still masked, while the surrounding URL structure
+    // survives verbatim. Covers query-param values and userinfo.
+    #[test]
+    fn in_url_credential_masked_at_default_while_url_survives() {
+        let e = engine();
+        let text = "curl https://api.example.com/v1/users?token=hunter2opaquevalue&id=42 \
+                    and pg postgres://admin:s3cr3tPw0rd@db.example.com/app";
+        let out = e.mask(text, Surface::UserMessage).unwrap();
+
+        // Opaque param credential gone; URL host/path/other-params survive.
+        assert!(
+            !out.masked_text.contains("hunter2opaquevalue"),
+            "opaque ?token= value must be masked: {}",
+            out.masked_text
+        );
+        assert!(out.masked_text.contains("[URL_CREDENTIAL_"));
+        assert!(
+            out.masked_text.contains("https://api.example.com/v1/users?token="),
+            "URL structure up to the credential must survive: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("&id=42"),
+            "benign trailing param must survive: {}",
+            out.masked_text
+        );
+        // URL itself NOT tokenized (Network off).
+        assert!(!out.masked_text.contains("[URL_]"));
+        assert!(!out.masked_text.contains("[URL_0"));
+
+        // Userinfo password gone; scheme + host + path survive.
+        assert!(
+            !out.masked_text.contains("s3cr3tPw0rd") && !out.masked_text.contains("admin:s3cr3tPw0rd"),
+            "userinfo credential must be masked: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("@db.example.com/app"),
+            "host/path after userinfo must survive: {}",
+            out.masked_text
+        );
+        assert!(out.masked_text.contains("postgres://"));
+
+        // A scheme URL with a bare username (no `:password`) is NOT userinfo
+        // credentials — the userinfo reading requires the `user:pass` colon. (Uses a
+        // dotless host so the email recognizer doesn't independently grab `user@host`.)
+        let nocolon = e
+            .mask("deploy via ssh://deploy@server/srv now", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !nocolon.masked_text.contains("[URL_CREDENTIAL_"),
+            "bare user@host must not be a URL credential: {}",
+            nocolon.masked_text
+        );
+        assert!(nocolon.masked_text.contains("ssh://deploy@server/srv"));
+    }
+
+    // Independence from the URL entity: the credential value is masked whether Network
+    // is OFF (URL passes through) or ON (URL would also match) — overlap resolution
+    // never lets the inner credential leak. Round-trips both ways.
+    #[test]
+    fn in_url_credential_masked_regardless_of_network_state() {
+        let secret = "letMeIn-OPAQUE-pw";
+        let text = format!("open https://svc.example.com/login?password={secret}");
+
+        for network_on in [false, true] {
+            let mut cfg = EngineConfig::default();
+            if network_on {
+                cfg.enabled_categories.insert(Category::Network);
+            }
+            let e = MaskEngine::new(cfg).unwrap();
+            let out = e.mask(&text, Surface::UserMessage).unwrap();
+            assert!(
+                !out.masked_text.contains(secret),
+                "credential leaked with network_on={network_on}: {}",
+                out.masked_text
+            );
+            // Reversible round-trip.
+            let back = e.unmask(&out.masked_text, &out.manifest).unwrap();
+            assert_eq!(back, text, "round-trip failed with network_on={network_on}");
+        }
+    }
+
+    // Regression battery for the ship-gate findings on the URL_CREDENTIAL recognizer.
+    // Each case is at the Balanced default (Network off). Negatives assert NO credential
+    // token; positives assert the secret VALUE is absent (not a brittle token match).
+    #[test]
+    fn in_url_credential_patch_battery() {
+        let e = engine();
+        let masks = |t: &str| e.mask(t, Surface::UserMessage).unwrap().masked_text;
+        // Values are deliberately LOW-ENTROPY (`letmein…`, short digits) so the generic
+        // high-entropy API_KEY catch-all does NOT mask them — any masking below is proof
+        // the new context recognizer fired, not an entropy backstop. `[URL_CREDENTIAL_`
+        // presence confirms the path.
+
+        // F1 — JSON-quoted key (quote sits between name and `:`).
+        let out = masks(r#"config {"token":"letmein"}"#);
+        assert!(!out.contains("letmein"), "JSON cred leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "JSON path must fire: {out}");
+
+        // F2 — single-level percent-encoded nested redirect (`%3F`/`%3D`).
+        let out = masks("https://app/cb?next=https%3A%2F%2Fx%3Ftoken%3Dletmein-nested");
+        assert!(!out.contains("letmein-nested"), "encoded nested cred leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "encoded path must fire: {out}");
+
+        // F2b (round-2) — fully percent-encoded JSON fragment (encoded quotes).
+        let out = masks("cb?state=%7B%22token%22%3A%22letmein%22%7D");
+        assert!(!out.contains("letmein"), "encoded-JSON cred leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "encoded-JSON path must fire: {out}");
+
+        // F3 — previously-missing common names.
+        for (t, secret) in [
+            ("clone with ?pat=letmein-pat", "letmein-pat"),
+            ("login ?otp=314159 now", "314159"),
+            ("dsn ?session_id=letmein-sess", "letmein-sess"),
+            ("aws ?access_key_id=letmein-akid set", "letmein-akid"),
+        ] {
+            let out = masks(t);
+            assert!(!out.contains(secret), "missing-name cred leaked ({secret}): {out}");
+            assert!(out.contains("[URL_CREDENTIAL_"), "name {secret} must fire: {out}");
+        }
+
+        // F4 — bare `key` / uncurated `*-key` must NOT be masked (FP). Text survives verbatim.
+        for benign in [
+            "ORDER BY sort-key=colname",
+            "public-key=id_rsa.pub",
+            "the map key: colname here",
+        ] {
+            let out = masks(benign);
+            assert!(
+                !out.contains("[URL_CREDENTIAL_"),
+                "bare key false-positive: {out}"
+            );
+            assert_eq!(out, benign, "benign key text must survive verbatim");
+        }
+        // ...but a curated hyphenated form (api-key) IS still caught.
+        let out = masks("send ?api-key=letmein-apikey here");
+        assert!(!out.contains("letmein-apikey"), "api-key must mask: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"));
+
+        // F5 — comma in a secret value does not leak its tail (`,` not a terminator).
+        let out = masks("GET https://h/p?token=ab,cd,ef&id=1");
+        assert!(!out.contains("ab,cd,ef"), "comma-value tail leaked: {out}");
+        assert!(out.contains("&id=1"), "trailing param must survive: {out}");
+
+        // F6 — password-only DSN: the credential does not leak end-to-end (here the
+        // whole authority is masked by the API_KEY backstop; the userinfo recognizer's
+        // exact span is proven in recognizers.rs `url_credential_value_only_spans`).
+        let out = masks("redis://:letmein@cache/0");
+        assert!(!out.contains("letmein"), "password-only DSN leaked: {out}");
+
+        // F7 (round-3) — non-Bearer Authorization header: the credential after the scheme is
+        // masked, not just the `Basic` word (low-entropy value ⇒ proves URL_CREDENTIAL fired).
+        let out = masks("Authorization: Basic letmein-basic now");
+        assert!(!out.contains("letmein-basic"), "Basic-scheme credential leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "Basic scheme skip must fire: {out}");
+
+        // F8 (round-3) — DOUBLE percent-encoded redirect: decoded across levels so the
+        // low-entropy nested credential is caught.
+        let out = masks("cb?next=https%253A%252F%252Fx%253Ftoken%253Dletmein-dbl");
+        assert!(!out.contains("letmein-dbl"), "double-encoded cred leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "double-encoded path must fire: {out}");
+
+        // F9 (round-4) — JSON-quoted Authorization value: opening quote consumed before the
+        // scheme skip, so the credential (not the `Basic` word) is masked.
+        let out = masks(r#"hdrs {"authorization":"Basic letmein-q"}"#);
+        assert!(!out.contains("letmein-q"), "quoted Basic auth leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "quoted-auth path must fire: {out}");
+
+        // F10 (round-4) — MIXED encoding: separator single-encoded (`%3D`), a value-internal
+        // `&` double-encoded (`%2526`). The whole value is visible only at the INTERMEDIATE
+        // decode level, so per-level scanning masks it whole — the tail must not leak.
+        let out = masks("cb x%3Ftoken%3Dletmein%2526tailz end");
+        assert!(!out.contains("tailz"), "intermediate-level cred tail leaked: {out}");
+        assert!(out.contains("[URL_CREDENTIAL_"), "intermediate-level path must fire: {out}");
     }
 
     // The control token is derived from the key (stable for a key) but is NOT the
@@ -1868,13 +2097,7 @@ mod tests {
             !cfg.entity_enabled("DATE_TIME"),
             "DATE_TIME must be off by default"
         );
-        for c in [
-            Category::Secrets,
-            Category::Financial,
-            Category::Identity,
-            Category::Contact,
-            Category::Personal,
-        ] {
+        for c in Category::ALL {
             assert!(
                 !c.entity_types().contains(&"DATE_TIME"),
                 "{c:?} unexpectedly lists DATE_TIME"

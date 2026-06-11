@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unified zlauder privacy control plane — backs /zlauder:privacy. Subsumes the old
-# status / reveal commands and the on/off/profile/category/threshold verbs.
+# status / reveal commands and the on/off/profile/category/entity/threshold verbs.
 #
 # Observer-style: never aborts hard (no `set -e`), and resolves binaries with
 # --no-build — config/status/reveal all need a *running* proxy, which a build can't
@@ -54,7 +54,7 @@ case "$sub" in
     echo "Masking:"
     "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config || true
     ;;
-  on | off | profile | category | threshold)
+  on | off | profile | category | threshold | entity)
     # Masking verbs (and any --scope flag) pass straight through to the CLI.
     exec "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" config "$@"
     ;;
@@ -97,7 +97,7 @@ case "$sub" in
     esac
     ;;
   *)
-    echo "unknown subcommand '$sub'. usage: /zlauder:privacy [status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token> | scrub --transcript <jsonl> (--value <text> | --values-file <file>)] [--scope session|project|user|local]" >&2
+    echo "unknown subcommand '$sub'. usage: /zlauder:privacy [status | on | off | profile <name> | category <name> on|off | entity <TYPE> <on|off|token|redact|hash|keep|mask|clear> | threshold <0-1> | model <download|on|off|status> | reveal <token> | scrub --transcript <jsonl> (--value <text> | --values-file <file>)] [--scope session|project|user|local]" >&2
     exit 2
     ;;
 esac

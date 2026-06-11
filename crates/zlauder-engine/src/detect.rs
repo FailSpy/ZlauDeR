@@ -41,7 +41,17 @@ use crate::surface::Surface;
 // `MaskEngine::from_parts`, plus the ML `private_date` → PRIVATE_DATE remap. New
 // recognizers + the remap change detection output for unchanged text, so bump to abandon
 // stale cache entries that predate them.
-pub const DETECTOR_VERSION: u64 = 6;
+// v7: added the context-based UrlCredentialRecognizer → URL_CREDENTIAL (Secrets). It
+// masks sensitive-named query-param values and URL userinfo regardless of value shape,
+// so a credential inside a URL stays masked after URL/IP/MAC moved to the (default-off)
+// `Network` category. New recognizer changes output for unchanged text — bump to abandon
+// stale cache.
+// v8: UrlCredentialRecognizer now skips non-Bearer auth schemes (Basic/Digest/Negotiate/
+// NTLM), incl. after a JSON-quoted name, so `Authorization: Basic <b64>` masks the
+// credential; and it scans EVERY percent-decode level (to a bounded fixpoint) so multiply-
+// and mixed-encoded (`%253D`, `%2526`) structures are caught. These change detection output
+// for unchanged text — bump.
+pub const DETECTOR_VERSION: u64 = 8;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -728,7 +738,10 @@ mod precision_tests {
             "this_is_a_very_long_snake_case_identifier_name_here",
             "4f3a2b1c9d8e7f6a5b4c3d2e1f0a9b8c", // 32-hex digest
             "0123456789abcdef0123456789abcdef", // uniform 32-hex (entropy 4.0)
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709", // 40-hex git SHA-1
             "550e8400-e29b-41d4-a716-446655440000", // UUID
+            "src/recognizers/url_credential_value_only_spans", // long path component
+            "build-artifact-cache-key-for-the-ci-pipeline-step", // long kebab id
         ] {
             assert!(
                 !plausible_generic_secret(s),

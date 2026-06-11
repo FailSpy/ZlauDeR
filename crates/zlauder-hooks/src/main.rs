@@ -219,7 +219,7 @@ enum ConfigAction {
     },
     /// Enable or disable one entity category.
     Category {
-        /// e.g. secrets, financial, identity, contact, personal.
+        /// e.g. secrets, financial, identity, contact, network, personal.
         name: String,
         #[arg(value_enum)]
         state: OnOff,
@@ -229,6 +229,18 @@ enum ConfigAction {
     /// Set the detection score threshold (0.0–1.0; lower = more aggressive).
     Threshold {
         value: f32,
+        #[arg(long, value_enum, default_value_t = Scope::Session)]
+        scope: Scope,
+    },
+    /// Set the operator for ONE entity type — finer-grained than a whole category.
+    /// e.g. `entity URL off` (pass URLs through), `entity URL_CREDENTIAL redact`.
+    Entity {
+        /// Canonical entity type, e.g. URL, EMAIL_ADDRESS, URL_CREDENTIAL, US_SSN, IP_ADDRESS.
+        name: String,
+        /// on (mask with the default token) | off (pass through) | token | redact | hash |
+        /// keep | mask | clear (remove the override; file scope only). `on`/`off` work
+        /// regardless of the entity's category.
+        op: String,
         #[arg(long, value_enum, default_value_t = Scope::Session)]
         scope: Scope,
     },
@@ -2395,6 +2407,7 @@ fn config_cmd(action: Option<ConfigAction>) -> Result<()> {
             apply_category(port, &root, scope, &name, matches!(state, OnOff::On))?
         }
         ConfigAction::Threshold { value, scope } => apply_threshold(port, &root, scope, value)?,
+        ConfigAction::Entity { name, op, scope } => apply_entity(port, &root, scope, &name, &op)?,
         ConfigAction::Ml { action } => ml_cmd(port, &root, action.unwrap_or(MlAction::Status))?,
     }
     Ok(())
@@ -2635,6 +2648,128 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
     finish_file_scope(port, scope, root, "reload")
 }
 
+/// Per-entity operator override (`config entity <TYPE> <op>`) — the finer-grained
+/// sibling of `apply_category`. Writes `entity_operators[<TYPE>]`, which both GATES the
+/// type (`entity_enabled` is true for any keyed type) and sets how it masks — so
+/// `on`/`off` work regardless of the type's category (e.g. enable URL masking without
+/// turning the whole Network category on). `clear` removes an override (file scope only).
+fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Result<()> {
+    let (name, builtin) = resolve_entity_type(name);
+    if !builtin {
+        // Not a typo we can prove here — could be a declared `[[custom_replacements]]`
+        // type. Pass it through verbatim; at session scope the proxy's PUT validation
+        // makes the final call (rejecting a true typo against canonical + declared
+        // custom types), and a file-scope write is a no-op until such a rule exists.
+        eprintln!(
+            "note: '{name}' is not a built-in entity type; it applies only if it matches a declared [[custom_replacements]] entity_type."
+        );
+    }
+
+    if op.eq_ignore_ascii_case("clear") {
+        return clear_entity(port, root, scope, &name);
+    }
+
+    let (op_json, op_toml) = entity_operator_value(op)?;
+
+    // Footgun guard (not a block — zlauder's everything-configurable contract): setting a
+    // SECRETS-category entity to pass-through reintroduces a credential-exposure path.
+    if matches!(op.to_lowercase().as_str(), "off" | "keep")
+        && zlauder_engine::Category::Secrets
+            .entity_types()
+            .contains(&name.as_str())
+    {
+        eprintln!(
+            "WARNING: '{name}' is a Secrets-category entity; '{op}' lets matching values reach the upstream model — this weakens a default-on protection."
+        );
+    }
+
+    if scope == Scope::Session {
+        let key =
+            key_for(root).context("proxy not running; use --scope project/user to persist")?;
+        // Minimal MERGE patch (not the whole fetched config): the control-plane PUT
+        // recurses into `entity_operators`, so this overlays exactly the one key —
+        // race-safe (a concurrent edit to another key isn't clobbered by stale GET data)
+        // and the proxy validates this delta's key (rejecting a typo).
+        let patch = json!({ "entity_operators": { name.clone(): op_json } });
+        let snap = admin_put(port, &key, &patch)?;
+        print_applied(&snap, port, "session")?;
+        return Ok(());
+    }
+    edit_scope_file(scope, root, move |doc| {
+        doc["engine"]["entity_operators"][name.as_str()] = toml_edit::value(op_toml);
+    })?;
+    finish_file_scope(port, scope, root, "reload")
+}
+
+/// Remove a per-entity override. Only meaningful at a FILE scope: the live session merge
+/// is additive (it cannot delete a key), and a `reload` would reset ALL session state,
+/// so a session-only override is cleared by reload/restart, not surgically here.
+fn clear_entity(port: u16, root: &str, scope: Scope, name: &str) -> Result<()> {
+    if scope == Scope::Session {
+        bail!(
+            "clearing an override needs a file scope (--scope project/user/local); the live session merge cannot remove a key (a session-only override is dropped on the next reload/restart)"
+        );
+    }
+    let name = name.to_string();
+    edit_scope_file(scope, root, move |doc| {
+        if let Some(tbl) = doc["engine"]["entity_operators"].as_table_like_mut() {
+            tbl.remove(&name);
+        }
+    })?;
+    finish_file_scope(port, scope, root, "reload")
+}
+
+/// Resolve a user-supplied entity type to its stored form + whether it is a recognized
+/// BUILT-IN (a canonical category member, or the deliberately-uncategorized `DATE_TIME`/
+/// `DOMAIN` opt-ins). Built-ins accept an upper-cased convenience (`url` → `URL`); any
+/// other input is returned VERBATIM (case-preserved, so a mixed-case custom type isn't
+/// mangled) with `false` so the caller can warn / defer to the proxy.
+fn resolve_entity_type(name: &str) -> (String, bool) {
+    let known = zlauder_engine::Category::canonical_entity_types();
+    let is_builtin = |n: &str| known.contains(n) || n == "DATE_TIME" || n == "DOMAIN";
+    if is_builtin(name) {
+        return (name.to_string(), true);
+    }
+    let upper = name.to_uppercase();
+    if is_builtin(&upper) {
+        return (upper, true);
+    }
+    (name.to_string(), false)
+}
+
+/// Parse an entity operator argument into its (JSON for the live PUT, TOML inline table
+/// for a file scope) forms. `on` masks with the default reversible token; `off`/`keep`
+/// detect-but-pass-through. `broker`/`local` are rejected — those are the registered-
+/// secret channel, never a per-entity detection override.
+fn entity_operator_value(op: &str) -> Result<(Value, toml_edit::InlineTable)> {
+    let (kind, is_mask) = match op.to_lowercase().as_str() {
+        "on" | "token" => ("token", false),
+        "off" | "keep" => ("keep", false),
+        "redact" => ("redact", false),
+        "hash" => ("hash", false),
+        "mask" => ("mask", true),
+        "broker" | "local" => {
+            bail!("operator '{op}' is reserved for registered secrets, not a per-entity override")
+        }
+        other => bail!(
+            "unknown operator '{other}'. valid: on, off, token, redact, hash, keep, mask"
+        ),
+    };
+    let mut j = serde_json::Map::new();
+    j.insert("kind".into(), json!(kind));
+    let mut t = toml_edit::InlineTable::new();
+    t.insert("kind", kind.into());
+    if is_mask {
+        // Default Mask shape (last 4 visible), matching the `[engine.entity_operators]`
+        // example; a custom char/from_end is set in TOML directly.
+        j.insert("char".into(), json!("*"));
+        j.insert("from_end".into(), json!(4));
+        t.insert("char", "*".into());
+        t.insert("from_end", toml_edit::Value::from(4));
+    }
+    Ok((Value::Object(j), t))
+}
+
 /// After editing a scope file: apply it live (if the proxy is up) via `action`, and
 /// report where it was persisted. Most edits use `"reload"` (re-read the files);
 /// the master switch uses `"enable"`/`"disable"` because `reload` deliberately
@@ -2662,6 +2797,102 @@ fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Resul
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::{entity_operator_value, resolve_entity_type};
+
+    #[test]
+    fn resolve_entity_type_marks_builtins_and_passes_custom_verbatim() {
+        // canonical category members (incl. the new ones) resolve as built-in, as-is.
+        for ok in ["URL", "IP_ADDRESS", "EMAIL_ADDRESS", "US_SSN", "URL_CREDENTIAL"] {
+            assert_eq!(resolve_entity_type(ok), (ok.to_string(), true));
+        }
+        // deliberately-uncategorized opt-ins are recognized built-in keys.
+        assert_eq!(resolve_entity_type("DATE_TIME").1, true);
+        assert_eq!(resolve_entity_type("DOMAIN").1, true);
+        // lowercase convenience upper-cases a built-in.
+        assert_eq!(resolve_entity_type("url"), ("URL".to_string(), true));
+        // a mixed-case custom type is passed through VERBATIM (not mangled), flagged
+        // non-built-in so the caller warns / the proxy validates.
+        assert_eq!(
+            resolve_entity_type("ProjectCode"),
+            ("ProjectCode".to_string(), false)
+        );
+        // typos resolve as non-built-in (the proxy PUT makes the final call).
+        for bad in ["EMIAL", "URLS", "IBAN"] {
+            assert_eq!(resolve_entity_type(bad).1, false, "{bad} should be non-builtin");
+        }
+    }
+
+    #[test]
+    fn clear_removes_entity_operator_key_from_toml() {
+        let mut doc = "[engine.entity_operators]\nURL = { kind = \"keep\" }\nUS_SSN = { kind = \"redact\" }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        // Mirror clear_entity's removal.
+        if let Some(tbl) = doc["engine"]["entity_operators"].as_table_like_mut() {
+            tbl.remove("URL");
+        }
+        let out = doc.to_string();
+        assert!(!out.contains("URL ="), "URL override should be gone: {out}");
+        assert!(out.contains("US_SSN"), "other overrides must survive: {out}");
+    }
+
+    #[test]
+    fn entity_operator_value_maps_on_off_and_named() {
+        let kind = |op: &str| {
+            entity_operator_value(op)
+                .unwrap()
+                .0
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(kind("on"), "token");
+        assert_eq!(kind("off"), "keep");
+        assert_eq!(kind("token"), "token");
+        assert_eq!(kind("redact"), "redact");
+        assert_eq!(kind("hash"), "hash");
+        assert_eq!(kind("keep"), "keep");
+        // case-insensitive
+        assert_eq!(kind("OFF"), "keep");
+
+        // mask carries the default char/from_end in BOTH the JSON and TOML forms.
+        let (j, t) = entity_operator_value("mask").unwrap();
+        assert_eq!(j.get("kind").and_then(|v| v.as_str()), Some("mask"));
+        assert_eq!(j.get("char").and_then(|v| v.as_str()), Some("*"));
+        assert_eq!(j.get("from_end").and_then(|v| v.as_i64()), Some(4));
+        assert_eq!(t.get("kind").and_then(|v| v.as_str()), Some("mask"));
+        assert!(t.get("char").is_some() && t.get("from_end").is_some());
+
+        // secrets-channel operators and garbage are rejected.
+        for bad in ["broker", "local", "bogus", ""] {
+            assert!(entity_operator_value(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    // The file-scope path writes `doc["engine"]["entity_operators"][TYPE]` — a 3-level
+    // nesting. Prove it auto-vivifies under the `engine` table `edit_scope_file`
+    // guarantees, renders, and re-parses to the expected operator shape.
+    #[test]
+    fn entity_operator_toml_nests_and_reparses() {
+        let (_j, t) = entity_operator_value("off").unwrap();
+        let mut doc = toml_edit::DocumentMut::new();
+        doc["engine"] = toml_edit::Item::Table(toml_edit::Table::new());
+        doc["engine"]["entity_operators"]["URL"] = toml_edit::value(t);
+        let rendered = doc.to_string();
+        let reparsed = rendered
+            .parse::<toml_edit::DocumentMut>()
+            .expect("rendered entity_operators must be valid TOML");
+        assert_eq!(
+            reparsed["engine"]["entity_operators"]["URL"]["kind"].as_str(),
+            Some("keep"),
+            "rendered toml: {rendered}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2901,7 +3132,9 @@ fn json_or_err(resp: reqwest::blocking::Response) -> Result<Value> {
 fn validate_category(name: &str) -> Result<()> {
     // Round-trip through the engine's Category enum (snake_case) for validity.
     if serde_json::from_value::<zlauder_engine::Category>(json!(name)).is_err() {
-        bail!("unknown category '{name}'. valid: secrets, financial, identity, contact, personal");
+        bail!(
+            "unknown category '{name}'. valid: secrets, financial, identity, contact, network, personal"
+        );
     }
     Ok(())
 }

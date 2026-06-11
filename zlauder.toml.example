@@ -42,7 +42,8 @@ language = "en"
 #             CREDIT_CARD_EXPIRATION, CVV
 #   identity  SSN/ITIN, national IDs, passports, driver's licenses, medical IDs,
 #             DATE_OF_BIRTH, PRIVATE_DATE
-#   contact   EMAIL_ADDRESS, PHONE_NUMBER, IP_ADDRESS, URL, MAC_ADDRESS
+#   contact   EMAIL_ADDRESS, PHONE_NUMBER
+#   network   IP_ADDRESS, URL, MAC_ADDRESS  (off in balanced; on in strict)
 #   personal  PERSON, LOCATION, ORGANIZATION; requires [engine.ml] to be ready
 #
 # DATE_OF_BIRTH / CREDIT_CARD_EXPIRATION / CVV are hard-context recognizers: they only

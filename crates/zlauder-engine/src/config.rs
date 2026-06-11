@@ -8,9 +8,9 @@ use crate::surface::Surface;
 
 // --- Custom entity-string contract (shared recognizer ↔ config gate) ---------
 //
-// These four `Custom` entity types are NOT canonical `presidio_core::EntityType`
-// Display names — they are zlauder-local labels emitted by the hard-context regex
-// recognizers (DOB / card-expiry / CVV) and by the ML `private_date` remap. The
+// These zlauder-local `Custom` entity types are NOT canonical `presidio_core::EntityType`
+// Display names — they are labels emitted by the hard-context regex recognizers (DOB /
+// card-expiry / CVV / URL-credential) and by the ML `private_date` remap. The
 // category gate (`entity_enabled`) matches on the EXACT emitted string, so the
 // recognizer's emitted label and the `Category::entity_types()` entry MUST be the
 // SAME string — a desync silently no-ops the gate (every detection of that type is
@@ -50,6 +50,21 @@ pub const ENTITY_CVV: &str = "CVV";
 /// `entity_kind`-displaying surface. `DATE_OF_BIRTH` stays reserved for the
 /// hard-context regex recognizer.
 pub const ENTITY_PRIVATE_DATE: &str = "PRIVATE_DATE";
+/// Credential embedded in a URL / config string — a sensitive-named query param
+/// value (`?token=…`, `password=…`) or URL userinfo (`scheme://user:pass@host`)
+/// → [`Category::Secrets`]. Lives in the always-on Secrets category (NOT Network)
+/// so that turning `Network` off — which stops masking the URL itself — never stops
+/// masking a credential *inside* a URL. Caught by the context-based
+/// `UrlCredentialRecognizer` (matches by param-name / userinfo position, not by
+/// value shape), so it covers opaque/low-entropy secrets that the entropy-gated
+/// generic API_KEY catch-all misses. Reserved system entity name. See [`Category::Network`].
+///
+/// Operator: inherits the profile `default_operator` (reversible `Token`), matching the
+/// other detected secret entities (`API_KEY`, …) and the project's reversible-on-wire
+/// model — the value never reaches the upstream LLM, but stays revealable for local
+/// audit. Deployments wanting it irreversible can set `entity_operators.URL_CREDENTIAL`
+/// to `Hash`/`Redact`.
+pub const ENTITY_URL_CREDENTIAL: &str = "URL_CREDENTIAL";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,7 +102,10 @@ impl Profile {
     pub fn default_categories(self) -> HashSet<Category> {
         use Category::*;
         let v: &[Category] = match self {
-            Profile::Strict => &[Secrets, Financial, Identity, Contact, Personal],
+            Profile::Strict => &[Secrets, Financial, Identity, Contact, Network, Personal],
+            // Balanced (default) deliberately OMITS Network: URL/IP/MAC are
+            // load-bearing infra context, not PII, and a real secret inside a URL
+            // is still caught via `URL_CREDENTIAL` (Secrets) regardless.
             Profile::Balanced => &[Secrets, Financial, Identity, Contact],
             Profile::Minimal => &[Secrets, Financial],
             Profile::SecretsOnly => &[Secrets],
@@ -111,16 +129,25 @@ pub enum Category {
     Financial,
     Identity,
     Contact,
+    /// Network / infrastructure identifiers (URL, IP, MAC). Split out of `Contact`
+    /// because — unlike email/phone — these are load-bearing context in a coding
+    /// tool's traffic (API endpoints, docs links, the monitor's own URL, loopback /
+    /// private IPs that are never PII), and masking them to one opaque token degrades
+    /// the model's reasoning for little privacy gain. OFF in the default `Balanced`
+    /// profile; ON in `Strict`. A genuine secret embedded in a URL is still masked
+    /// regardless of this category — see `URL_CREDENTIAL` in `Secrets`.
+    Network,
     Personal,
 }
 
 impl Category {
     /// Every category, for callers that need to enumerate the whole set.
-    pub const ALL: [Category; 5] = [
+    pub const ALL: [Category; 6] = [
         Category::Secrets,
         Category::Financial,
         Category::Identity,
         Category::Contact,
+        Category::Network,
         Category::Personal,
     ];
 
@@ -148,6 +175,10 @@ impl Category {
                 "GCP_API_KEY",
                 "PRIVATE_KEY",
                 "JWT",
+                // zlauder-local Custom entity (context-based recognizer). Kept in the
+                // always-on Secrets category so an in-URL credential stays masked even
+                // when `Network` (the URL/IP/MAC category) is off — design §3.
+                ENTITY_URL_CREDENTIAL,
             ],
             Category::Financial => &[
                 "CREDIT_CARD",
@@ -206,18 +237,17 @@ impl Category {
                 // (dedups) and `entity_enabled` uses `.any()` (idempotent).
                 ENTITY_EXPIRATION_DATE,
             ],
+            // Contact = ways to reach a *person* (genuine PII). Infra identifiers
+            // (URL / IP / MAC) moved to `Network` so the default can keep them
+            // unmasked without giving up email/phone masking.
+            Category::Contact => &["EMAIL_ADDRESS", "PHONE_NUMBER"],
+            // Network / infrastructure identifiers — OFF by default (see `Category::Network`).
             // URL relies on presidio's strict `UrlRecognizer` (the default since
             // its strict-mode change), which drops scheme-less `file.ext`/`opts.la`
             // false positives while keeping real URLs (scheme / www. / path).
             // DOMAIN stays OFF: its recognizer is still aggressive on filenames;
             // re-enable per-deployment via `entity_operators` if wanted.
-            Category::Contact => &[
-                "EMAIL_ADDRESS",
-                "PHONE_NUMBER",
-                "IP_ADDRESS",
-                "URL",
-                "MAC_ADDRESS",
-            ],
+            Category::Network => &["IP_ADDRESS", "URL", "MAC_ADDRESS"],
             Category::Personal => &["PERSON", "LOCATION", "ORGANIZATION"],
         }
     }
@@ -1446,6 +1476,38 @@ mod tests {
         assert_eq!(ENTITY_EXPIRATION_DATE, "EXPIRATION_DATE");
         assert_eq!(ENTITY_CVV, "CVV");
         assert_eq!(ENTITY_PRIVATE_DATE, "PRIVATE_DATE");
+        assert_eq!(ENTITY_URL_CREDENTIAL, "URL_CREDENTIAL");
+    }
+
+    // URL_CREDENTIAL's gate invariant: it lives in the always-on Secrets category, so an
+    // in-URL credential stays masked even when Network (URL/IP/MAC) is OFF — the whole
+    // point of the recognizer. Locked here next to the other custom-entity gate strings.
+    #[test]
+    fn url_credential_gates_on_under_balanced_with_network_off() {
+        assert!(
+            Category::Secrets
+                .entity_types()
+                .contains(&ENTITY_URL_CREDENTIAL),
+            "URL_CREDENTIAL must be a Secrets-category member"
+        );
+        assert!(Category::canonical_entity_types().contains(ENTITY_URL_CREDENTIAL));
+        let balanced = EngineConfig::default();
+        assert!(
+            !balanced.enabled_categories.contains(&Category::Network),
+            "Balanced must NOT enable Network (precondition for this test)"
+        );
+        assert!(
+            balanced.entity_enabled(ENTITY_URL_CREDENTIAL),
+            "URL_CREDENTIAL must gate on under Balanced despite Network being off"
+        );
+        // And it is a valid per-entity operator key (not flagged as an unknown typo).
+        let cfg = EngineConfig {
+            entity_operators: [(ENTITY_URL_CREDENTIAL.to_string(), Operator::Redact)]
+                .into_iter()
+                .collect(),
+            ..EngineConfig::default()
+        };
+        assert!(cfg.unknown_entity_types().is_empty());
     }
 
     #[test]

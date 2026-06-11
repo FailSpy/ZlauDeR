@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 
 use crate::config::{
     ENTITY_CREDIT_CARD_EXPIRATION, ENTITY_CVV, ENTITY_DATE_OF_BIRTH, ENTITY_EXPIRATION_DATE,
+    ENTITY_URL_CREDENTIAL,
 };
 
 /// High base score for a hard-context match. Above every profile floor (Strict 0.4
@@ -778,6 +779,232 @@ impl Recognizer for CvvRecognizer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// URL_CREDENTIAL (context-based, value-only-capture)
+// ---------------------------------------------------------------------------
+
+/// Credential embedded in a URL / config string. Two readings, both emitting the
+/// VALUE only (group 1) at [`BASE_SCORE`], labeled [`ENTITY_URL_CREDENTIAL`] →
+/// [`crate::config::Category::Secrets`] (always-on), so a real secret inside a URL
+/// stays masked even when the `Network` category (the URL entity itself) is OFF.
+///
+/// This is a CONTEXT recognizer: it matches by the param NAME / userinfo POSITION,
+/// not by the value's shape, so it covers opaque/low-entropy secrets (`?token=hunter2`,
+/// `password=letmein`, `{"token":"letmein"}`) that the entropy-gated generic `API_KEY`
+/// catch-all drops.
+///
+/// `analyze` runs the patterns over BOTH the raw text and a single-level percent-decoded
+/// copy, mapping any span found in the decoded copy back to the original bytes — so a
+/// credential whose STRUCTURE is percent-encoded (`%3Ftoken%3D…`, `%22token%22%3A%22…`)
+/// is caught without special-casing each `%XX` in the regex, and the emitted span still
+/// indexes the original input exactly (surrounding URL structure survives verbatim).
+///
+/// 1. **Sensitive query/assignment param** — a credential-named key (`token`, `secret`,
+///    `password`, `api_key`, the `*_token`/`*_secret`/`*_key`/… suffix family, …) then
+///    `=`/`:`, then the value up to the next delimiter (`& # whitespace " ' < > ) } ]`).
+///    Handles JSON (`"token":"…"`, an optional quote between name and separator) and an
+///    optional auth-scheme prefix (`Bearer`/`Basic`/`Digest`/`Negotiate`/`NTLM`), so an
+///    `Authorization: Basic <b64>` masks the credential rather than the scheme word.
+/// 2. **URL userinfo** — `scheme://user:pass@host` masks the `user:pass` segment (host
+///    survives → `scheme://[URL_CREDENTIAL_…]@host`). The `:` is required (a bare
+///    `git@github.com` username is not a credential); the user may be empty for
+///    password-only DSNs (`redis://:pw@host`).
+///
+/// KNOWN LIMITATIONS (honest gaps, not silent ones): (a) a space-separated value captures
+/// only its first token, so a value behind a NON-standard scheme (`X-Api-Key: my secret`) or
+/// one that literally begins with a skipped scheme word (`password: Basic secret`) loses that
+/// leading word — pathological for real secrets, which are single space-free tokens; (b) bare
+/// `key`/`code` are excluded for false-positive reasons (see `new`) — in a coding tool these
+/// flood, and the real forms are covered elsewhere (`api_key`/`access_key` suffixes, GCP
+/// `AIza…`; OAuth `code` is single-use/short-lived). Shaped secrets in any of these still hit
+/// the secrets/ML passes.
+pub struct UrlCredentialRecognizer {
+    entities: Vec<EntityType>,
+    /// credential-named param + `=`/`:` (or encoded) + value  (`?token=…`, `"pwd":"…"`).
+    param: Regex,
+    /// `scheme://user:pass@host` → the `user:pass` userinfo.
+    userinfo: Regex,
+}
+
+impl UrlCredentialRecognizer {
+    pub fn new() -> Self {
+        // Credential-named params. Longer/more-specific alternants first. Case-insensitive.
+        // The trailing `<ident>_<word>` suffix family (`db_password`, `app_secret`,
+        // `csrf_token`, …) generalizes past the literal list.
+        //
+        // Bare `key` and `code` are deliberately EXCLUDED: in a coding tool `?key=` /
+        // `sort-key=` / `public-key=` and `status code` / `?code=US` are overwhelmingly
+        // benign, while their real credential forms are covered elsewhere — `api_key` /
+        // `access_key` by the suffix family, Google `?key=AIza…` by the GCP shape
+        // recognizer, and OAuth `?code=` is a single-use, short-lived value. Masking
+        // either bare would flood code traffic with confusing tokens.
+        let names = concat!(
+            r"secret[_-]?access[_-]?key|access[_-]?key[_-]?id|client[_-]?secret",
+            r"|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token",
+            r"|shared[_-]?access[_-]?signature|x-amz-security-token|x-amz-signature|x-goog-signature",
+            r"|webhook[_-]?secret|private[_-]?key|ssh[_-]?key|session[_-]?id|sessionid",
+            r"|api[_-]?key|apikey|access[_-]?key|authorization|signature|passphrase|password|passwd",
+            r"|assertion|credential|session|bearer|secret|csrf|xsrf|token|auth|pass|jwt|saml",
+            r"|pwd|pat|otp|sas|sid|sig",
+            // suffix family: <ident>_<credential-word>
+            r"|[a-z0-9]+_(?:token|secret|password|passwd|pwd|key|sig|signature|apikey|auth)",
+        );
+        // Anatomy (run on the RAW text AND on a percent-decoded copy — see `analyze`):
+        //  - LEFT BOUNDARY: start or a non-identifier char.
+        //  - optional closing quote after the name so JSON `{"token":"…"}` masks (the quote
+        //    sits BETWEEN name and separator).
+        //  - SEPARATOR: literal `=`/`:`.
+        //  - optional opening quote, THEN an auth-scheme prefix (`Bearer`/`Basic`/`Digest`/
+        //    `Negotiate`/`NTLM`) skipped — quote BEFORE scheme so a JSON-quoted
+        //    `"authorization":"Basic <b64>"` masks the credential, not the scheme word.
+        //  - VALUE (group 1): to the next URL/JSON/quote delimiter. `,` is intentionally
+        //    NOT a terminator (a secret with a raw comma must not leak its tail); `%` IS
+        //    allowed so a percent-encoded VALUE is captured whole on the raw pass.
+        let param = format!(
+            r#"(?i)(?:^|[^A-Za-z0-9_])(?:{names})["']?[ \t]*[=:][ \t]*["']?(?:(?:bearer|basic|digest|negotiate|ntlm)[ \t]+)?([^&#\s"'<>)}}\]]+)"#
+        );
+        // `user:pass` before `@` — the `:` is required (so a bare `git@host` username is
+        // not a credential), but the user MAY be empty for password-only DSNs
+        // (`redis://:pw@host`). Group 1 = the userinfo credential; host survives.
+        let userinfo = r"://([^/:@\s]*:[^/@\s]+)@";
+        Self {
+            entities: vec![custom(ENTITY_URL_CREDENTIAL)],
+            param: Regex::new(&param).expect("URL credential param regex must compile"),
+            userinfo: Regex::new(userinfo).expect("URL userinfo regex must compile"),
+        }
+    }
+}
+
+impl Default for UrlCredentialRecognizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Recognizer for UrlCredentialRecognizer {
+    fn name(&self) -> &str {
+        "UrlCredentialRecognizer"
+    }
+    fn supported_entities(&self) -> &[EntityType] {
+        &self.entities
+    }
+    fn supported_languages(&self) -> &[&str] {
+        &["en"]
+    }
+    fn analyze(
+        &self,
+        text: &str,
+        _entities: Option<&[EntityType]>,
+        _nlp: Option<&NlpArtifacts>,
+    ) -> Vec<RecognizerResult> {
+        // Pass A — raw text. Catches plaintext params/userinfo and values that are
+        // themselves percent-encoded (the value class admits `%`).
+        let mut out = self.scan(text);
+        // Pass B — scan EACH percent-decode level up to a fixpoint (bounded), mapping every
+        // hit back to the original text. Scanning every level (not just the final fixpoint) is
+        // REQUIRED: one level can reveal a credential's separator (`%3D`→`=`) while a DEEPER
+        // level decodes a terminator (`%2526`→`&`) that would SPLIT the value — so the whole
+        // value is visible only at that intermediate level. Overlapping spans across levels are
+        // merged downstream (the larger span wins), so masking is never narrowed.
+        const MAX_DECODE_LEVELS: usize = 4;
+        let mut cur = text.to_string();
+        // Map from a byte of `cur` to its originating byte in `text` (with trailing sentinel).
+        let mut cur_map: Vec<usize> = (0..=text.len()).collect();
+        for _ in 0..MAX_DECODE_LEVELS {
+            let (dec, m) = percent_decode_ascii(&cur);
+            if dec.len() == cur.len() {
+                break; // fixpoint — nothing decoded this round
+            }
+            // Compose the map back to the ORIGINAL: byte i of `dec` → `cur` byte `m[i]` →
+            // original byte `cur_map[m[i]]`. Both carry the trailing sentinel, so an exclusive
+            // end index always composes.
+            cur_map = m.iter().map(|&j| cur_map[j]).collect();
+            cur = dec;
+            for r in self.scan(&cur) {
+                // Guards are defense-in-depth: `cur_map` is indexable at every regex offset
+                // (len == cur.len()+1 incl. sentinel) and every entry lands on an original char
+                // boundary (ASCII `%XX` → the `%` offset; verbatim bytes 1:1). Skipping a
+                // (then-impossible) span is safe — a real value is still covered by another pass.
+                if r.start >= cur_map.len() || r.end >= cur_map.len() {
+                    continue;
+                }
+                let (s, e) = (cur_map[r.start], cur_map[r.end]);
+                if !text.is_char_boundary(s) || !text.is_char_boundary(e) {
+                    continue;
+                }
+                out.push(
+                    RecognizerResult::new(r.entity_type.clone(), s, e, r.score)
+                        .with_recognizer(self.name().to_string()),
+                );
+            }
+        }
+        out
+    }
+}
+
+impl UrlCredentialRecognizer {
+    /// Run both readings (param + userinfo) over one haystack, emitting value-only spans
+    /// in that haystack's coordinates.
+    fn scan(&self, hay: &str) -> Vec<RecognizerResult> {
+        let mut v = gated_capture(&self.param, &self.entities[0], self.name(), hay, |_, _, _| {
+            true
+        });
+        v.extend(gated_capture(
+            &self.userinfo,
+            &self.entities[0],
+            self.name(),
+            hay,
+            |_, _, _| true,
+        ));
+        v
+    }
+}
+
+/// Single-level percent-decode of ASCII escapes only (`%XX` where `XX` is hex and the
+/// decoded byte is `< 0x80`). Returns the decoded string and a map from each decoded
+/// BYTE index to its originating byte offset in `text`, with a trailing sentinel
+/// (`map[decoded.len()] == text.len()`) so an exclusive end index always maps. Non-ASCII
+/// escapes (`%E2…`) and malformed `%` are left verbatim, which keeps the output valid
+/// UTF-8 and the map byte-aligned. This decodes ONE level; `analyze` calls it repeatedly
+/// (composing the map back to the original) and scans EACH level, so multiply- and
+/// mixed-encoded (`%253D`, `%2526`) structures are fully revealed.
+fn percent_decode_ascii(text: &str) -> (String, Vec<usize>) {
+    let b = text.as_bytes();
+    let hex = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut map: Vec<usize> = Vec::with_capacity(b.len() + 1);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+            && (h << 4 | l) < 0x80
+        {
+            out.push(h << 4 | l);
+            map.push(i);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        map.push(i);
+        i += 1;
+    }
+    map.push(text.len());
+    match String::from_utf8(out) {
+        Ok(s) => (s, map),
+        // Defensive: should be unreachable (ASCII inserts + preserved UTF-8 runs). Fall
+        // back to identity so `analyze` simply skips the decode pass — never panics.
+        Err(_) => (text.to_string(), (0..=text.len()).collect()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +1057,65 @@ mod tests {
         let probe = Regex::new(r"exp").expect("probe regex");
         let m = probe.find(text).expect("text must contain an `exp` token");
         has_card_context(text, &m)
+    }
+
+    fn urlcred_spans(text: &str) -> Vec<&str> {
+        UrlCredentialRecognizer::new()
+            .analyze(text, None, None)
+            .iter()
+            .filter_map(|r| r.text(text))
+            .collect()
+    }
+
+    // Recognizer-level proof of the URL_CREDENTIAL span shape, isolated from the
+    // pipeline (where a high-entropy value could also be masked by the API_KEY
+    // backstop). Each ship-gate finding gets a case here.
+    #[test]
+    fn url_credential_value_only_spans() {
+        // value-only (name/separator survive)
+        assert_eq!(urlcred_spans("?token=letmein"), vec!["letmein"]);
+        assert_eq!(urlcred_spans("password: letmein"), vec!["letmein"]);
+        // F1 — JSON-quoted key (quote between name and `:`).
+        assert_eq!(urlcred_spans(r#"{"token":"letmein"}"#), vec!["letmein"]);
+        // F2 — single-level percent-encoded nested separator (`%3F`/`%3D`), via decode pass.
+        assert_eq!(urlcred_spans("a%3Ftoken%3Dletmein-x"), vec!["letmein-x"]);
+        // F2b (round-2) — fully percent-encoded JSON fragment (encoded quotes `%22` +
+        // separator `%3A`): decode pass reveals `{"token":"letmein"}`, span maps back.
+        assert_eq!(
+            urlcred_spans("?state=%7B%22token%22%3A%22letmein%22%7D"),
+            vec!["letmein"]
+        );
+        // F3 — previously-missing names.
+        assert_eq!(urlcred_spans("?pat=letmein-pat"), vec!["letmein-pat"]);
+        assert_eq!(urlcred_spans("?otp=314159"), vec!["314159"]);
+        assert_eq!(urlcred_spans("?session_id=letmein-s"), vec!["letmein-s"]);
+        assert_eq!(urlcred_spans("?access_key_id=letmein-k"), vec!["letmein-k"]);
+        // F5 — comma is not a value terminator.
+        assert_eq!(urlcred_spans("?token=ab,cd,ef&id=1"), vec!["ab,cd,ef"]);
+        // userinfo: user:pass, and F6 password-only DSN (empty user).
+        assert_eq!(urlcred_spans("redis://admin:s3cr3t@h"), vec!["admin:s3cr3t"]);
+        assert_eq!(urlcred_spans("redis://:letmein@h"), vec![":letmein"]);
+        // curated hyphenated form still matches.
+        assert_eq!(urlcred_spans("?api-key=letmein-a"), vec!["letmein-a"]);
+        // F4 — bare `key` / uncurated `*-key` / bare `git@host` are NOT credentials.
+        assert!(urlcred_spans("sort-key=colname").is_empty());
+        assert!(urlcred_spans("public-key=id_rsa.pub").is_empty());
+        assert!(urlcred_spans("the map key: colname").is_empty());
+        assert!(urlcred_spans("git@github.com:org/repo.git").is_empty());
+        // F7 (round-3) — non-Bearer Authorization schemes: the scheme word is skipped, so the
+        // credential AFTER it is captured (not just the scheme).
+        assert_eq!(urlcred_spans("Authorization: Basic dXNlcjpwYXNz"), vec!["dXNlcjpwYXNz"]);
+        assert_eq!(urlcred_spans("authorization=Digest letmein-d"), vec!["letmein-d"]);
+        // F8 (round-3) — DOUBLE percent-encoded structure (`%253F`/`%253D`): decoded across
+        // levels so the nested separator is revealed and the value captured.
+        assert_eq!(urlcred_spans("x%253Ftoken%253Dletmein2x"), vec!["letmein2x"]);
+        // F9 (round-4) — JSON-quoted auth value: the opening quote is consumed BEFORE the
+        // scheme skip, so the credential is captured, not the scheme word.
+        assert_eq!(
+            urlcred_spans(r#"{"authorization":"Basic dXNlcjpwYXNz"}"#),
+            vec!["dXNlcjpwYXNz"]
+        );
+        assert_eq!(urlcred_spans(r#"{"token":"Bearer letmein-jwt"}"#), vec!["letmein-jwt"]);
     }
 
     #[test]

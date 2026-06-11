@@ -40,7 +40,8 @@ language = "en"
 #             PRIVATE_KEY, JWT
 #   financial CREDIT_CARD, IBAN_CODE, CRYPTO, US_BANK_NUMBER, ABA_ROUTING_NUMBER
 #   identity  SSN/ITIN, national IDs, passports, driver's licenses, medical IDs
-#   contact   EMAIL_ADDRESS, PHONE_NUMBER, IP_ADDRESS, URL, MAC_ADDRESS
+#   contact   EMAIL_ADDRESS, PHONE_NUMBER
+#   network   IP_ADDRESS, URL, MAC_ADDRESS  (off in balanced; on in strict)
 #   personal  PERSON, LOCATION, ORGANIZATION; requires [engine.ml] to be ready
 enabled_categories = ["secrets", "financial", "identity", "contact"]
 
