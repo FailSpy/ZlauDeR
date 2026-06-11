@@ -66,6 +66,13 @@ jobs:
             echo "::error::tag '$tag' != Codex plugin version 'v$codex_ver'. Bump codex-zlauder-plugin/.codex-plugin/plugin.json to match the tag before releasing." >&2
             exit 1
           fi
+          # Cargo workspace version — the SINGLE source of truth. Parsed with sed
+          # (this job has no setup-rust, so `cargo metadata` is unavailable).
+          cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$tag" = "v$cargo_ver" ] || { echo "::error::tag '$tag' != Cargo.toml version 'v$cargo_ver'"; exit 1; }
+          # marketplace.json entry for the zlauder plugin must track the tag too.
+          mkt_ver="$(jq -r '.plugins[]|select(.name=="zlauder").version' .claude-plugin/marketplace.json)"
+          [ "$tag" = "v$mkt_ver" ] || { echo "::error::tag '$tag' != marketplace.json version 'v$mkt_ver'"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
