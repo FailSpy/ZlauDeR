@@ -117,8 +117,9 @@ After install, masking activates with a **one-time restart**:
    `settings.local.json` and launches the proxy eagerly, but Claude Code applies a route
    written *during* SessionStart to the current session only unreliably (~1 in 5) — every
    session *after* the first reads it at startup, which always works. The statusline shows
-   `⟳ ZlauDeR: restart to mask` until it's live, then `🛡`. (A later message may
-   also pick it up, but a restart is the sure path.)
+   `⟳ ZlauDeR: restart to mask` until it's live, then `🛡`. Until this session is
+   routed, ZlauDeR's intake gate **blocks** its messages so nothing sends unmasked
+   first (set `ZLAUDER_NO_INTAKE_GATE=1` to send anyway without masking).
 2. **`/zlauder:privacy`** — confirm routing + masking, or flip masking on/off live.
 3. **`/zlauder:doctor`** — if masking won't come on, this preflight catches the usual causes
    (a local firewall/AV intercepting `127.0.0.1`, a busy static port).

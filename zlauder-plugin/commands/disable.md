@@ -1,5 +1,5 @@
 ---
-description: Stop routing this project through the ZlauDeR proxy (reverts .claude/settings.local.json; a one-time Claude Code restart reliably applies it). `--all` sweeps every project — run it before uninstalling.
+description: Stop routing this project through the ZlauDeR proxy (reverts .claude/settings.local.json). Stops routing reliably after a one-time restart (the current session may keep routing until then). `--all` sweeps every plumbed project — run it before uninstalling.
 argument-hint: "[--all]"
 allowed-tools: Bash(bash:*)
 # User-only: tearing down routing is a loosen action; the model surfaces it, the user runs it.
@@ -19,20 +19,22 @@ records this project as **opted out**, so the plugin won't auto-re-enable it; ru
 `/zlauder:enable` to turn routing back on.
 
 **`/zlauder:disable --all`** sweeps EVERY project ZlauDeR has plumbed (not just this one) and
-clears their routing. Run it **before uninstalling the plugin**, so no project is left pointing
-at a proxy that's gone — a dead `ANTHROPIC_BASE_URL` makes Claude Code hang for minutes and then
-fail. (Note: a project reopened *after* the plugin is fully gone can't self-heal, since the
-binaries are gone too — hence the pre-uninstall sweep.)
+clears their routing. It finds them from its own registry AND a scan of Claude Code's session
+logs, so even an older route the registry doesn't list still gets cleaned (it only ever strips a
+project that actually carries a ZlauDeR route). Run it **before uninstalling the plugin**, so no
+project is left pointing at a proxy that's gone — a dead `ANTHROPIC_BASE_URL` makes Claude Code
+hang for minutes and then fail. (Note: a project reopened *after* the plugin is fully gone can't
+self-heal, since the binaries are gone too — hence the pre-uninstall sweep.)
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/disable.sh" "$ARGUMENTS"`
 
 Read the script output above, then:
 
 - If it reverted the routing, confirm to the user that this project's
-  `.claude/settings.local.json` no longer points at the ZlauDeR proxy. Claude Code snapshotted the
-  route at startup, so **a one-time restart reliably stops routing** — the next session reads the
-  cleared settings and traffic goes straight to Anthropic with no masking. (Until the restart, this
-  session may still route through the proxy.)
+  `.claude/settings.local.json` no longer points at the ZlauDeR proxy. Routing stops reliably
+  after a **one-time restart** of Claude Code (it reads the route at startup); the current
+  session may keep routing through the proxy until then, which is harmless. The project is now
+  opted out, so ZlauDeR won't auto-re-enable it (nor block its messages).
 - If it reported that nothing was wired (no ZlauDeR `env` block found), say so plainly — there
   was nothing to revert.
 - For `--all`: relay how many projects were swept and whether all succeeded. Only tell the user

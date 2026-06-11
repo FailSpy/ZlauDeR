@@ -59,8 +59,9 @@ CFG="$(config_path)"
 # owns the routing decision now: it checks whether THIS session's ANTHROPIC_BASE_URL is
 # actually pointed at the proxy and, only then, launches/recycles it and announces that
 # masking is active — otherwise it auto-enables a never-seen project, nudges (on stderr)
-# a configured-but-not-yet-routed one that masking kicks in on its next message, or stays
-# a silent no-op. Single source of truth, no shell guard.
+# a configured-but-not-yet-routed one to restart once to activate masking, or stays a
+# silent no-op. (The UserPromptSubmit intake gate blocks that unrouted session's prompts
+# until the restart, so nothing sends unmasked.) Single source of truth, no shell guard.
 set +e
 if [ -n "$CFG" ]; then
   "$ZLAUDER_HOOKS_BIN" "${PORT_ARGS[@]}" session-start --config "$CFG"

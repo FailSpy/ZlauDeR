@@ -96,6 +96,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// UserPromptSubmit hook: the fail-CLOSED first-session intake gate. Blocks an unrouted
+    /// (would-be UNMASKED) prompt until the route goes live, so the common first session can't
+    /// silently direct-leak. Backs the plugin's user-prompt-submit.sh.
+    UserPromptSubmit,
     /// Print a one-line status indicator for the Claude Code status line.
     Statusline,
     /// View or change privacy settings (backs the `/zlauder:privacy` command).
@@ -154,10 +158,10 @@ enum Cmd {
 enum SettingsAction {
     /// Wire env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT and take over the statusLine slot
     /// (wrapping any existing line to the sidecar). A missing settings.local.json is treated
-    /// as `{}` (and created). Exit 0 = file changed (caller announces masking activates after
-    /// a one-time Claude Code restart — a route written this session applies reliably only from
-    /// the next one); exit 3 = already pointed at this proxy, nothing routing-relevant changed;
-    /// non-zero = error (invalid JSON / write failure), message on stderr.
+    /// as `{}` (and created). Exit 0 = file changed (caller announces masking activates after a
+    /// one-time restart — Claude Code reads a freshly-written route reliably only at startup);
+    /// exit 3 = already pointed at this proxy, nothing routing-relevant changed; non-zero
+    /// = error (invalid JSON / write failure), message on stderr.
     Enable {
         /// Proxy base URL to bake in, e.g. http://127.0.0.1:18123.
         #[arg(long)]
@@ -328,6 +332,7 @@ fn main() -> Result<()> {
         } => ensure_up_cmd(config, proxy_bin, print_url),
         Cmd::Doctor { json } => doctor(json),
         Cmd::Verify { json } => verify(json),
+        Cmd::UserPromptSubmit => user_prompt_submit(),
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(action),
         Cmd::PreToolUse => pre_tool_use(),
@@ -358,8 +363,8 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Outcome of a settings mutation, mapped to the shell's exit-code contract:
-/// `Changed` => exit 0 (caller announces masking activates after a one-time restart),
-/// `NoOp` => exit 3 (caller prints "already pointed…"/
+/// `Changed` => exit 0 (caller announces the routing change takes effect after a one-time
+/// restart of Claude Code), `NoOp` => exit 3 (caller prints "already pointed…"/
 /// "already disabled…"). Hard errors bubble as `anyhow` (exit 1).
 enum SettingsOutcome {
     Changed,
@@ -373,15 +378,17 @@ fn settings_cmd(action: SettingsAction) -> Result<()> {
             zport,
             statusline,
         } => {
-            let outcome = settings_enable(&url, &zport, &statusline)?;
-            // Record this project as plumbed (clears any prior opt-out) so SessionStart keeps
-            // it routed and `/zlauder:disable --all` can find it. Best-effort: never fail the
-            // enable over a registry write.
-            let _ = zlauder_state::registry_set(
+            // Clear any prior opt-out FIRST and REQUIRE it to persist, THEN write the route — so a
+            // SUCCESSFUL enable can never leave this project in (route baked + registry=Optout).
+            // That preserves the invariant SessionStart's self-heal relies on: such a state can
+            // then ONLY mean "a prior /zlauder:disable's strip didn't land" (safe to strip). If we
+            // wrote the route first and the registry write then failed, the next session would
+            // silently strip the route we just enabled — UNMASKING against the user's fresh intent.
+            zlauder_state::registry_set(
                 &canonical(&project_root()),
                 zlauder_state::PlumbState::Plumbed,
-            );
-            outcome
+            )?;
+            settings_enable(&url, &zport, &statusline)?
         }
         SettingsAction::Disable { all } => {
             if all {
@@ -917,7 +924,21 @@ fn settings_disable() -> Result<SettingsOutcome> {
 /// `ANTHROPIC_BASE_URL` pointing at a dead proxy in any project (the ~3-min ConnectionRefused
 /// hang). Prints a per-project summary; never uses the single-project exit-3 contract.
 fn settings_disable_all() -> Result<()> {
-    let roots = zlauder_state::registry_plumbed_roots();
+    // The post-2b7fc96 registry is the primary record of plumbed projects, but it can MISS a
+    // route: one baked by an older build (pre-registry), or whose entry was lost to a partial
+    // failure. So ALSO scan Claude Code's session logs for project roots and union them in —
+    // but strip ONLY a discovered root that ACTUALLY carries our route (project_baked_route),
+    // so a non-zlauder project surfaced by the scan is never touched. Registry roots are swept
+    // unconditionally (settings_disable_at is an idempotent no-op when the route is already
+    // gone, and registry_remove then clears the stale entry).
+    let mut roots = zlauder_state::registry_plumbed_roots();
+    let mut seen: std::collections::HashSet<String> = roots.iter().cloned().collect();
+    for r in discover_session_cwds() {
+        if !seen.contains(&r) && project_baked_route(&r).is_some() {
+            seen.insert(r.clone());
+            roots.push(r);
+        }
+    }
     if roots.is_empty() {
         println!("ZlauDeR: no plumbed projects to disable — nothing to sweep.");
         return Ok(());
@@ -952,6 +973,109 @@ fn settings_disable_all() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Claude Code's per-user data dir (`$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`). Its
+/// `projects/<encoded-root>/*.jsonl` session logs each carry the project's real `cwd`.
+fn claude_config_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
+}
+
+/// Best-effort discovery of project roots from Claude Code's session logs, for the `--all`
+/// sweep to catch routes the registry doesn't list. The `projects/<encoded>` dir NAME is lossy
+/// (both `/` and `.` map to `-`), so we read the EXACT `cwd` out of a `*.jsonl` instead. Never
+/// fails the sweep: an unreadable/absent projects dir just yields an empty list (registry-only).
+fn discover_session_cwds() -> Vec<String> {
+    let Some(projects) = claude_config_dir().map(|d| d.join("projects")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Vec::new();
+    };
+    let mut roots = std::collections::BTreeSet::new();
+    for dir in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // One session log with a cwd is enough — every log in a project dir shares the same one.
+        for f in files.filter_map(|e| e.ok()).map(|e| e.path()) {
+            if f.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(cwd) = first_cwd_in_jsonl(&f) {
+                roots.insert(canonical(Path::new(&cwd)));
+                break;
+            }
+        }
+    }
+    roots.into_iter().collect()
+}
+
+/// Pull the first top-level `cwd` out of a JSONL session log. Each scanned line is parsed as
+/// JSON (robust to whitespace around the colon, escaped characters in the path, and a stray
+/// `cwd`-looking substring inside some other field — a raw substring scan got all three wrong).
+/// Per-line reads are byte-capped so a pathological multi-hundred-MB single record can't blow up
+/// the teardown sweep, and ONLY a line that actually ended in `\n` is parsed — a capped-or-EOF
+/// partial line is skipped, never parsed, so a truncated record can never yield a wrong `cwd`.
+/// The real `cwd` appears in the first session records, well within the line budget.
+fn first_cwd_in_jsonl(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader, Read};
+    const MAX_LINE: u64 = 256 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    for _ in 0..200 {
+        let mut buf = Vec::new();
+        // Read at most MAX_LINE bytes of the next line: bounds memory on a giant record.
+        let n = match (&mut reader).take(MAX_LINE).read_until(b'\n', &mut buf) {
+            Ok(0) => break,                          // EOF
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        // A buffer with no trailing '\n' that ALSO filled the cap (`n >= MAX_LINE`) is the HEAD of
+        // a record longer than the cap: drain the rest of it (O(1) memory) so the next iteration
+        // resumes at a true record boundary, never parsing a mid-record fragment. A short read
+        // without a newline (`n < MAX_LINE`) instead means EOF — a final record the writer left
+        // unterminated — which IS complete and should be parsed.
+        if buf.last() != Some(&b'\n') && n as u64 >= MAX_LINE {
+            if !drain_to_newline(&mut reader) {
+                break; // EOF reached while draining ⇒ no further complete record
+            }
+            continue;
+        }
+        if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&buf)
+            && let Some(cwd) = map.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
+/// Consume and DISCARD bytes from `reader` up to and including the next `\n`, reading straight
+/// from the `BufRead` buffer (no growing allocation) so a multi-hundred-MB record is drained in
+/// O(1) extra memory. Returns false if EOF is hit before any newline (no further whole record).
+fn drain_to_newline<R: std::io::BufRead>(reader: &mut R) -> bool {
+    loop {
+        let (found, used) = match reader.fill_buf() {
+            Ok(b) if b.is_empty() => return false, // EOF
+            Ok(b) => match b.iter().position(|&c| c == b'\n') {
+                Some(i) => (true, i + 1),
+                None => (false, b.len()),
+            },
+            Err(_) => return false,
+        };
+        reader.consume(used);
+        if found {
+            return true;
+        }
+    }
 }
 
 /// Strip zlauder routing from one project's settings (both `settings.local.json` and the
@@ -1721,9 +1845,10 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                     eprintln!(
                         "ZlauDeR: auto-enabled PII masking for this project (wrote \
                          .claude/settings.local.json). RESTART Claude Code once to activate it — the \
-                         statusline shows '⟳ ZlauDeR: restart to mask' until it's live, then 🛡. Control \
-                         it with /zlauder:privacy; remove it with /zlauder:disable. \
-                         (ZLAUDER_NO_AUTO_ENABLE=1 opts out globally.)"
+                         statusline shows '⟳ ZlauDeR: restart to mask' until it's live, then 🛡. Until \
+                         then ZlauDeR blocks this session's messages so nothing sends unmasked (set \
+                         ZLAUDER_NO_INTAKE_GATE=1 to send anyway). Control it with /zlauder:privacy; \
+                         remove it with /zlauder:disable. (ZLAUDER_NO_AUTO_ENABLE=1 opts out globally.)"
                     );
                     println!(
                         "{}",
@@ -1732,10 +1857,12 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                                 "hookEventName": "SessionStart",
                                 "additionalContext":
                                     "ZlauDeR just auto-enabled PII masking for this project (route written to \
-                                     .claude/settings.local.json). Masking is NOT reliably active in THIS \
-                                     session — the sure activation is a one-time restart of Claude Code, after \
-                                     which it stays on automatically. Until then, outbound text may reach the \
-                                     API provider UNMASKED (real PII, not tokens). This is only about what the \
+                                     .claude/settings.local.json). Masking is NOT active in THIS session yet — \
+                                     the sure activation is a one-time restart of Claude Code, after which it \
+                                     stays on automatically. Until then ZlauDeR's intake gate BLOCKS this \
+                                     session's messages so nothing reaches the API provider unmasked (unless the \
+                                     user set ZLAUDER_NO_INTAKE_GATE=1, in which case outbound text may reach the \
+                                     API provider UNMASKED — real PII, not tokens). This is only about what the \
                                      provider sees; the user always sees their own plaintext locally. If the user \
                                      asks why masking isn't on yet, tell them to restart Claude Code once. Never \
                                      tell the user their data is hidden in this session. The user controls masking \
@@ -1760,16 +1887,35 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
             return Ok(());
         }
 
-        if configured {
-            // Plumbed earlier but this live session isn't routed yet (typically the first session
-            // after enable/auto-plumb, which snapshotted env before the route was written). A
-            // one-time restart reliably activates masking; every session after reads the route at
-            // startup. Stay a route-less no-op for now; the proxy launches on the session that
-            // actually routes.
+        if opted_out && configured {
+            // SELF-HEAL: opted out here, yet a route is STILL baked into settings.local.json (a
+            // prior /zlauder:disable's strip didn't fully land, or the file was restored). Left
+            // alone, this session routes to a proxy the user disabled — a hang if it's down.
+            // Strip the stale route so this and future sessions stop routing; opt-out means no
+            // masking intent, so reverting to a direct (unmasked) connection is exactly right
+            // (this is the only safe strip — we NEVER strip a route a project still intends).
+            let _ = settings_disable_at(Path::new(&root));
             eprintln!(
-                "ZlauDeR: this project is configured but THIS session isn't masked yet. Restart \
-                 Claude Code to activate it (the statusline shows '⟳ ZlauDeR: restart to mask' until \
-                 it's live). It may also kick in on a later message, but a restart is the sure path."
+                "ZlauDeR: this project is opted out, but a stale route was still baked into \
+                 .claude/settings.local.json — removed it so the session won't route to a \
+                 disabled proxy. Re-enable masking any time with /zlauder:enable."
+            );
+            println!("{}", json!({}));
+            return Ok(());
+        }
+
+        if configured {
+            // Plumbed earlier but this live session isn't routed yet (typically the very first
+            // message after enable/auto-plumb). Claude Code reads a freshly-written route
+            // reliably only at startup, so the SURE activation is a one-time restart — and the
+            // UserPromptSubmit intake gate BLOCKS this session's prompts until then, so nothing
+            // egresses unmasked first. Stay a route-less no-op for now; the proxy launches on
+            // the session that actually routes.
+            eprintln!(
+                "ZlauDeR: this project is configured but THIS session isn't routed yet. Restart \
+                 Claude Code once to activate masking (the statusline shows '⟳ ZlauDeR: restart to \
+                 mask' until it's live). Until then ZlauDeR blocks this session's messages so \
+                 nothing sends unmasked (set ZLAUDER_NO_INTAKE_GATE=1 to send anyway)."
             );
             println!(
                 "{}",
@@ -1777,9 +1923,11 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
                         "additionalContext":
-                            "ZlauDeR is configured for this project but masking is NOT reliably active in \
-                             THIS session yet — the sure activation is a one-time restart of Claude Code. \
-                             Until then, outbound text may reach the API provider UNMASKED (real PII, not \
+                            "ZlauDeR is configured for this project but masking is NOT active in THIS \
+                             session yet — the sure activation is a one-time restart of Claude Code. \
+                             Until then ZlauDeR's intake gate BLOCKS this session's messages so nothing \
+                             reaches the API provider unmasked (unless the user set ZLAUDER_NO_INTAKE_GATE=1, \
+                             in which case outbound text may reach the provider UNMASKED — real PII, not \
                              tokens). This is only about what the provider sees; the user always sees their \
                              own plaintext. If the user asks why masking isn't on, tell them to restart \
                              Claude Code once. Control with /zlauder:privacy."
@@ -1888,6 +2036,80 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
     });
     println!("{out}");
     Ok(())
+}
+
+/// `UserPromptSubmit` hook — the fail-CLOSED first-session INTAKE GATE. Claude Code applies a
+/// freshly-written `settings.local.json` route to the CURRENT session only unreliably, so the
+/// common first session after auto-plumb/`enable` is PLUMBED but NOT routed: its prompt would
+/// reach the API provider UNMASKED (real PII, not tokens). This hook runs BEFORE the prompt is
+/// sent and, in exactly that state, returns `decision:"block"` so the prompt never egresses —
+/// turning the statusline's "⟳ restart to mask" nudge into an ENFORCED restart and closing the
+/// first-session direct-leak. Every other state is a silent ALLOW (emit nothing): not plumbed,
+/// already routed, opted out, or the `ZLAUDER_NO_INTAKE_GATE` escape hatch.
+///
+/// The decision uses only fast LOCAL reads (the baked route + `$ANTHROPIC_BASE_URL`) — no
+/// network. This matters BECAUSE a UserPromptSubmit hook that hangs (30s timeout) or crashes
+/// FAILS OPEN (the prompt proceeds unmasked); only an explicit block decision is fail-closed.
+/// Every read on this path is non-panicking by construction: `project_root` (env/cwd with a
+/// fallback), `canonical` (`canonicalize` with an `unwrap_or_else` fallback), `registry_get` /
+/// `project_baked_route` (fallible `fs::read` + `serde` that degrade to `None`), and
+/// `session_routed_through` (env + string compare) — none `unwrap`/`expect`/index, so no panic
+/// path precedes the block emission. A missing binary likewise fails open at the shell wrapper,
+/// which is correct: no zlauder installed ⇒ no masking promise ⇒ nothing to gate.
+fn user_prompt_submit() -> Result<()> {
+    // Drain the hook payload so the pipe never blocks; its contents aren't needed.
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+
+    let root = canonical(&project_root());
+    // Gather the routing facts with fast LOCAL reads only (registry file, settings.local.json,
+    // $ANTHROPIC_BASE_URL) — nothing that hits the network or can hang.
+    let opted_out =
+        zlauder_state::registry_get(&root) == Some(zlauder_state::PlumbState::Optout);
+    let baked_port = project_baked_route(&root);
+    // Routed iff this session's $ANTHROPIC_BASE_URL points at the baked proxy port. If the proxy
+    // is down, a routed session still fails-closed AT the proxy (never unmasked), so "routed"
+    // is the right allow condition.
+    let routed = baked_port
+        .is_some_and(|p| session_routed_through(&format!("http://127.0.0.1:{p}")));
+    // VALUE-aware, unlike the presence-based ZLAUDER_NO_AUTO_ENABLE: this disables a fail-CLOSED
+    // SECURITY control, so a user who sets `=0` meaning "off" must NOT accidentally turn the gate
+    // off — only an explicitly truthy value opens the hatch.
+    let escape_hatch = std::env::var("ZLAUDER_NO_INTAKE_GATE")
+        .map(|v| is_truthy_flag(&v))
+        .unwrap_or(false);
+
+    if !intake_should_block(opted_out, baked_port.is_some(), routed, escape_hatch) {
+        return Ok(()); // allow: emit nothing
+    }
+
+    // PLUMBED but THIS session is NOT routed: the prompt would reach the API UNMASKED. Block it
+    // (exit 0 + `decision:"block"` is the fail-closed contract; the reason is shown to the user).
+    let reason = "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session \
+                  is not yet routed through the masking proxy — so your message would reach the \
+                  API provider UNMASKED (real PII, not tokens). Restart Claude Code once to \
+                  activate masking; every session after the first picks it up automatically. \
+                  (Only what the provider sees is affected — you always see your own plaintext. \
+                  To send this session WITHOUT masking, set ZLAUDER_NO_INTAKE_GATE=1 in your \
+                  environment and try again.)";
+    println!("{}", json!({ "decision": "block", "reason": reason }));
+    Ok(())
+}
+
+/// Fail-CLOSED intake-gate decision (pure — for testing). BLOCK iff this project is plumbed
+/// through us AND this session is NOT routed to it, and neither the opt-out nor the
+/// `ZLAUDER_NO_INTAKE_GATE` escape hatch applies. Every other state is an ALLOW: not plumbed
+/// (no masking intent), already routed (masking active / fails-closed at the proxy), opted out,
+/// or escape-hatched.
+fn intake_should_block(opted_out: bool, plumbed: bool, routed: bool, escape_hatch: bool) -> bool {
+    !escape_hatch && !opted_out && plumbed && !routed
+}
+
+/// Truthy-flag parse for an env value (pure — for testing). Only an explicitly affirmative value
+/// counts; `0`, `false`, `""`, or junk read as false. Used so the intake-gate escape hatch can't
+/// be flipped off by a `=0` a user meant as "keep it on".
+fn is_truthy_flag(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// Outcome of bringing this project's proxy up. The proxy is project-keyed (a record
@@ -3955,6 +4177,98 @@ mod route_gate_tests {
         assert_eq!(project_baked_route(&root), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intake_gate_blocks_only_plumbed_unrouted_no_escape() {
+        // The one BLOCK state: plumbed, not routed, not opted out, no escape hatch.
+        assert!(intake_should_block(false, true, false, false));
+
+        // Allowed: already routed this session (masking active / fails-closed at the proxy).
+        assert!(!intake_should_block(false, true, true, false));
+        // Allowed: not plumbed through us (no masking intent — never gate a foreign project).
+        assert!(!intake_should_block(false, false, false, false));
+        // Allowed: opted out (sending direct is exactly what opt-out means).
+        assert!(!intake_should_block(true, true, false, false));
+        // Allowed: the ZLAUDER_NO_INTAKE_GATE escape hatch overrides everything.
+        assert!(!intake_should_block(false, true, false, true));
+        // Escape hatch wins even over the block state with all other flags set to block.
+        assert!(!intake_should_block(false, true, false, true));
+    }
+
+    #[test]
+    fn first_cwd_in_jsonl_extracts_exact_path_or_none() {
+        let dir = std::env::temp_dir().join(format!("zlauder-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A summary-only first line (no cwd), then a record carrying the real cwd.
+        let log = dir.join("session.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"summary\",\"leafUuid\":\"x\"}\n\
+             {\"type\":\"user\",\"cwd\":\"/home/u/My Project\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_cwd_in_jsonl(&log),
+            Some("/home/u/My Project".to_string())
+        );
+
+        // No cwd anywhere → None (never a bogus root for the sweep to act on).
+        let nocwd = dir.join("nocwd.jsonl");
+        std::fs::write(&nocwd, "{\"type\":\"summary\"}\n{\"type\":\"x\"}\n").unwrap();
+        assert_eq!(first_cwd_in_jsonl(&nocwd), None);
+
+        // Whitespace around the colon (pretty-printed key) is tolerated (a raw substring scan for
+        // `"cwd":"` would have missed this and skipped a real project).
+        let spaced = dir.join("spaced.jsonl");
+        std::fs::write(&spaced, "{\"type\":\"user\",\"cwd\": \"/srv/app\"}\n").unwrap();
+        assert_eq!(first_cwd_in_jsonl(&spaced), Some("/srv/app".to_string()));
+
+        // A `cwd`-looking substring INSIDE another field must not be mistaken for the key (proper
+        // JSON parsing only reads the top-level `cwd`).
+        let decoy = dir.join("decoy.jsonl");
+        std::fs::write(
+            &decoy,
+            "{\"type\":\"user\",\"text\":\"\\\"cwd\\\":\\\"/evil\\\"\",\"cwd\":\"/real\"}\n",
+        )
+        .unwrap();
+        assert_eq!(first_cwd_in_jsonl(&decoy), Some("/real".to_string()));
+
+        // An OVERLONG record (> the 256 KiB per-line cap) that carries a decoy `cwd` is drained
+        // and skipped — never parsed as a fragment — so the real cwd in the NEXT small record is
+        // what's returned. Proves the bounded drain resumes at a true record boundary.
+        let overlong = dir.join("overlong.jsonl");
+        let huge = "x".repeat(300 * 1024);
+        std::fs::write(
+            &overlong,
+            format!("{{\"big\":\"{huge}\",\"cwd\":\"/decoy\"}}\n{{\"cwd\":\"/real-after\"}}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            first_cwd_in_jsonl(&overlong),
+            Some("/real-after".to_string())
+        );
+
+        // A COMPLETE final record a writer left WITHOUT a trailing newline is still parsed (the
+        // short read hit EOF below the cap, so it's complete — not an overlong-head fragment).
+        let unterminated = dir.join("unterminated.jsonl");
+        std::fs::write(&unterminated, "{\"type\":\"user\",\"cwd\":\"/no-nl\"}").unwrap();
+        assert_eq!(first_cwd_in_jsonl(&unterminated), Some("/no-nl".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_truthy_flag_only_affirmative_values() {
+        for t in ["1", "true", "TRUE", "Yes", "on", " on "] {
+            assert!(is_truthy_flag(t), "{t:?} should be truthy");
+        }
+        // A `=0` a user meant as "keep the gate ON" must NOT open the escape hatch.
+        for f in ["0", "false", "", "off", "no", "2", "enabled"] {
+            assert!(!is_truthy_flag(f), "{f:?} should NOT be truthy");
+        }
     }
 }
 
