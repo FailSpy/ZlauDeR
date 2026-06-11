@@ -75,9 +75,27 @@ fn candle_config(cfg: &MlConfig) -> CandleConfig {
     }
 }
 
+/// Refuse to fetch or load any model repo that is not on the authorized allowlist
+/// ([`crate::config::AUTHORIZED_ML_MODELS`]). This is the SINGLE chokepoint covering
+/// every override source — `--download-model --model <repo>`, `model on --model
+/// <repo> --scope <file>`, and a raw `[engine.ml] model = "…"` edit all resolve here
+/// before any network/loader work, so an arbitrary (model-supplied, injected, or
+/// typo'd) checkpoint can never be pulled. Runs FIRST, before `CandleBackend::new`.
+fn ensure_authorized(cfg: &MlConfig) -> Result<(), EngineError> {
+    if !crate::config::is_authorized_model(&cfg.model) {
+        return Err(EngineError::Ml(format!(
+            "ML model '{}' is not authorized; ZlauDeR only fetches/loads: {}",
+            cfg.model,
+            crate::config::AUTHORIZED_ML_MODELS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Build the token-classification recognizer, downloading + loading the model
 /// (cached under the standard `hf-hub` location). Heavy + blocking.
 pub fn build_recognizer(cfg: &MlConfig) -> Result<Arc<dyn Recognizer>, EngineError> {
+    ensure_authorized(cfg)?;
     let backend =
         CandleBackend::new(candle_config(cfg)).map_err(|e| EngineError::Ml(e.to_string()))?;
     let mut builder = TokenClassifierRecognizer::builder()
@@ -98,6 +116,7 @@ pub fn build_recognizer(cfg: &MlConfig) -> Result<Arc<dyn Recognizer>, EngineErr
 /// loaded (constructs the backend, then drops it). Used by the explicit
 /// `zlauder-proxy --download-model` pre-warm so a later `enable` is fast.
 pub fn download(cfg: &MlConfig) -> Result<(), EngineError> {
+    ensure_authorized(cfg)?;
     CandleBackend::new(candle_config(cfg)).map_err(|e| EngineError::Ml(e.to_string()))?;
     Ok(())
 }
@@ -105,6 +124,25 @@ pub fn download(cfg: &MlConfig) -> Result<(), EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unauthorized model id is refused by `download`/`build_recognizer` BEFORE
+    /// any network or loader work — `ensure_authorized` short-circuits, so this test
+    /// needs no model files and asserts the supply-chain gate, not the backend.
+    #[test]
+    fn unauthorized_model_is_refused_without_loading() {
+        let mut cfg = MlConfig {
+            model: "attacker/evil-weights".to_string(),
+            ..Default::default()
+        };
+        let err = download(&cfg).expect_err("an unlisted repo must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not authorized"), "got: {msg}");
+        assert!(msg.contains("openai/privacy-filter"), "got: {msg}");
+        // The default (allowlisted) model passes the gate (does not return the auth
+        // error). We check the guard directly to avoid a real network fetch.
+        cfg.model = crate::config::AUTHORIZED_ML_MODELS[0].to_string();
+        assert!(ensure_authorized(&cfg).is_ok());
+    }
 
     /// C5: the `private_date` override routes to `Custom("PRIVATE_DATE")` — NOT
     /// `DateTime` (the spec default) and NOT `DATE_OF_BIRTH`. Exercises only the

@@ -11,21 +11,23 @@
 # The one thing this plugin cannot do is set ANTHROPIC_BASE_URL directly (Claude
 # Code only honors "agent"/"subagentStatusLine" from a plugin settings.json). So
 # `zlauder-hooks session-start` AUTO-ENABLES a never-seen project by writing the
-# route into .claude/settings.local.json (gitignored); Claude Code re-reads it on
-# the next message, so masking kicks in with no full restart in the common case.
-# The hook gates every side effect on whether THIS session is actually routed
-# through the proxy (it never announces masking for a session that isn't).
+# route into .claude/settings.local.json (gitignored) and launching the proxy; Claude
+# Code applies a route written mid-session only unreliably, so masking activates
+# reliably after a ONE-TIME RESTART (every session after reads it at startup). The hook
+# gates every side effect on whether THIS session is actually routed through the proxy
+# (it never announces masking for a session that isn't).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_resolve-bins.sh
 . "$SCRIPT_DIR/_resolve-bins.sh"
 
-# Do NOT default the port. zlauder-hooks/zlauder-proxy derive a per-project port
-# via derive_port(project_root) (range 18000..20000) whenever neither --port nor
-# $ZLAUDER_PORT is set. Forcing a fixed port would collapse every project onto one
-# shared proxy and break per-project isolation. We only pass --port when the user
-# explicitly set $ZLAUDER_PORT.
+# Pass --port ONLY when $ZLAUDER_PORT is set (the per-project EPHEMERAL port baked into
+# settings.local.json, which Claude Code exports into this session's env). The hook uses it
+# as the session's ROUTED port for the route gate — NOT a bind directive: the proxy binds an
+# OS-assigned ephemeral port (or a static [proxy] port) and ignores an inherited ZLAUDER_PORT.
+# When unset (a never-routed first session), the hook resolves the proxy from the project-keyed
+# rendezvous.
 PORT_ARGS=()
 if [ -n "${ZLAUDER_PORT:-}" ]; then
   PORT_ARGS=(--port "$ZLAUDER_PORT")

@@ -1,5 +1,5 @@
 ---
-description: Stop routing this project through the ZlauDeR proxy (reverts .claude/settings.local.json). Takes effect on your next message, no restart in the common case. `--all` sweeps every project — run it before uninstalling.
+description: Stop routing this project through the ZlauDeR proxy (reverts .claude/settings.local.json; a one-time Claude Code restart reliably applies it). `--all` sweeps every project — run it before uninstalling.
 argument-hint: "[--all]"
 allowed-tools: Bash(bash:*)
 ---
@@ -27,10 +27,10 @@ binaries are gone too — hence the pre-uninstall sweep.)
 Read the script output above, then:
 
 - If it reverted the routing, confirm to the user that this project's
-  `.claude/settings.local.json` no longer points at the ZlauDeR proxy. It takes effect on their
-  **next message** — Claude Code re-reads the route live, so traffic then goes straight to
-  Anthropic with no masking (no full restart needed in the common case; if it is still routing
-  after a message or two, a restart forces it).
+  `.claude/settings.local.json` no longer points at the ZlauDeR proxy. Claude Code snapshotted the
+  route at startup, so **a one-time restart reliably stops routing** — the next session reads the
+  cleared settings and traffic goes straight to Anthropic with no masking. (Until the restart, this
+  session may still route through the proxy.)
 - If it reported that nothing was wired (no ZlauDeR `env` block found), say so plainly — there
   was nothing to revert.
 - For `--all`: relay how many projects were swept and whether all succeeded. Only tell the user

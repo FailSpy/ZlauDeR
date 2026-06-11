@@ -1,5 +1,5 @@
 ---
-description: Explicitly route this project's Claude Code through the ZlauDeR masking proxy (writes .claude/settings.local.json, seeds practical zlauder.toml). Usually automatic; activates on your next message, no restart in the common case.
+description: Explicitly route this project's Claude Code through the ZlauDeR masking proxy (writes .claude/settings.local.json, seeds practical zlauder.toml). Usually automatic; a one-time Claude Code restart reliably activates it.
 allowed-tools: Bash(bash:*)
 ---
 
@@ -9,7 +9,7 @@ Script output:
 
 This is the per-project **routing** setup, and in most cases you don't need to run it:
 the plugin AUTO-ENABLES routing the first time it sees a project (it writes the route on
-the first session; masking is live from the next message). Run `/zlauder:enable` to do
+the first session; a one-time restart then reliably activates masking). Run `/zlauder:enable` to do
 that explicitly — e.g. to turn routing back on after `/zlauder:disable`, or to refresh a
 stale status-line path. It writes this project's **`.claude/settings.local.json`**
 (which the plugin keeps out of git via a `.claude/.gitignore`, so the machine-specific
@@ -20,11 +20,13 @@ line you already had as `🛡 … │ {your line}` (the original is saved and re
 exhaustive reference is `zlauder.toml.example`. Hide the `🛡` segment with
 `env.ZLAUDER_STATUSLINE=off`.
 
-Report the result above, then make the activation model clear: routing takes effect on the
-user's **next message** — Claude Code re-reads `ANTHROPIC_BASE_URL` from
-`settings.local.json` live, so no full restart is needed in the common case (if it hasn't
-taken effect within a message or two, restarting Claude Code forces it). Until it takes
-effect, outbound text still reaches the model unmasked.
+Report the result above, then make the activation model clear: Claude Code snapshots
+`ANTHROPIC_BASE_URL` at startup, so the route just written applies to THIS session only
+unreliably — **a one-time restart of Claude Code is the sure way to activate masking** (the
+status line shows `⟳ ZlauDeR: restart to mask` until it's live). Every session after this one
+reads the route at startup and routes reliably. Until masking is live, outbound text still
+reaches the model unmasked (real PII, not tokens) — this is only about what the provider
+sees; the user always sees their own plaintext.
 
 This command controls **routing** (whether traffic goes through the proxy at all, set once
 and then effectively permanent). The everyday control is **masking** — on/off, profile,

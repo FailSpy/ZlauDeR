@@ -610,7 +610,25 @@ impl ComputePrecision {
 }
 
 fn default_ml_model() -> String {
-    "openai/privacy-filter".to_string()
+    AUTHORIZED_ML_MODELS[0].to_string()
+}
+
+/// The HuggingFace repo ids ZlauDeR is authorized to fetch + load — an allowlist,
+/// NOT an open `--model`. A model checkpoint is an executable-grade artifact (a
+/// loader/tokenizer + tensor deserialization surface), so "download any repo" is a
+/// supply-chain / RCE vector. Pinning here means a model-supplied (`/zlauder:privacy
+/// model download <repo>`, `model on --model <repo>`), prompt-injected, or simply
+/// typo'd repo id can never pull an arbitrary checkpoint — every fetch/load path
+/// funnels through [`is_authorized_model`] and is rejected unless it names an entry
+/// below. The first entry is the default. Authorized quantizations are added here as
+/// explicit, validated entries; the surface never becomes an open string.
+pub const AUTHORIZED_ML_MODELS: &[&str] = &["openai/privacy-filter"];
+
+/// Whether `repo` is on the [`AUTHORIZED_ML_MODELS`] allowlist. The single predicate
+/// the ML loader and the `--download-model` pre-warm both gate on, so no override path
+/// can fetch an unlisted checkpoint.
+pub fn is_authorized_model(repo: &str) -> bool {
+    AUTHORIZED_ML_MODELS.contains(&repo)
 }
 
 /// Serde default for [`MlConfig::quant`]: the operational default is `Bf16` (the
@@ -1129,6 +1147,19 @@ mod tests {
 
     fn from_json(s: &str) -> EngineConfig {
         serde_json::from_str(s).expect("config should parse")
+    }
+
+    #[test]
+    fn authorized_model_allowlist_admits_default_only() {
+        // The compiled default is on the allowlist; arbitrary repos are not. This is
+        // the supply-chain pin enforced at the ML fetch/load chokepoint.
+        assert!(is_authorized_model(&default_ml_model()));
+        assert!(is_authorized_model("openai/privacy-filter"));
+        assert!(!is_authorized_model("attacker/evil-weights"));
+        assert!(!is_authorized_model("openai/privacy-filter-but-evil"));
+        assert!(!is_authorized_model(""));
+        // The default is, by construction, the first authorized entry.
+        assert_eq!(default_ml_model(), AUTHORIZED_ML_MODELS[0]);
     }
 
     #[test]

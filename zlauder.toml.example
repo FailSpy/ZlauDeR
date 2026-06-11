@@ -9,9 +9,10 @@
 # Tables merge recursively; arrays replace wholesale.
 
 [proxy]
-# Standalone default. In Claude Code plugin sessions, /zlauder:enable derives a
-# per-project port and passes it as --port, so project configs normally omit port.
-port = 8787
+# Omit `port` (the default) to bind an OS-assigned ephemeral port, published to a
+# per-project rendezvous file so two projects never collide. Uncomment to PIN a static
+# port instead — bound exactly; a conflict is a hard error, never silently moved.
+# port = 8787
 bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 

@@ -26,10 +26,11 @@ routing the first time it sees a project. It writes `env.ANTHROPIC_BASE_URL` (an
 `${CLAUDE_PROJECT_DIR}/.claude/settings.local.json`. The plugin also writes a
 `.claude/.gitignore` for that file, so the machine-specific `http://127.0.0.1:<port>`
 can't be committed and strand a teammate on a dead pointer. Routing
-is **per-project**, not global. Claude Code re-reads `env` from that file **live**
-(no full restart in the common case), so masking is active from your **next
-message**: the first session writes the route, the next one routes through the
-proxy. (Web `claude.ai/code` can't reach a localhost proxy and is out of scope.)
+is **per-project**, not global. Claude Code snapshots `env` at startup, so the route the
+first session writes applies to *that* session only unreliably — **a one-time restart of
+Claude Code is the sure way to activate masking** (the status line shows
+`⟳ ZlauDeR: restart to mask` until it's live). Every session after the first reads the
+route at startup and routes reliably. (Web `claude.ai/code` can't reach a localhost proxy and is out of scope.)
 
 ## Activation flow
 
@@ -37,13 +38,15 @@ Installing the plugin is, in the common case, all you do — **installed = route
 
 1. **Install the plugin** (see Install below). Its `SessionStart` hook runs each
    session. The first time it sees a project it resolves the prebuilt per-platform
-   binary that shipped with the plugin (**no compile, no download**), reserves a
-   **per-project port derived in `18000..20000`** from the project root (override
-   with `ZLAUDER_PORT`), and auto-plumbs routing into `.claude/settings.local.json`.
-   It does **not** launch the proxy for this first session — Claude Code snapshots
-   settings at startup, so a route written now applies to the *next* session.
-2. **Send your next message.** Claude Code re-reads the route live; from here the
-   session routes through the proxy and masking is on. (`/zlauder:enable` does the
+   binary that shipped with the plugin (**no compile, no download**) and auto-plumbs
+   routing into `.claude/settings.local.json`. The proxy binds an **OS-assigned
+   ephemeral port** and publishes it to a per-project *rendezvous* the hooks/CLI look
+   up by project root — no fixed or derived port to collide. Because Claude Code
+   snapshots settings at startup, the route written now applies reliably only from the
+   *next* session.
+2. **Restart Claude Code once.** That reliably applies the route; from there the
+   session routes through the proxy and masking is on. (A later message may also pick it
+   up, but a restart is the sure path. `/zlauder:enable` does the
    same write explicitly — handy to re-enable after `/zlauder:disable`, or to also
    seed a starter `zlauder.toml` — but you rarely need it. The full annotated config
    reference is shipped as `zlauder.toml.example`.)
@@ -53,8 +56,8 @@ Installing the plugin is, in the common case, all you do — **installed = route
 Set `env.ZLAUDER_STATUSLINE=off` to hide the `🛡` segment (your own status line still
 shows), or `min`/`verbose` to change how much it shows.
 
-To stop routing: `/zlauder:disable` (this project; effective on your next message, no
-restart in the common case). **Before uninstalling the plugin, run `/zlauder:disable --all`** to sweep
+To stop routing: `/zlauder:disable` (this project; effective after a one-time restart).
+**Before uninstalling the plugin, run `/zlauder:disable --all`** to sweep
 every project the plugin plumbed, so none is left pointing at a proxy that's about to
 disappear — a dead `ANTHROPIC_BASE_URL` makes Claude Code hang for minutes then fail,
 and once the plugin is gone there's no hook left to self-heal it. (The patch lives in
@@ -120,16 +123,16 @@ git config --global url."git@github.com:".pushInsteadOf "https://github.com/"
 
 Two layers, deliberately separated. **Routing** (whether traffic goes through the proxy
 at all) is plumbing: auto-set once into `settings.local.json` on the first session, then
-effectively permanent — `/zlauder:enable` / `/zlauder:disable` set it explicitly (each
-live on your next message, no restart in the common case). **Masking** (what the running proxy does to your
+effectively permanent — `/zlauder:enable` / `/zlauder:disable` set it explicitly (a
+one-time Claude Code restart reliably activates the change). **Masking** (what the running proxy does to your
 text) is policy: the everyday on/off, controlled live by `/zlauder:privacy`. Masking sits
 *on top of* routing, so turning it off is transparent pass-through and never strands a
 session.
 
 | Command | What it does |
 |---|---|
-| `/zlauder:enable` | Explicit per-project routing setup (usually automatic — the `SessionStart` hook does this on first sight). Writes this project's gitignored `.claude/settings.local.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's per-project derived port, takes over the status-line slot (wrapping any existing line as `🛡 … │ {your line}`, original saved for restore), and seeds a practical starter `zlauder.toml`. **Takes effect on your next message — no restart in the common case.** |
-| `/zlauder:disable` | Revert the routing change for this project and restore your original status line (saved at enable time; if you had none, the zlauder line is just removed) so traffic goes straight to Anthropic again — effective on your next message, and it opts the project out of auto-routing. **`/zlauder:disable --all`** sweeps every plumbed project; run it **before uninstalling** so no project strands on a dead proxy. |
+| `/zlauder:enable` | Explicit per-project routing setup (usually automatic — the `SessionStart` hook does this on first sight). Writes this project's gitignored `.claude/settings.local.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's OS-assigned ephemeral port (published per-project via a rendezvous record), takes over the status-line slot (wrapping any existing line as `🛡 … │ {your line}`, original saved for restore), and seeds a practical starter `zlauder.toml`. **A one-time Claude Code restart reliably activates it.** |
+| `/zlauder:disable` | Revert the routing change for this project and restore your original status line (saved at enable time; if you had none, the zlauder line is just removed) so traffic goes straight to Anthropic again — effective after a one-time restart, and it opts the project out of auto-routing. **`/zlauder:disable --all`** sweeps every plumbed project; run it **before uninstalling** so no project strands on a dead proxy. |
 | `/zlauder:privacy [args]` | Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
 | `/zlauder:privacy model …` | The optional `openai/privacy-filter` ML recognizer (CPU) for free-text PII (names, locations). `model download [<repo>]` caches the weights (large/slow first run); `model on`/`off` toggles it (on **loads in the background** — text is not filtered through the model until `model status` shows `ready`, so masking stays regex-only meanwhile); `model status` reports `disabled\|loading\|ready\|failed`. Pair with `category personal on`. |
 

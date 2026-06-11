@@ -7,21 +7,19 @@
 //!
 //! ## Per-project isolation
 //!
-//! Each project gets its own proxy on a project-derived port ([`derive_port`]),
-//! hence its own key, salt, store, and config. State files are keyed by port
-//! (`proxy-<port>.json`), so two `claude` windows in the same project share one
-//! file (and one proxy), while different projects never collide.
+//! Each project gets its own proxy, hence its own key, salt, store, and config. The
+//! proxy binds an OS-assigned ephemeral port (`127.0.0.1:0`) and PUBLISHES a
+//! rendezvous record keyed by PROJECT IDENTITY (`blake3(canonical_root)`), so two
+//! `claude` windows in the same project share one record (and one proxy), while
+//! different projects can never collide — a consumer only ever reads its OWN record.
 //!
 //! ## Who writes it
 //!
-//! Two writers, by design:
-//! - `session-start` writes a **reservation** ([`reserve_port`], `pid == 0`, empty
-//!   key) on a project's first launch, so it durably owns its port *before* its
-//!   proxy has bound — otherwise two colliding projects could each bake the same
-//!   port into their `settings.json` and end up sharing one proxy.
-//! - The **bound proxy** then overwrites with the live record (real control token,
-//!   salt, pid) after it binds, so the file always matches the live proxy even if
-//!   two sessions race to launch (the loser fails to bind and never writes).
+//! The **bound proxy** is the sole authority: after it binds, it writes the live
+//! rendezvous record (real control token, salt, pid, the port it actually got). A
+//! per-launch `nonce` lets the launcher trust only the instance it spawned, so a
+//! stale/crashed record is never mistaken for the live proxy (authoritative liveness
+//! is a `/healthz` build-id round-trip layered in the hook).
 //!
 //! The hooks reuse the *salt* across a restart (keeps tokens — and the prompt-cache
 //! prefix — stable) but only when the record is owned by the same project.
@@ -32,11 +30,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Lowest port used by the per-project derivation.
-pub const PORT_BASE: u16 = 18000;
-/// Number of ports in the derivation window (`PORT_BASE..PORT_BASE+PORT_SPAN`).
-pub const PORT_SPAN: u16 = 2000;
-
 /// Per-build identity baked in by `build.rs` (git short SHA, `-dirty` if the tree
 /// had uncommitted changes, or `"unknown"` without git). Both binaries embed it;
 /// the proxy reports it on `/healthz` and the SessionStart hook compares it against
@@ -46,30 +39,6 @@ pub const BUILD_ID: &str = match option_env!("ZLAUDER_BUILD") {
     Some(s) => s,
     None => "unknown",
 };
-
-/// On-disk record describing one running (or last-known) per-project proxy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProxyState {
-    pub port: u16,
-    /// Hex of the proxy's **control token** — a random secret distinct from the
-    /// AES session key. Required (via `x-zlauder-key`) to call the reveal/config
-    /// control endpoints, so they are not a trivial oracle for a tool-driven
-    /// `curl`. It is NOT the encryption key: reading this file grants control-plane
-    /// access (disable/reload/reveal-via-proxy) but not offline decryption of the
-    /// transcript. Empty for a reservation record (no proxy bound yet).
-    pub admin_key: String,
-    /// Hex of the token salt; reused across proxy restarts on this port so tokens
-    /// (and the prompt-cache prefix) stay stable mid-session.
-    #[serde(default)]
-    pub salt: String,
-    pub base_url: String,
-    /// PID of the live proxy, or `0` for a pre-launch reservation (no proxy yet).
-    pub pid: u32,
-    /// Absolute project root this proxy serves (so a port collision between two
-    /// different projects is detectable).
-    #[serde(default)]
-    pub project_root: String,
-}
 
 /// The user-scope config path: `$ZLAUDER_USER_CONFIG`, else
 /// `$XDG_CONFIG_HOME/zlauder/config.toml`, else `$HOME/.config/zlauder/config.toml`.
@@ -88,17 +57,6 @@ pub fn user_config_path() -> PathBuf {
         .or_else(windows_appdata)
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("zlauder").join("config.toml")
-}
-
-/// Deterministically map a (canonical) project root to a port in the derivation
-/// window. Same path → same port (so repeat sessions and sibling windows share a
-/// proxy); different paths → almost-always different ports. Collisions are rare
-/// and resolved at first-launch time by probing upward.
-pub fn derive_port(project_root: &str) -> u16 {
-    let h = blake3::hash(project_root.as_bytes());
-    let b = h.as_bytes();
-    let n = u16::from_le_bytes([b[0], b[1]]);
-    PORT_BASE + (n % PORT_SPAN)
 }
 
 /// Root directory for zlauder state files (created `0700` on Unix).
@@ -140,24 +98,6 @@ fn windows_appdata() -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn windows_appdata() -> Option<PathBuf> {
     None
-}
-
-/// Path to the state file for `port` (`<state_dir>/proxy-<port>.json`).
-pub fn state_path(port: u16) -> Result<PathBuf> {
-    Ok(state_dir()?.join(format!("proxy-{port}.json")))
-}
-
-/// Read the state file for `port`.
-pub fn read_state(port: u16) -> Result<ProxyState> {
-    let path = state_path(port)?;
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {path:?}"))?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-/// Read the state file for `port`, returning `None` if it doesn't exist or is
-/// unparseable (rather than erroring).
-pub fn read_state_opt(port: u16) -> Option<ProxyState> {
-    read_state(port).ok()
 }
 
 /// Is `pid` (probably) a live process? Unix (Linux AND macOS) uses POSIX `kill(pid, 0)`;
@@ -204,128 +144,6 @@ fn pid_alive(pid: u32) -> bool {
     {
         true
     }
-}
-
-/// The project that currently owns `port`, if any. A *reservation* (`pid == 0`)
-/// stands until cleared. A *live-proxy* record only counts while its pid is alive —
-/// a crashed proxy's stale record is reclaimable, so a dead proxy can't pin a port
-/// forever (review finding C3).
-fn port_owner(port: u16) -> Option<String> {
-    let st = read_state_opt(port)?;
-    if st.project_root.is_empty() {
-        return None;
-    }
-    if st.pid != 0 && !pid_alive(st.pid) {
-        return None; // stale live-proxy record → reclaimable
-    }
-    Some(st.project_root)
-}
-
-/// Resolve the port a project should use: its [`derive_port`] value, probed upward
-/// past any port currently owned by a *different* project (live proxy or standing
-/// reservation). Read-only — used by the observer commands (`statusline`, `config`,
-/// `reveal`) when no port was baked into `settings.json`. The `session-start`
-/// launcher uses [`reserve_port`] instead, which also claims the port atomically.
-pub fn pick_port(project_root: &str) -> u16 {
-    let start = derive_port(project_root);
-    for off in 0..PORT_SPAN {
-        let p = PORT_BASE + ((start - PORT_BASE + off) % PORT_SPAN);
-        match port_owner(p) {
-            Some(owner) if owner != project_root => continue,
-            _ => return p,
-        }
-    }
-    start
-}
-
-/// Atomically reserve and return the port for `project_root` (used by `session-start` /
-/// auto-plumb on a project's first launch). Thin wrapper over [`reserve_port_created`] that
-/// drops the "did this call create it" flag.
-pub fn reserve_port(project_root: &str) -> Result<u16> {
-    reserve_port_created(project_root).map(|(port, _created)| port)
-}
-
-/// Like [`reserve_port`], but also returns whether THIS call CREATED the reservation
-/// (`true`) versus returning a port already owned by this project (`false` — a standing
-/// reservation, a live proxy, or one a concurrent same-project launch just created). The
-/// caller can then clean up ONLY its own freshly-created reservation on a later failure,
-/// never one a sibling launch is relying on.
-///
-/// Probes like [`pick_port`], but for a free slot it writes a reservation record via
-/// `O_CREAT|O_EXCL`, so two concurrent first-launches can't claim the same port (one loses
-/// the create race and keeps probing). A port already owned by this project (reservation or
-/// live proxy) is returned as-is — re-launching is idempotent. The reservation makes the
-/// port visible to *other* projects' `pick_port`/`reserve_port` before this project's proxy
-/// has bound, which is what prevents two colliding projects from baking the same port
-/// (review finding F1/HIGH).
-pub fn reserve_port_created(project_root: &str) -> Result<(u16, bool)> {
-    let start = derive_port(project_root);
-    for off in 0..PORT_SPAN {
-        let p = PORT_BASE + ((start - PORT_BASE + off) % PORT_SPAN);
-        match port_owner(p) {
-            Some(owner) if owner != project_root => continue, // someone else's
-            Some(_) => return Ok((p, false)),                 // already ours — we did NOT create it
-            None => {
-                if try_reserve(p, project_root)? {
-                    return Ok((p, true)); // WE created this reservation
-                }
-                // Lost the create race. Re-check ownership: if a concurrent launch
-                // for THIS project just claimed it, it's ours — return it (so two
-                // same-project launches converge on ONE port, not p and p+1). If a
-                // different project won, keep probing.
-                match port_owner(p) {
-                    Some(owner) if owner == project_root => return Ok((p, false)),
-                    _ => continue,
-                }
-            }
-        }
-    }
-    Ok((start, false))
-}
-
-/// Atomically reserve `port` iff no state file exists yet. Returns `false` if the
-/// file already exists (lost the race / occupied).
-///
-/// The reservation is published by `hard_link`ing a fully-written temp file over the
-/// target path: `hard_link` is atomic and EXCLUSIVE (fails `AlreadyExists` if the
-/// path exists), and because the temp is complete before the link, a concurrent
-/// reader never observes an empty/torn reservation.
-fn try_reserve(port: u16, project_root: &str) -> Result<bool> {
-    let path = state_path(port)?;
-    let st = ProxyState {
-        port,
-        admin_key: String::new(),
-        salt: String::new(),
-        base_url: format!("http://127.0.0.1:{port}"),
-        pid: 0,
-        project_root: project_root.to_string(),
-    };
-    let tmp = temp_sibling(&path);
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&st)?)
-        .with_context(|| format!("writing reservation temp {tmp:?}"))?;
-    set_mode(&tmp, 0o600);
-    let result = match std::fs::hard_link(&tmp, &path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reserving {path:?}"))),
-    };
-    let _ = std::fs::remove_file(&tmp);
-    result
-}
-
-/// Write `state` to its port's state file (`0600`), atomically (temp file in the
-/// same dir, then `rename` over the target). The atomicity matters: the proxy
-/// overwrites its own reservation on bind, and a plain truncate-rewrite would let a
-/// concurrent reader briefly see the file as empty/absent → a port looking "free"
-/// mid-write → a racing `reserve_port` skipping it (review finding).
-pub fn write_state(state: &ProxyState) -> Result<()> {
-    let path = state_path(state.port)?;
-    let tmp = temp_sibling(&path);
-    std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)
-        .with_context(|| format!("writing {tmp:?}"))?;
-    set_mode(&tmp, 0o600);
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
-    Ok(())
 }
 
 /// A process-unique temp path next to `path` (same directory → same filesystem, so
@@ -457,178 +275,703 @@ pub fn registry_plumbed_roots() -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Per-project rendezvous (OS-assigned ephemeral ports)
+// ---------------------------------------------------------------------------
+//
+// This record is keyed by PROJECT IDENTITY (`blake3(canonical_root)`): the proxy binds
+// an OS-assigned ephemeral port (`127.0.0.1:0`) and PUBLISHES the port it actually got,
+// while consumers look it up by their OWN project root — never by a shared port. That
+// keying has no hash-collision surface AND structurally prevents a cross-project
+// ownership bug (a consumer can only ever read its own record).
+//
+// The proxy is the sole authority on its port; the hook LEARNS the bound port
+// from the rendezvous after launch (it never passes one). A per-launch `nonce`
+// (hook→proxy via `ZLAUDER_LAUNCH_NONCE`, echoed on `/healthz`) lets the launcher
+// trust only the instance IT spawned, so a stale/crashed/static-conflict record
+// can't be mistaken for the live proxy. Authoritative liveness is a `/healthz`
+// build-id round-trip layered in the hook (this crate has no HTTP client); the
+// `pid` here is only a cheap negative pre-filter.
+
+/// Project-identity key: `blake3(canonical_root).hex`. The single hashing
+/// contract — only Rust computes it (shell scripts never hash a path), and the
+/// hook passes the already-canonical root to the proxy, which uses it verbatim,
+/// so both sides name the same file.
+pub fn project_key(canonical_root: &str) -> String {
+    blake3::hash(canonical_root.as_bytes()).to_hex().to_string()
+}
+
+/// Project-identity-keyed live-proxy rendezvous record. The bound port lives
+/// INSIDE the record (filled by the proxy after it binds). Path:
+/// `<state_dir>/proxy/<project_key>.json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rendezvous {
+    /// Absolute canonical project root this proxy serves. Verified on read
+    /// (collision/tamper guard, like [`RegistryEntry::root`]).
+    pub project_root: String,
+    /// The bound port. `0` ⇒ launching, not bound yet.
+    pub port: u16,
+    /// Hex of the proxy's control token (`x-zlauder-key`). FRESHLY MINTED by the
+    /// proxy each launch — never read back from disk into a new proxy — so a
+    /// tampered file can't inject attacker-controlled auth material.
+    pub admin_key: String,
+    /// Hex of the token salt; reused across restarts (prompt-cache stability)
+    /// ONLY when the prior record passed [`read_rendezvous`] validation, else fresh.
+    #[serde(default)]
+    pub salt: String,
+    pub base_url: String,
+    /// PID of the live proxy, or `0` for a not-yet-bound record.
+    pub pid: u32,
+    /// Bind address (recorded so consumers/doctor know it; `127.0.0.1` by default).
+    #[serde(default)]
+    pub bind: String,
+    /// The last port this project bound — the sticky seed a relaunch tries first
+    /// (falling back to `:0` if taken), so the port stays stable across restarts.
+    #[serde(default)]
+    pub last_port: u16,
+    /// The proxy's [`BUILD_ID`] — lets a later session recycle a stale-build proxy.
+    #[serde(default)]
+    pub build_id: String,
+    /// Proxy start time (unix secs). Freshness signal independent of PID reuse.
+    #[serde(default)]
+    pub started_unix: u64,
+    /// Per-launch random token. The launcher trusts a record only when this
+    /// matches the nonce it handed the proxy via `ZLAUDER_LAUNCH_NONCE`.
+    #[serde(default)]
+    pub nonce: String,
+}
+
+/// Directory holding per-project rendezvous records: `<state_dir>/proxy/`.
+pub fn rendezvous_dir() -> Result<PathBuf> {
+    let dir = state_dir()?.join("proxy");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating rendezvous dir {dir:?}"))?;
+    set_mode(&dir, 0o700);
+    Ok(dir)
+}
+
+/// Path to `project_root`'s rendezvous record (`<state_dir>/proxy/<project_key>.json`).
+pub fn rendezvous_path(project_root: &str) -> Result<PathBuf> {
+    Ok(rendezvous_dir()?.join(format!("{}.json", project_key(project_root))))
+}
+
+/// On Unix, is `path` owner-only (no group/other access) AND owned by us? The
+/// rendezvous holds the admin key, so a record that anyone else could have
+/// written/read is not trustworthy. No-op `true` off Unix (where confidentiality
+/// rests on the per-user `%LOCALAPPDATA%` dir, same posture as the legacy state file).
+///
+/// This `metadata` and the subsequent `read` in [`read_rendezvous`] are two syscalls
+/// that both follow symlinks, so there is a small TOCTOU window. It is bounded: the
+/// enclosing `proxy/` and `state_dir` are `0700`/per-user, so only the SAME euid could
+/// swap the file — and a same-euid actor already wins by writing a valid record (and the
+/// `admin_key` is freshly minted per launch regardless). Acceptable for the local-only
+/// threat model; noted for candor.
+#[cfg(unix)]
+fn owner_only_readable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    (md.mode() & 0o077) == 0 && md.uid() == unsafe { libc::geteuid() }
+}
+#[cfg(not(unix))]
+fn owner_only_readable(_path: &Path) -> bool {
+    true
+}
+
+/// Read + VALIDATE `project_root`'s rendezvous record. Returns `None` (treat as
+/// absent) unless the file parses cleanly, is owner-only on Unix, and stores the
+/// matching `project_root`. A failed validation means the proxy mints fresh
+/// salt/key rather than trusting a possibly-tampered record.
+pub fn read_rendezvous(project_root: &str) -> Option<Rendezvous> {
+    let path = rendezvous_path(project_root).ok()?;
+    if !owner_only_readable(&path) {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let r: Rendezvous = serde_json::from_slice(&bytes).ok()?;
+    (r.project_root == project_root).then_some(r)
+}
+
+/// Write `r` to its project's rendezvous file (`0600`, atomic temp+rename — a failed
+/// write or rename leaves no temp file behind).
+pub fn write_rendezvous(r: &Rendezvous) -> Result<()> {
+    let path = rendezvous_path(&r.project_root)?;
+    let tmp = temp_sibling(&path);
+    if let Err(e) = std::fs::write(&tmp, serde_json::to_vec_pretty(r)?) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!("writing {tmp:?}")));
+    }
+    set_mode(&tmp, 0o600);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        // A failed rename leaves the temp behind otherwise (the "no temp leak" invariant).
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!("renaming {tmp:?} -> {path:?}")));
+    }
+    Ok(())
+}
+
+/// Remove `project_root`'s rendezvous record (a missing file is not an error).
+/// The hook calls this to clear a dead record it owns (by nonce) after a failed
+/// launch, so a never-served record can't poison a later adoption attempt.
+pub fn rendezvous_remove(project_root: &str) -> Result<()> {
+    let path = rendezvous_path(project_root)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("removing rendezvous record"),
+    }
+}
+
+/// Remove `project_root`'s rendezvous record ONLY if it is still OURS — both the on-disk
+/// `nonce` and `pid` match. A successor proxy that already republished (new nonce/pid)
+/// keeps its record; any record we no longer own is left untouched. The proxy calls this
+/// on graceful shutdown so a clean stop leaves no stale record behind without ever
+/// clobbering a live successor. A missing or foreign record is not an error.
+///
+/// The check-then-remove is not atomic: a successor that republishes in the sub-millisecond
+/// gap between the read and the unlink could have its fresh record removed (we already saw
+/// our own record under the guard). The window is bounded by the same single-euid local
+/// threat model as [`read_rendezvous`] (only our uid writes here), and the effect is
+/// self-healing — a missing record merely triggers the next consumer's normal launch/adopt
+/// path, never a security or data loss. Not worth a cross-process lock pre-v1.0.
+pub fn rendezvous_remove_if_owned(project_root: &str, nonce: &str, pid: u32) -> Result<()> {
+    match read_rendezvous(project_root) {
+        Some(r) if r.nonce == nonce && r.pid == pid => rendezvous_remove(project_root),
+        _ => Ok(()),
+    }
+}
+
+/// The project's bound port + record, IF the record names a bound port whose pid
+/// is (cheaply) alive. The caller still confirms authoritative liveness with a
+/// `/healthz` build-id round-trip — a reused PID that isn't answering our health
+/// on that port is then treated as dead, closing the PID-reuse hole cross-platform.
+pub fn live_port(project_root: &str) -> Option<(u16, Rendezvous)> {
+    let r = read_rendezvous(project_root)?;
+    (r.port != 0 && pid_alive(r.pid)).then_some((r.port, r))
+}
+
+// --- launch lock (single-launcher-per-project) ---------------------------------
+
+/// How long a launch lock may be held before it's considered abandoned (a launcher
+/// that died without removing it, or one wedged past any reasonable cold start).
+pub const LAUNCH_LOCK_TTL_SECS: u64 = 30;
+
+#[derive(Serialize, Deserialize)]
+struct LockBody {
+    pid: u32,
+    nonce: String,
+    started_unix: u64,
+}
+
+/// RAII guard for the per-project launch lock. Dropping it removes the lock file,
+/// so the winner must hold it until the proxy has published a healthy, nonce-matching
+/// record (or the launch has failed) — otherwise a sibling could win and double-launch.
+pub struct LaunchLock {
+    path: PathBuf,
+    /// This guard's identity. Drop removes the file ONLY if it still carries this
+    /// nonce — so a guard whose lock was already reclaimed by another launcher (a
+    /// stale-TTL takeover while we ran long) never deletes the *successor's* lock.
+    nonce: String,
+}
+impl Drop for LaunchLock {
+    fn drop(&mut self) {
+        // Identity-checked: only unlink a lock that is STILL ours. Without this,
+        // a long-running-then-reclaimed holder would, on exit, delete the lock the
+        // reclaiming launcher now owns — letting a third launcher acquire concurrently.
+        if read_lock(&self.path).map(|b| b.nonce == self.nonce).unwrap_or(false) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn lock_path(project_root: &str) -> Result<PathBuf> {
+    Ok(rendezvous_dir()?.join(format!("{}.lock", project_key(project_root))))
+}
+
+fn read_lock(path: &Path) -> Option<LockBody> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Atomically create the lock file via `O_CREAT|O_EXCL` (emulated with `hard_link`,
+/// which fails with `AlreadyExists` if the target is present). Returns `false` then.
+fn try_create_lock(path: &Path, body: &LockBody) -> Result<bool> {
+    let tmp = temp_sibling(path);
+    if let Err(e) = std::fs::write(&tmp, serde_json::to_vec(body)?) {
+        // Clean up a partially-written temp so a failed create never leaks one.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!("writing {tmp:?}")));
+    }
+    set_mode(&tmp, 0o600);
+    let result = match std::fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("locking {path:?}"))),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Mint a `LaunchLock` guard for a path we just won.
+fn lock_guard(path: &Path, nonce: &str) -> LaunchLock {
+    LaunchLock {
+        path: path.to_path_buf(),
+        nonce: nonce.to_string(),
+    }
+}
+
+/// Try to become the single launcher for `project_root`. Returns `Some(LaunchLock)`
+/// to exactly one caller; `None` if another live launcher holds it. A lock whose
+/// holder pid is dead, OR whose age exceeds [`LAUNCH_LOCK_TTL_SECS`] (so a reused
+/// holder PID can't pin it forever), is reclaimed.
+pub fn try_launch_lock(project_root: &str, pid: u32, nonce: &str) -> Result<Option<LaunchLock>> {
+    let path = lock_path(project_root)?;
+    let body = LockBody {
+        pid,
+        nonce: nonce.to_string(),
+        started_unix: now_unix(),
+    };
+    // Fast, uncontended path: no lock file yet.
+    if try_create_lock(&path, &body)? {
+        return Ok(Some(lock_guard(&path, nonce)));
+    }
+    // A lock exists. Reclaim only if its holder is dead, or it is past the TTL (so a
+    // dead holder's *reused* PID can't pin it forever).
+    let Some(existing) = read_lock(&path) else {
+        // It vanished between our create attempt and the read — race for it once more.
+        return Ok(try_create_lock(&path, &body)?.then(|| lock_guard(&path, nonce)));
+    };
+    let reclaimable = !pid_alive(existing.pid)
+        || now_unix().saturating_sub(existing.started_unix) > LAUNCH_LOCK_TTL_SECS;
+    if !reclaimable {
+        return Ok(None);
+    }
+    // Claim the RIGHT to replace the stale lock atomically: rename the exact current
+    // file aside. `rename` of a given source path succeeds for exactly ONE racer; any
+    // concurrent reclaimer gets `NotFound` and yields. This replaces a racy
+    // remove-then-create (under which two reclaimers, or a reclaimer and a fresh
+    // acquirer, could each believe they hold the lock).
+    let claimed = path.with_file_name(format!(
+        "{}.reclaim.{nonce}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("lock")
+    ));
+    match std::fs::rename(&path, &claimed) {
+        Ok(()) => {
+            // Best-effort: a crash between the rename and this remove orphans a
+            // `<lock>.reclaim.<nonce>` sidecar. Harmless — it is never the lock path,
+            // so it can't block acquisition; it is at worst disk clutter in the 0700 dir.
+            let _ = std::fs::remove_file(&claimed);
+            // We won the reclaim; create our lock exclusively. If a fresh acquirer
+            // slipped a create in between, we lose the O_EXCL and yield (no stomp).
+            Ok(try_create_lock(&path, &body)?.then(|| lock_guard(&path, nonce)))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None), // another reclaimer won the claim
+        Err(e) => Err(anyhow::Error::from(e).context("reclaiming stale launch lock")),
+    }
+}
+
+/// Current unix time in whole seconds (0 if the clock is before the epoch).
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// --- loopback / bind-error classifiers (pure; unit-tested on any OS) ------------
+
+/// Is `bind` a loopback address (or the name `localhost`)? Non-loopback binds
+/// expose the control plane to the network and are refused by the proxy unless
+/// explicitly acknowledged.
+pub fn is_loopback_bind(bind: &str) -> bool {
+    let b = bind.trim();
+    if b.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Tolerate a bracketed IPv6 literal (`[::1]`).
+    let b = b
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(b);
+    b.parse::<std::net::IpAddr>()
+        // `to_canonical` folds an IPv4-mapped IPv6 (`::ffff:127.0.0.1`) back to its v4
+        // form so it is recognized as loopback. Errs safe in any case — an unrecognized
+        // loopback form is merely *refused* (ack required), never wrongly exposed.
+        .map(|ip| ip.to_canonical().is_loopback())
+        .unwrap_or(false)
+}
+
+/// A classified bind failure, mapped from an OS errno / `io::ErrorKind` so both the
+/// proxy (at bind) and the hook (diagnosing a launch failure) render the same
+/// actionable cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindFault {
+    /// Port already in use (`EADDRINUSE` / `WSAEADDRINUSE`).
+    InUse,
+    /// Privileged (<1024) or OS-reserved/excluded port (`EACCES` / `WSAEACCES`).
+    Permission,
+    /// The bind address isn't local to this host (`EADDRNOTAVAIL` / `WSAEADDRNOTAVAIL`).
+    AddrNotAvail,
+    /// Anything else.
+    Other,
+}
+
+/// Classify a `TcpListener::bind` error. Matches `io::ErrorKind` first, then falls
+/// back to the raw Windows Winsock codes (which surface as `Uncategorized`).
+pub fn classify_bind_error(raw_os: Option<i32>, kind: ErrorKind) -> BindFault {
+    match kind {
+        ErrorKind::AddrInUse => BindFault::InUse,
+        ErrorKind::PermissionDenied => BindFault::Permission,
+        ErrorKind::AddrNotAvailable => BindFault::AddrNotAvail,
+        _ => match raw_os {
+            Some(10048) => BindFault::InUse,        // WSAEADDRINUSE
+            Some(10013) => BindFault::Permission,   // WSAEACCES
+            Some(10049) => BindFault::AddrNotAvail, // WSAEADDRNOTAVAIL
+            _ => BindFault::Other,
+        },
+    }
+}
+
+impl BindFault {
+    /// A human, actionable message for a failed bind of `port` on `bind`.
+    pub fn message(self, port: u16, bind: &str) -> String {
+        match self {
+            BindFault::InUse => format!(
+                "port {port} is already in use — another process (or a stale zlauder proxy) holds it. \
+                 Pick a different `[proxy] port` in zlauder.toml, or remove it to use an OS-assigned \
+                 ephemeral port (recommended)."
+            ),
+            BindFault::Permission => format!(
+                "binding {bind}:{port} was denied — the port is privileged (<1024) or OS-reserved. \
+                 On Windows, Hyper-V/WSL/Docker reserve ranges (`netsh interface ipv4 show \
+                 excludedportrange protocol=tcp`); choose a port outside them, or remove `[proxy] \
+                 port` to use an ephemeral port (recommended)."
+            ),
+            BindFault::AddrNotAvail => format!(
+                "{bind} is not an address on this machine — use 127.0.0.1 (the default) or a local \
+                 interface IP."
+            ),
+            BindFault::Other => format!("could not bind {bind}:{port}."),
+        }
+    }
+}
+
+/// A SINGLE process-global lock serializing every test that mutates the process-wide
+/// `ZLAUDER_STATE_DIR` / `ZLAUDER_USER_CONFIG` env vars. Shared across BOTH test
+/// modules below — separate per-module locks would not mutually exclude, so a
+/// `rendezvous_tests` case and a `tests` case could race on the env under
+/// `--test-threads` and read each other's state dir.
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod rendezvous_tests {
+    use super::*;
+
+    // The shared env lock (see TEST_ENV_LOCK) — ZLAUDER_STATE_DIR is process-global.
+    use super::TEST_ENV_LOCK as ENV_LOCK;
+
+    fn with_state_dir(tag: &str, f: impl FnOnce(&std::path::Path)) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("zlauder-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: single-threaded test guarded by ENV_LOCK.
+        unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
+        f(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::remove_var("ZLAUDER_STATE_DIR") };
+    }
+
+    fn rec(root: &str, port: u16, pid: u32) -> Rendezvous {
+        Rendezvous {
+            project_root: root.into(),
+            port,
+            admin_key: "ab".repeat(32),
+            salt: "cd".repeat(16),
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid,
+            bind: "127.0.0.1".into(),
+            last_port: port,
+            build_id: "testbuild".into(),
+            started_unix: now_unix(),
+            nonce: "nonce-x".into(),
+        }
+    }
+
+    /// A definitely-dead pid: spawn a trivial child and reap it.
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                ["/C", "exit 0"]
+            } else {
+                ["-c", "exit 0"]
+            })
+            .spawn()
+            .expect("spawn throwaway child");
+        let pid = c.id();
+        let _ = c.wait();
+        pid
+    }
+
+    #[test]
+    fn rendezvous_round_trips_and_guards_root() {
+        with_state_dir("rv-rt", |_| {
+            assert!(read_rendezvous("/proj/a").is_none());
+            write_rendezvous(&rec("/proj/a", 41234, std::process::id())).unwrap();
+            let back = read_rendezvous("/proj/a").expect("present");
+            assert_eq!(back.port, 41234);
+            assert_eq!(back.admin_key, "ab".repeat(32));
+            // A different project never reads /proj/a's record (project-keyed lookup).
+            assert!(read_rendezvous("/proj/b").is_none());
+        });
+    }
+
+    #[test]
+    fn live_port_requires_bound_and_alive() {
+        with_state_dir("rv-live", |_| {
+            // Not bound yet (port 0).
+            write_rendezvous(&rec("/proj/a", 0, std::process::id())).unwrap();
+            assert!(live_port("/proj/a").is_none(), "port 0 is not live");
+            // Bound + alive (our own pid).
+            write_rendezvous(&rec("/proj/a", 41001, std::process::id())).unwrap();
+            assert_eq!(live_port("/proj/a").map(|(p, _)| p), Some(41001));
+            // Bound but dead pid → reclaimable.
+            write_rendezvous(&rec("/proj/a", 41001, dead_pid())).unwrap();
+            assert!(live_port("/proj/a").is_none(), "dead pid is not live");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rendezvous_rejects_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        with_state_dir("rv-perm", |_| {
+            write_rendezvous(&rec("/proj/a", 41002, std::process::id())).unwrap();
+            assert!(read_rendezvous("/proj/a").is_some());
+            // Loosen perms as a tamper proxy → record is no longer trusted.
+            let p = rendezvous_path("/proj/a").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                read_rendezvous("/proj/a").is_none(),
+                "a non-owner-only record must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn launch_lock_admits_one_then_reclaims_dead() {
+        with_state_dir("rv-lock", |_| {
+            let g = try_launch_lock("/proj/a", std::process::id(), "n1").unwrap();
+            assert!(g.is_some(), "first caller wins the lock");
+            // A live holder blocks a second caller.
+            assert!(
+                try_launch_lock("/proj/a", std::process::id(), "n2")
+                    .unwrap()
+                    .is_none(),
+                "live holder blocks a second launcher"
+            );
+            drop(g); // releases the lock
+            // After release, a fresh caller wins again.
+            assert!(try_launch_lock("/proj/a", std::process::id(), "n3").unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn launch_lock_reclaims_dead_holder() {
+        with_state_dir("rv-lock-dead", |_| {
+            // Hand-write a lock owned by a dead pid; a new caller must reclaim it.
+            let path = lock_path("/proj/a").unwrap();
+            let body = LockBody {
+                pid: dead_pid(),
+                nonce: "old".into(),
+                started_unix: now_unix(),
+            };
+            std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+            assert!(
+                try_launch_lock("/proj/a", std::process::id(), "new")
+                    .unwrap()
+                    .is_some(),
+                "a dead holder's lock is reclaimable"
+            );
+        });
+    }
+
+    #[test]
+    fn launch_lock_reclaims_stale_holder() {
+        with_state_dir("rv-lock-stale", |_| {
+            // Live holder (our pid) but ancient started_unix → stale, reclaimable.
+            let path = lock_path("/proj/a").unwrap();
+            let body = LockBody {
+                pid: std::process::id(),
+                nonce: "old".into(),
+                started_unix: 0,
+            };
+            std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+            assert!(
+                try_launch_lock("/proj/a", std::process::id(), "new")
+                    .unwrap()
+                    .is_some(),
+                "a lock older than the TTL is reclaimable even if the pid is alive"
+            );
+        });
+    }
+
+    // The HIGH from the Phase-1 paired review: a long-running holder that got
+    // reclaimed (its lock taken over via the stale-TTL path) must NOT, on its own
+    // eventual drop, delete the SUCCESSOR's lock — else a third launcher could acquire
+    // while the successor still holds. Identity-checked Drop prevents the stomp.
+    #[test]
+    fn reclaimed_holder_drop_does_not_stomp_successor() {
+        with_state_dir("rv-lock-stomp", |_| {
+            // A stale lock recorded with a LIVE pid (ours) but an ancient start → the
+            // exact reclaimable-while-alive condition that makes the drop race possible.
+            let path = lock_path("/proj/a").unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&LockBody {
+                    pid: std::process::id(),
+                    nonce: "A".into(),
+                    started_unix: 0,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            // B reclaims and now owns the on-disk lock.
+            let b = try_launch_lock("/proj/a", std::process::id(), "B").unwrap();
+            assert!(b.is_some(), "B reclaims the stale lock");
+            assert_eq!(read_lock(&path).unwrap().nonce, "B");
+            // The happy-path reclaim leaves no `.reclaim.*` sidecar behind (guards the
+            // leak-test blind spot the paired review flagged).
+            let sidecars: Vec<_> = std::fs::read_dir(rendezvous_dir().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".reclaim."))
+                .collect();
+            assert!(sidecars.is_empty(), "reclaim sidecar leaked: {sidecars:?}");
+
+            // Simulate the original holder A's guard dropping AFTER the reclaim.
+            drop(lock_guard(&path, "A"));
+
+            // B's lock survives — A's identity-checked drop is a no-op on B's file.
+            assert_eq!(
+                read_lock(&path).map(|l| l.nonce),
+                Some("B".to_string()),
+                "A's drop must not stomp B's reclaimed lock"
+            );
+            // And a fresh launcher still cannot acquire while B holds (alive + fresh).
+            assert!(
+                try_launch_lock("/proj/a", std::process::id(), "C")
+                    .unwrap()
+                    .is_none(),
+                "C must not acquire while B holds"
+            );
+            drop(b);
+            // After B releases, the lock file is gone and C can win.
+            assert!(read_lock(&path).is_none(), "B's release removed its own lock");
+        });
+    }
+
+    #[test]
+    fn is_loopback_bind_table() {
+        for s in [
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LOCALHOST",
+            "127.5.5.5",
+            "::ffff:127.0.0.1", // IPv4-mapped loopback (folded via to_canonical)
+        ] {
+            assert!(is_loopback_bind(s), "{s} should be loopback");
+        }
+        for s in ["0.0.0.0", "::", "192.168.1.5", "10.0.0.1", "example.com"] {
+            assert!(!is_loopback_bind(s), "{s} should NOT be loopback");
+        }
+    }
+
+    #[test]
+    fn classify_bind_error_table() {
+        assert_eq!(
+            classify_bind_error(None, ErrorKind::AddrInUse),
+            BindFault::InUse
+        );
+        assert_eq!(
+            classify_bind_error(None, ErrorKind::PermissionDenied),
+            BindFault::Permission
+        );
+        assert_eq!(
+            classify_bind_error(None, ErrorKind::AddrNotAvailable),
+            BindFault::AddrNotAvail
+        );
+        // Windows Winsock codes arrive as an "other" kind with a raw os error.
+        assert_eq!(
+            classify_bind_error(Some(10048), ErrorKind::Other),
+            BindFault::InUse
+        );
+        assert_eq!(
+            classify_bind_error(Some(10013), ErrorKind::Other),
+            BindFault::Permission
+        );
+        assert_eq!(classify_bind_error(Some(0), ErrorKind::Other), BindFault::Other);
+    }
+
+    #[test]
+    fn write_rendezvous_leaves_no_temp() {
+        with_state_dir("rv-noleak", |_| {
+            write_rendezvous(&rec("/proj/a", 41003, std::process::id())).unwrap();
+            write_rendezvous(&rec("/proj/a", 41003, std::process::id())).unwrap();
+            let dir = rendezvous_dir().unwrap();
+            let leaked: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".tmp."))
+                .collect();
+            assert!(leaked.is_empty(), "temp files leaked: {leaked:?}");
+        });
+    }
+
+    #[test]
+    fn rendezvous_remove_if_owned_respects_identity() {
+        with_state_dir("rv-rmown", |_| {
+            // A record we own (matching nonce + pid) is removed.
+            let mut r = rec("/proj/a", 41010, std::process::id());
+            r.nonce = "mine".into();
+            write_rendezvous(&r).unwrap();
+            rendezvous_remove_if_owned("/proj/a", "mine", std::process::id()).unwrap();
+            assert!(read_rendezvous("/proj/a").is_none(), "our own record is cleared");
+
+            // A successor's record (different nonce) is left untouched.
+            let mut s = rec("/proj/a", 41011, std::process::id());
+            s.nonce = "successor".into();
+            write_rendezvous(&s).unwrap();
+            rendezvous_remove_if_owned("/proj/a", "mine", std::process::id()).unwrap();
+            assert!(
+                read_rendezvous("/proj/a").is_some(),
+                "a record owned by a successor (different nonce) must survive"
+            );
+
+            // A pid mismatch (right nonce, foreign pid) is also left untouched.
+            rendezvous_remove_if_owned("/proj/a", "successor", 0x7FFF_FFFE).unwrap();
+            assert!(
+                read_rendezvous("/proj/a").is_some(),
+                "a pid mismatch must not remove the record"
+            );
+
+            // Removing a non-existent record is not an error.
+            rendezvous_remove_if_owned("/proj/none", "x", std::process::id()).unwrap();
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // `ZLAUDER_STATE_DIR` is process-global; serialize tests that mutate it so
-    // parallel test threads don't clobber each other's state dir.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn derive_port_is_deterministic_and_in_range() {
-        let a = derive_port("/home/me/projects/alpha");
-        let b = derive_port("/home/me/projects/alpha");
-        let c = derive_port("/home/me/projects/beta");
-        assert_eq!(a, b, "same path => same port");
-        assert!((PORT_BASE..PORT_BASE + PORT_SPAN).contains(&a));
-        assert!((PORT_BASE..PORT_BASE + PORT_SPAN).contains(&c));
-        // Not a hard guarantee, but these two distinct paths must not collide or
-        // the isolation premise is silently broken for the test fixtures.
-        assert_ne!(a, c, "distinct paths collided in-range");
-    }
-
-    #[test]
-    fn state_round_trips() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("zlauder-test-{}", std::process::id()));
-        // SAFETY: single-threaded test; sets a process-local override only.
-        unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
-        let st = ProxyState {
-            port: 18042,
-            admin_key: "ab".repeat(32),
-            salt: "cd".repeat(16),
-            base_url: "https://api.anthropic.com".into(),
-            pid: 4242,
-            project_root: "/home/me/projects/alpha".into(),
-        };
-        write_state(&st).unwrap();
-        let back = read_state(18042).unwrap();
-        assert_eq!(back.admin_key, st.admin_key);
-        assert_eq!(back.salt, st.salt);
-        assert_eq!(back.project_root, st.project_root);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Two colliding projects must NOT be handed the same port: the first reserves
-    // it durably (before any proxy runs), the second probes past it.
-    #[test]
-    fn reserve_port_prevents_collision_pre_launch() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("zlauder-resv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
-
-        let a = "/proj/a";
-        let b = "/proj/b";
-        let pa = reserve_port(a).unwrap();
-        // Reservation is on disk with pid 0 and a's root, even though no proxy ran.
-        let rec = read_state(pa).unwrap();
-        assert_eq!(rec.pid, 0);
-        assert_eq!(rec.project_root, a);
-        assert!(rec.admin_key.is_empty(), "reservation carries no key");
-
-        // init for b is idempotent for itself and never collides with a.
-        let pb = reserve_port(b).unwrap();
-        assert_ne!(
-            pa, pb,
-            "second project must not reuse the first's reserved port"
-        );
-        assert_eq!(reserve_port(a).unwrap(), pa, "re-reserve is idempotent");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe { std::env::remove_var("ZLAUDER_STATE_DIR") };
-    }
-
-    // The core F1 fix: a *foreign reservation* (pid 0, no proxy running) on a
-    // project's derived port must push it to a different port. The pre-fix bug was
-    // that init wrote no reservation, so this record didn't exist pre-launch.
-    #[test]
-    fn foreign_reservation_blocks_derived_port_pre_launch() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("zlauder-foreign-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
-
-        let x = "/proj/x";
-        let port = derive_port(x);
-        write_state(&ProxyState {
-            port,
-            admin_key: String::new(),
-            salt: String::new(),
-            base_url: format!("http://127.0.0.1:{port}"),
-            pid: 0, // a standing reservation — no proxy running
-            project_root: "/proj/foreign".into(),
-        })
-        .unwrap();
-
-        let got = reserve_port(x).unwrap();
-        assert_ne!(
-            got, port,
-            "a foreign pre-launch reservation must block the derived port"
-        );
-        assert_eq!(read_state(got).unwrap().project_root, x);
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe { std::env::remove_var("ZLAUDER_STATE_DIR") };
-    }
-
-    // A stale live-proxy record (dead pid) must not pin a port forever.
-    #[test]
-    fn stale_dead_proxy_record_is_reclaimable() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("zlauder-stale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
-
-        let port = derive_port("/proj/x");
-        // A different project's record with a definitely-dead pid.
-        write_state(&ProxyState {
-            port,
-            admin_key: "aa".repeat(32),
-            salt: "bb".repeat(16),
-            base_url: format!("http://127.0.0.1:{port}"),
-            pid: 0x7FFF_FFFE, // not a live process
-            project_root: "/proj/other".into(),
-        })
-        .unwrap();
-        // /proj/x derives this very port; since the other record is dead, x reclaims it.
-        assert_eq!(
-            pick_port("/proj/x"),
-            port,
-            "dead proxy record should be reclaimable"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe { std::env::remove_var("ZLAUDER_STATE_DIR") };
-    }
-
-    // write_state replaces an existing record and leaves no temp file behind (the
-    // atomic temp+rename must clean up after itself).
-    #[test]
-    fn write_state_replaces_atomically_no_temp_leak() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("zlauder-atomic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
-
-        let mk = |k: &str| ProxyState {
-            port: 18099,
-            admin_key: k.into(),
-            salt: "00".repeat(16),
-            base_url: "x".into(),
-            pid: 1,
-            project_root: "/p".into(),
-        };
-        write_state(&mk("first")).unwrap();
-        write_state(&mk("second")).unwrap(); // overwrite an existing file
-        assert_eq!(read_state(18099).unwrap().admin_key, "second");
-
-        let leftovers: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".tmp."))
-            .collect();
-        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe { std::env::remove_var("ZLAUDER_STATE_DIR") };
-    }
+    // The shared env lock (see TEST_ENV_LOCK): ZLAUDER_STATE_DIR/ZLAUDER_USER_CONFIG are
+    // process-global, so ALL env-mutating tests across both modules serialize on ONE lock.
+    use super::TEST_ENV_LOCK as ENV_LOCK;
 
     // The plumbed-projects registry round-trips state, filters Plumbed for the sweep, and
     // honors an opt-out so a disabled project is never auto-re-plumbed.

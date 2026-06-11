@@ -1,10 +1,12 @@
 //! zlauder-proxy — local reverse proxy that masks PII in Claude Code's
 //! Anthropic Messages API traffic and unmasks responses on the wire.
 //!
-//! One proxy per project (the SessionStart hook launches it on a project-derived
-//! port). The proxy is the authoritative writer of its state file: after it binds
-//! the port it records its real key/salt/pid, so the `zlauder-hooks` CLI always
-//! reaches a key that matches the live proxy — even if two sessions race to start.
+//! One proxy per project (the SessionStart hook launches it). By default it binds an
+//! OS-assigned ephemeral port (sticky-reusing its last port when free); a static
+//! `[proxy] port` pins one instead. The proxy is the authoritative writer of its
+//! project-keyed rendezvous record: after it binds it records the real port + key/salt/
+//! pid, so the `zlauder-hooks` CLI always reaches a key that matches the live proxy —
+//! even if two sessions race to start.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,12 +16,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context;
 use clap::Parser;
 use zlauder_engine::{EngineConfig, MaskEngine, MlConfig};
-use zlauder_proxy::{config, ml, monitor::Monitor, routes, secrets as proxy_secrets, state::AppState};
+use zlauder_proxy::{
+    bind, config, ml, monitor::Monitor, routes, secrets as proxy_secrets, state::AppState,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "zlauder-proxy", version, about)]
 struct Args {
-    /// Port to listen on (overrides config; default 8787).
+    /// Static port to pin (overrides config). Omitted ⇒ OS-assigned ephemeral port
+    /// (the default), sticky-reusing this project's last port when it's free.
     #[arg(long, env = "ZLAUDER_PORT")]
     port: Option<u16>,
     /// Bind address (overrides config; default 127.0.0.1).
@@ -61,10 +66,23 @@ async fn main() -> anyhow::Result<()> {
         return download_model(cfg.engine.ml, args.model).await;
     }
 
-    let port = args.port.unwrap_or(cfg.port);
+    // A user-pinned `[proxy] port`/`--port` is a static pin; absent ⇒ ephemeral.
+    let static_port = args.port.or(cfg.port);
     let bind = args.bind.unwrap_or(cfg.bind);
     let upstream = args.upstream.unwrap_or(cfg.upstream_base_url);
     let project_root = resolve_project_root(args.project_root);
+
+    // Bind BEFORE building state so the actual (OS-assigned, for the ephemeral default)
+    // port flows into AppState.port and the published rendezvous. Loopback-only unless
+    // explicitly acknowledged. The launch nonce lets the hook confirm it adopted the
+    // exact proxy instance it spawned (echoed on /healthz).
+    bind::loopback_guard(&bind)?;
+    let launch_nonce = std::env::var("ZLAUDER_LAUNCH_NONCE").unwrap_or_default();
+    let listener = bind::bind_listener(&bind, static_port, &project_root).await?;
+    let port = listener
+        .local_addr()
+        .context("reading the bound port")?
+        .port();
 
     // Registered-secret refs (resolved in the background after we bind). Captured
     // before `cfg.engine` is moved into `build_engine`.
@@ -141,23 +159,28 @@ async fn main() -> anyhow::Result<()> {
         .set_local_redactions(state.engine.local_redaction_pairs());
     let app = routes::router(state);
     let addr = format!("{bind}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
 
-    // We bound the port → we are the live proxy for it. Record authoritative
-    // state BEFORE serving so the CLI never reads a key that doesn't match us.
-    // (A racing rival that failed to bind exits above and never writes.)
+    // We bound the port → we are the live proxy for this project. Publish the authoritative
+    // rendezvous record (keyed by project identity) BEFORE serving so the CLI never reads a
+    // key that doesn't match us; the hook looks us up by project root.
+    // Captured for the graceful-shutdown cleanup below before these values move into the record.
+    let shutdown_nonce = launch_nonce.clone();
+    let shutdown_root = project_root.clone();
     let base_url = format!("http://127.0.0.1:{port}");
-    if let Err(e) = zlauder_state::write_state(&zlauder_state::ProxyState {
+    if let Err(e) = zlauder_state::write_rendezvous(&zlauder_state::Rendezvous {
+        project_root,
         port,
         admin_key,
         salt: salt_hex,
         base_url,
         pid: std::process::id(),
-        project_root,
+        bind,
+        last_port: port,
+        build_id: zlauder_state::BUILD_ID.to_string(),
+        started_unix: zlauder_state::now_unix(),
+        nonce: launch_nonce,
     }) {
-        tracing::warn!("could not write state file (reveal/config CLI may not find the key): {e}");
+        tracing::warn!("could not write rendezvous record (CLI may not find the proxy): {e}");
     }
 
     tracing::info!("zlauder-proxy listening on http://{addr} -> {upstream}");
@@ -204,6 +227,17 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+
+    // Graceful shutdown completed — clear OUR rendezvous so a clean stop leaves no stale
+    // record behind (dead pid/port). Guarded by nonce+pid so a successor proxy that already
+    // replaced us keeps its own record.
+    if let Err(e) = zlauder_state::rendezvous_remove_if_owned(
+        &shutdown_root,
+        &shutdown_nonce,
+        std::process::id(),
+    ) {
+        tracing::warn!("could not remove rendezvous on shutdown: {e}");
+    }
     Ok(())
 }
 

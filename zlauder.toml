@@ -4,7 +4,8 @@
 # For the full annotated config surface, see zlauder.toml.example.
 
 [proxy]
-port = 8787
+# Omitted ⇒ OS-assigned ephemeral port (the default), published to a per-project
+# rendezvous file so projects never collide. Set `port = N` to pin a static port.
 bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 

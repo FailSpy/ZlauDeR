@@ -2,8 +2,9 @@
 //!
 //! Subcommands:
 //!   session-start  Launch this project's proxy (if not already running) and emit
-//!                  the SessionStart hook JSON that points Claude Code at it. On the
-//!                  first launch it atomically reserves the project's derived port.
+//!                  the SessionStart hook JSON that points Claude Code at it. The proxy
+//!                  binds an OS-assigned ephemeral port and publishes a per-project
+//!                  rendezvous record consumers look up by project root.
 //!   statusline     One-line status indicator (on/off + profile).
 //!   config         View or change privacy settings (backs `/zlauder:privacy`).
 //!   reveal <tok>   Audit: decode a token to its plaintext via the running proxy.
@@ -16,12 +17,13 @@
 //!
 //! ## Per-project isolation
 //!
-//! Each project runs its own proxy on a project-derived port (see
-//! [`zlauder_state::derive_port`]), so its key, store, and config are isolated.
-//! Two `claude` windows in the same project share the one proxy; different projects
-//! never interfere. The port is written into each project's `.claude/settings.local.json`
-//! (as `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`) by auto-plumb / `/zlauder:enable`, so the
-//! load-bearing path is the static base URL — not a best-effort dynamic env.
+//! Each project runs its own proxy on an OS-assigned ephemeral port; consumers find it
+//! through a project-identity-keyed rendezvous record (see [`zlauder_state::live_port`]),
+//! so its key, store, and config are isolated. Two `claude` windows in the same project
+//! share the one proxy; different projects never interfere. The bound port is written into
+//! each project's `.claude/settings.local.json` (as `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`)
+//! by auto-plumb / `/zlauder:enable`, so the load-bearing path is the static base URL — not
+//! a best-effort dynamic env.
 
 use std::io::Read;
 use std::net::TcpListener;
@@ -34,7 +36,6 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde_json::{Value, json};
 use zlauder_engine::{EngineConfig, Profile};
-use zlauder_state::{pick_port, read_state, reserve_port};
 
 mod transcript;
 
@@ -58,12 +59,16 @@ enum Cmd {
         #[arg(long, default_value_t = default_proxy_bin())]
         proxy_bin: String,
     },
-    /// Reserve (O_EXCL) this project's derived proxy port and print it. Used by
-    /// `/zlauder:enable` to learn the port to write into settings.local.json WITHOUT
-    /// launching the proxy or emitting SessionStart output — the proxy launches on the
-    /// next SessionStart that is actually routed through it (the session after the route
-    /// is written; Claude Code re-reads it live, no restart needed in the common case).
-    ReservePort,
+    /// Bring this project's proxy up (launch / recycle a stale build) and print the port it
+    /// bound on stdout. Used by `/zlauder:enable` to learn the OS-assigned ephemeral port to
+    /// write into settings.local.json. (Name retained for the shell contract; behaviorally a
+    /// bare-port variant of `ensure-up`.)
+    ReservePort {
+        #[arg(long, env = "ZLAUDER_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long, default_value_t = default_proxy_bin())]
+        proxy_bin: String,
+    },
     /// Ensure this project's proxy is running (launch or recycle a stale build) and, with
     /// `--print-url`, print its base URL. A standalone way to warm the proxy ahead of time,
     /// and the primitive a future zero-state launcher could exec Claude Code through (passing
@@ -76,6 +81,14 @@ enum Cmd {
         /// Print the proxy base URL on stdout (for the launcher's `--settings` injection).
         #[arg(long)]
         print_url: bool,
+    },
+    /// Preflight self-check: probe loopback reachability, localhost IPv4/IPv6, this project's
+    /// proxy health, the state dir, and (Windows, static port) excluded ranges. Prints a
+    /// pass/fail table (or `--json`) and exits non-zero on any FAIL. Backs `/zlauder:doctor`.
+    Doctor {
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a one-line status indicator for the Claude Code status line.
     Statusline,
@@ -135,10 +148,10 @@ enum Cmd {
 enum SettingsAction {
     /// Wire env.ANTHROPIC_BASE_URL + env.ZLAUDER_PORT and take over the statusLine slot
     /// (wrapping any existing line to the sidecar). A missing settings.local.json is treated
-    /// as `{}` (and created). Exit 0 = file changed (caller announces masking activates on
-    /// the next message — Claude Code re-reads the route live, no restart in the common case);
-    /// exit 3 = already pointed at this proxy, nothing routing-relevant changed; non-zero
-    /// = error (invalid JSON / write failure), message on stderr.
+    /// as `{}` (and created). Exit 0 = file changed (caller announces masking activates after
+    /// a one-time Claude Code restart — a route written this session applies reliably only from
+    /// the next one); exit 3 = already pointed at this proxy, nothing routing-relevant changed;
+    /// non-zero = error (invalid JSON / write failure), message on stderr.
     Enable {
         /// Proxy base URL to bake in, e.g. http://127.0.0.1:18123.
         #[arg(long)]
@@ -289,18 +302,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::SessionStart { config, proxy_bin } => session_start(cli.port, config, proxy_bin),
-        Cmd::ReservePort => reserve_port_cmd(cli.port),
+        Cmd::ReservePort { config, proxy_bin } => reserve_port_cmd(config, proxy_bin),
         Cmd::EnsureUp {
             config,
             proxy_bin,
             print_url,
-        } => ensure_up_cmd(cli.port, config, proxy_bin, print_url),
+        } => ensure_up_cmd(config, proxy_bin, print_url),
+        Cmd::Doctor { json } => doctor(json),
         Cmd::Statusline => statusline(cli.port),
-        Cmd::Config { action } => config_cmd(cli.port, action),
-        Cmd::PreToolUse => pre_tool_use(cli.port),
-        Cmd::Reveal { token } => reveal(cli.port, token),
-        Cmd::Monitor => monitor_cmd(cli.port),
-        Cmd::Secrets { action } => secrets_cmd(cli.port, action),
+        Cmd::Config { action } => config_cmd(action),
+        Cmd::PreToolUse => pre_tool_use(),
+        Cmd::Reveal { token } => reveal(token),
+        Cmd::Monitor => monitor_cmd(),
+        Cmd::Secrets { action } => secrets_cmd(action),
         Cmd::Scrub {
             transcript,
             values,
@@ -325,8 +339,8 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Outcome of a settings mutation, mapped to the shell's exit-code contract:
-/// `Changed` => exit 0 (caller announces masking activates on the next message — no
-/// restart in the common case), `NoOp` => exit 3 (caller prints "already pointed…"/
+/// `Changed` => exit 0 (caller announces masking activates after a one-time restart),
+/// `NoOp` => exit 3 (caller prints "already pointed…"/
 /// "already disabled…"). Hard errors bubble as `anyhow` (exit 1).
 enum SettingsOutcome {
     Changed,
@@ -774,13 +788,22 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
     // Ownership matters: `ZLAUDER_PORT` is OUR private co-key (no user sets it), so it is
     // always ours to remove. `ANTHROPIC_BASE_URL`, however, may be the USER's own (e.g. a
     // corporate gateway) — we only remove it when its VALUE is provably ours (a loopback URL
-    // in our derived port range). This keeps disable/migration from deleting a user's own
+    // whose port matches our co-baked `ZLAUDER_PORT`). This keeps disable/migration from deleting a user's own
     // base URL that was merely shadowed by our local route. We still trigger on ANY of our
     // wiring (ours-env or our status line) so disable is a true inverse in asymmetric state.
+    // The co-baked ZLAUDER_PORT identifies OUR (ephemeral) loopback URL even though its port
+    // isn't derivable. Tolerate a string or numeric JSON value.
+    let baked_zport = v
+        .pointer("/env/ZLAUDER_PORT")
+        .and_then(|z| {
+            z.as_str()
+                .and_then(|s| s.parse::<u16>().ok())
+                .or_else(|| z.as_u64().and_then(|n| u16::try_from(n).ok()))
+        });
     let abu_is_ours = v
         .pointer("/env/ANTHROPIC_BASE_URL")
         .and_then(Value::as_str)
-        .map(is_zlauder_base_url)
+        .map(|u| is_zlauder_base_url(u, baked_zport))
         .unwrap_or(false);
     let zport_present = v.pointer("/env/ZLAUDER_PORT").is_some();
     let has_env_wiring = abu_is_ours || zport_present;
@@ -827,13 +850,12 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
     Ok((true, restored))
 }
 
-/// Is `url` a base URL WE would have written — a path-less loopback authority on a port in
-/// our derived range (`PORT_BASE..PORT_BASE+PORT_SPAN`)? Lets migration/disable tell OUR
+/// Is `url` a base URL WE would have written — a path-less loopback authority whose port
+/// matches the co-baked `ZLAUDER_PORT` (`co_key`)? Lets migration/disable tell OUR
 /// `ANTHROPIC_BASE_URL` apart from a user's own (a corporate gateway, a different local
-/// proxy), so we never delete an env var that isn't ours. `ZLAUDER_PORT` is the primary
-/// ownership signal; this is the value-based check for it and for the asymmetric case where
-/// `ZLAUDER_PORT` was hand-removed but our loopback URL remains.
-fn is_zlauder_base_url(url: &str) -> bool {
+/// proxy), so we never delete an env var that isn't ours. The port is OS-assigned (not
+/// derivable), so the co-baked `ZLAUDER_PORT` is the only durable ownership signal.
+fn is_zlauder_base_url(url: &str, co_key: Option<u16>) -> bool {
     let Some(authority) = url.trim().trim_end_matches('/').strip_prefix("http://") else {
         return false;
     };
@@ -845,36 +867,39 @@ fn is_zlauder_base_url(url: &str) -> bool {
     if (host != "127.0.0.1" && host != "localhost") || port.contains('/') {
         return false;
     }
-    matches!(port.parse::<u16>(), Ok(p)
-        if (zlauder_state::PORT_BASE..zlauder_state::PORT_BASE + zlauder_state::PORT_SPAN).contains(&p))
+    let Ok(p) = port.parse::<u16>() else {
+        return false;
+    };
+    // Ours iff the loopback port matches the co-baked ZLAUDER_PORT. A bare loopback URL that
+    // doesn't match is a user's own (a corporate gateway, a different local proxy) and is
+    // left untouched.
+    co_key == Some(p)
 }
 
 #[cfg(test)]
 mod base_url_ownership_tests {
     use super::is_zlauder_base_url;
-    use zlauder_state::{PORT_BASE, PORT_SPAN};
 
     #[test]
-    fn ours_is_loopback_in_derived_range() {
-        let p = PORT_BASE + 123;
-        assert!(is_zlauder_base_url(&format!("http://127.0.0.1:{p}")));
-        assert!(is_zlauder_base_url(&format!("http://localhost:{p}/")));
+    fn ours_is_ephemeral_loopback_matching_co_key() {
+        // An OS-assigned ephemeral port is ours ONLY when it matches the co-baked ZLAUDER_PORT.
+        assert!(is_zlauder_base_url("http://127.0.0.1:41234", Some(41234)));
+        assert!(is_zlauder_base_url("http://localhost:53999/", Some(53999)));
+        // Same ephemeral URL but a MISMATCHED / absent co-key is NOT claimed as ours.
+        assert!(!is_zlauder_base_url("http://127.0.0.1:41234", Some(40000)));
+        assert!(!is_zlauder_base_url("http://127.0.0.1:41234", None));
     }
 
     #[test]
-    fn not_ours_user_gateway_or_out_of_range() {
+    fn not_ours_user_gateway_or_mismatched_port() {
         // A user's own base URL must NOT be claimed as ours (else disable/migration would
-        // delete their committed env var).
-        assert!(!is_zlauder_base_url("https://gateway.corp.example.com"));
-        assert!(!is_zlauder_base_url("http://127.0.0.1:4000")); // a user's local proxy, out of range
-        assert!(!is_zlauder_base_url("http://127.0.0.1:18123/v1")); // has a path -> theirs
-        assert!(!is_zlauder_base_url("http://10.0.0.5:18123")); // non-loopback host
-        assert!(!is_zlauder_base_url("http://127.0.0.1")); // no port
-        // Exactly one past the top of the range is out.
-        assert!(!is_zlauder_base_url(&format!(
-            "http://127.0.0.1:{}",
-            PORT_BASE + PORT_SPAN
-        )));
+        // delete their committed env var) -- even with a stale co-key present.
+        assert!(!is_zlauder_base_url("http://nothost:5000", Some(41234))); // non-loopback host
+        assert!(!is_zlauder_base_url("http://127.0.0.1:4000", None)); // user's local proxy, no co-key
+        assert!(!is_zlauder_base_url("http://127.0.0.1:18123/v1", Some(18123))); // has a path -> theirs
+        assert!(!is_zlauder_base_url("http://127.0.0.1", None)); // no port
+        // A loopback port that doesn't match the co-key is not ours.
+        assert!(!is_zlauder_base_url("http://127.0.0.1:18123", Some(41234)));
     }
 }
 
@@ -896,6 +921,306 @@ fn print_route_url() {
         }
     }
     println!("(unset)");
+}
+
+// ---------------------------------------------------------------------------
+// doctor — preflight self-check (/zlauder:doctor)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbeStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skip,
+    Info,
+}
+
+impl ProbeStatus {
+    fn label(self) -> &'static str {
+        match self {
+            ProbeStatus::Pass => "PASS",
+            ProbeStatus::Warn => "WARN",
+            ProbeStatus::Fail => "FAIL",
+            ProbeStatus::Skip => "SKIP",
+            ProbeStatus::Info => "INFO",
+        }
+    }
+}
+
+struct Probe {
+    name: &'static str,
+    status: ProbeStatus,
+    detail: String,
+    remediation: Option<String>,
+}
+
+fn probe(name: &'static str, status: ProbeStatus, detail: String, remediation: Option<&str>) -> Probe {
+    Probe {
+        name,
+        status,
+        detail,
+        remediation: remediation.map(str::to_string),
+    }
+}
+
+/// `/zlauder:doctor`: run the preflight probes, print a table (or `--json`), exit non-zero on
+/// any FAIL. Catches the firewall/loopback/port footguns the masking flow depends on.
+fn doctor(json: bool) -> Result<()> {
+    let root = canonical(&project_root());
+    let probes = vec![
+        probe_loopback_self_connect(),
+        probe_localhost_resolution(),
+        probe_ephemeral_bind(),
+        probe_state_dir(),
+        probe_project_proxy(&root),
+        probe_windows_excluded_range(),
+    ];
+    let any_fail = probes.iter().any(|p| p.status == ProbeStatus::Fail);
+
+    if json {
+        let arr: Vec<Value> = probes
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p.name,
+                    "status": p.status.label(),
+                    "detail": p.detail,
+                    "remediation": p.remediation,
+                })
+            })
+            .collect();
+        println!("{}", json!({ "ok": !any_fail, "probes": arr }));
+    } else {
+        println!(
+            "ZlauDeR doctor — {}",
+            if any_fail {
+                "PROBLEMS FOUND"
+            } else {
+                "all checks passed"
+            }
+        );
+        for p in &probes {
+            println!("  [{}] {} — {}", p.status.label(), p.name, p.detail);
+        }
+        for p in probes
+            .iter()
+            .filter(|p| matches!(p.status, ProbeStatus::Fail | ProbeStatus::Warn))
+        {
+            if let Some(r) = &p.remediation {
+                println!("        → {r}");
+            }
+        }
+    }
+    if any_fail {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The foundation: can we connect to 127.0.0.1 over a fresh loopback socket at all?
+fn probe_loopback_self_connect() -> Probe {
+    let name = "loopback 127.0.0.1 reachable";
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => {
+            return probe(
+                name,
+                ProbeStatus::Fail,
+                format!("could not bind 127.0.0.1:0 ({e})"),
+                Some("the loopback interface may be down or firewalled"),
+            );
+        }
+    };
+    let addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            return probe(
+                name,
+                ProbeStatus::Fail,
+                format!("bound listener has no local address ({e})"),
+                Some("the loopback interface may be misconfigured"),
+            );
+        }
+    };
+    // The kernel completes the TCP handshake into the listener's backlog WITHOUT an accept(),
+    // so a successful connect proves loopback works — and there is no accept thread that could
+    // hang if the connect is firewalled (the exact case this probe must survive).
+    let ok = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
+    if ok {
+        probe(
+            name,
+            ProbeStatus::Pass,
+            "self-connect over 127.0.0.1 succeeded".into(),
+            None,
+        )
+    } else {
+        probe(
+            name,
+            ProbeStatus::Fail,
+            "could not connect to 127.0.0.1 on this machine".into(),
+            Some(
+                "a local firewall/AV is blocking loopback. Linux: ensure `INPUT -i lo -j ACCEPT`; \
+                 macOS: check custom pf rules on lo0; Windows: a security product may intercept \
+                 127.0.0.1.",
+            ),
+        )
+    }
+}
+/// Does the NAME "localhost" resolve to IPv4 first? ZlauDeR always uses the literal 127.0.0.1
+/// on the wire, so a "localhost"→`::1` host is only a WARN, not a failure.
+fn probe_localhost_resolution() -> Probe {
+    use std::net::ToSocketAddrs;
+    let name = "localhost resolves to IPv4";
+    match ("localhost", 0u16)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    {
+        Some(a) if a.ip().is_ipv4() => probe(
+            name,
+            ProbeStatus::Pass,
+            format!("localhost → {} (IPv4)", a.ip()),
+            None,
+        ),
+        Some(a) => probe(
+            name,
+            ProbeStatus::Warn,
+            format!("localhost → {} (IPv6) first", a.ip()),
+            Some(
+                "harmless — ZlauDeR uses the literal 127.0.0.1, not the name. Do NOT set \
+                 ANTHROPIC_BASE_URL to use \"localhost\".",
+            ),
+        ),
+        None => probe(
+            name,
+            ProbeStatus::Warn,
+            "could not resolve localhost".into(),
+            Some("non-fatal — ZlauDeR uses 127.0.0.1 directly"),
+        ),
+    }
+}
+
+/// Does an OS-assigned ephemeral bind yield a concrete port? (The default port mode.)
+fn probe_ephemeral_bind() -> Probe {
+    let name = "ephemeral bind (127.0.0.1:0)";
+    match std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()) {
+        Ok(a) if a.port() != 0 => probe(
+            name,
+            ProbeStatus::Pass,
+            format!("OS assigned port {}", a.port()),
+            None,
+        ),
+        Ok(_) => probe(
+            name,
+            ProbeStatus::Fail,
+            "bind :0 returned port 0".into(),
+            Some("pin a static `[proxy] port` in zlauder.toml"),
+        ),
+        Err(e) => probe(
+            name,
+            ProbeStatus::Fail,
+            format!("could not bind :0 ({e})"),
+            Some("pin a static `[proxy] port` in zlauder.toml"),
+        ),
+    }
+}
+
+/// Is the state dir creatable + writable (and 0600-capable on Unix)?
+fn probe_state_dir() -> Probe {
+    let name = "state dir writable";
+    let dir = match zlauder_state::state_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            return probe(
+                name,
+                ProbeStatus::Fail,
+                format!("cannot create the state dir ({e})"),
+                Some("set $ZLAUDER_STATE_DIR to a writable directory"),
+            );
+        }
+    };
+    let test = dir.join(format!(".doctor-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&test, b"x") {
+        return probe(
+            name,
+            ProbeStatus::Fail,
+            format!("cannot write under {} ({e})", dir.display()),
+            Some("set $ZLAUDER_STATE_DIR to a writable directory"),
+        );
+    }
+    let _ = std::fs::remove_file(&test);
+    #[cfg(unix)]
+    let detail = format!("{} (0600 enforced)", dir.display());
+    #[cfg(not(unix))]
+    let detail = format!(
+        "{} (per-user; 0600 not enforced on Windows — expected)",
+        dir.display()
+    );
+    probe(name, ProbeStatus::Pass, detail, None)
+}
+
+/// This project's proxy: healthy (nonce matches), unreachable-though-recorded (firewall/AV),
+/// foreign-on-our-port, or not running.
+fn probe_project_proxy(root: &str) -> Probe {
+    let name = "this project's proxy";
+    match zlauder_state::live_port(root) {
+        Some((port, rec)) => match proxy_identity(port) {
+            Some((build, nonce)) if !rec.nonce.is_empty() && nonce == rec.nonce => probe(
+                name,
+                ProbeStatus::Pass,
+                format!("healthy on :{port} (build {build})"),
+                None,
+            ),
+            Some((build, _)) => probe(
+                name,
+                ProbeStatus::Warn,
+                format!("a proxy answers on :{port} (build {build}) but its nonce ≠ our record"),
+                Some("a stale/foreign server may hold the port; start a fresh `claude` session"),
+            ),
+            None => probe(
+                name,
+                ProbeStatus::Fail,
+                format!(
+                    "our proxy (pid {}) is recorded on :{port} but /healthz is unreachable",
+                    rec.pid
+                ),
+                Some(
+                    "a local security/AV product or a hardened loopback firewall may be \
+                     intercepting 127.0.0.1",
+                ),
+            ),
+        },
+        None => probe(
+            name,
+            ProbeStatus::Info,
+            "no proxy running for this project".into(),
+            Some("start a `claude` session here, or run /zlauder:enable"),
+        ),
+    }
+}
+
+/// Windows + static port only: reserved/excluded ranges. The ephemeral default avoids them by
+/// construction, so this is advisory.
+fn probe_windows_excluded_range() -> Probe {
+    let name = "windows excluded port range";
+    #[cfg(not(windows))]
+    {
+        probe(name, ProbeStatus::Skip, "not Windows".into(), None)
+    }
+    #[cfg(windows)]
+    {
+        probe(
+            name,
+            ProbeStatus::Skip,
+            "ephemeral default avoids reserved ranges; applies only to a static `[proxy] port`"
+                .into(),
+            Some(
+                "if a static port fails, run `netsh interface ipv4 show excludedportrange \
+                 protocol=tcp` and pick a port outside the listed blocks",
+            ),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -960,67 +1285,55 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
     let conversation = conversation_id_from_hook_payload(&stdin);
 
     let root = canonical(&project_root());
-    // Resolve the port READ-ONLY for the route-gate checks below. With an explicit
-    // --port/$ZLAUDER_PORT (the normal case once routing is baked) we honor it verbatim.
-    // Otherwise `pick_port` resolves the project's derived port WITHOUT writing anything, so
-    // an opted-out / silent / nudge-only session — which does no routing work — leaves no
-    // spurious runtime reservation. We only `reserve_port` (the atomic O_EXCL claim that
-    // stops a colliding project baking the same port, review F1/HIGH) when we are actually
-    // about to BAKE the port into settings, in the auto-plumb branch below.
-    let port = match port_arg {
-        Some(p) => p,
-        None => pick_port(&root),
-    };
-    let base_url = format!("http://127.0.0.1:{port}");
+    // Is THIS session routed through OUR proxy? The SessionStart hook fires in every project
+    // (the plugin is installed globally), but we only act where Claude Code has applied our
+    // route to the live session — at which point this hook subprocess inherits it. The route
+    // is `ANTHROPIC_BASE_URL` + the co-baked `ZLAUDER_PORT` (= the baked port); when they
+    // agree on a loopback proxy, `port_arg` (=$ZLAUDER_PORT) is that port and we're routed to
+    // it. The proxy is the sole authority on its (ephemeral) port, so there is no derived port
+    // to guess — an unrouted session simply has no matching ZLAUDER_PORT in its env.
+    // Announcing "masking active" when this session is NOT pointed at us would be a lie (the
+    // misleading-status bug), so gate every side effect on this real, env-derived route.
+    let routed_port =
+        port_arg.filter(|p| session_routed_through(&format!("http://127.0.0.1:{p}")));
 
-    // Route gate (the load-bearing accuracy check). The SessionStart hook fires in
-    // EVERY project, because the plugin is installed globally — but the proxy is only
-    // relevant where `ANTHROPIC_BASE_URL` was written into the project's
-    // settings.local.json (by auto-plumb or `/zlauder:enable`) and Claude Code has since
-    // applied it to the live session — at which point this hook subprocess inherits it.
-    // Announcing "masking active" or launching a proxy when this session is NOT actually
-    // pointed at us would be a lie (the exact misleading-status bug). So gate every side
-    // effect on the session's real base URL.
-    if !session_routed_through(&base_url) {
-        let configured = project_configures(&root, &base_url);
+    if routed_port.is_none() {
+        // Port-agnostic "is this project plumbed through us": an ephemeral baked port can't be
+        // re-derived, so read it back from settings.local.json (a loopback ANTHROPIC_BASE_URL
+        // whose port matches the co-baked ZLAUDER_PORT). Ignores a user's own unrelated base URL.
+        let configured = project_baked_route(&root).is_some();
         let opted_out =
             zlauder_state::registry_get(&root) == Some(zlauder_state::PlumbState::Optout);
         // Global escape hatch: ZLAUDER_NO_AUTO_ENABLE disables auto-plumb everywhere.
         let auto_enable = std::env::var_os("ZLAUDER_NO_AUTO_ENABLE").is_none();
 
         if !configured && !opted_out && auto_enable {
-            // AUTO-PLUMB: first time zlauder has seen this project. Atomically CLAIM the port
-            // (reserve_port — so a different project hashing to the same derived port can't
-            // bake it too, review F1/HIGH), then write routing into settings.local.json
-            // (gitignored) and record it Plumbed. We deliberately do NOT launch the proxy
-            // here: this session cannot be routed anyway (Claude Code snapshots settings at
-            // startup, and a file that didn't exist then is not applied to the live session),
-            // so the proxy launches on the NEXT session — the one that actually routes.
-            // We do NOT clean this reservation up if the enable below fails: it is THIS
-            // project's OWN derived port, so keeping it claimed is correct (a colliding
-            // project just probes past it — exactly the reservation's job), and a blind
-            // delete here could strand a concurrent same-project sibling that was handed
-            // back this same (pid==0) reservation and DID bake it (review: sibling-
-            // reservation race). A persistently-failing auto-plumb re-probes its own
-            // reservation next session (reserve_port is idempotent for a port we already
-            // own); the live proxy overwrites it on bind; and the worst residual — a stale
-            // pid==0 reservation — lives in the volatile state dir and clears on reboot.
-            let bake_port = match port_arg {
-                Some(p) => p,
-                None => match reserve_port(&root) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Mirror the settings_enable failure arm below: make NO masking claim,
-                        // keep stdout a single valid (empty) JSON object, reason on stderr —
-                        // don't exit non-zero with empty stdout on an unwritable state dir.
-                        eprintln!(
-                            "ZlauDeR: could not reserve a port to auto-enable masking for this \
-                             project: {e}. Run /zlauder:enable to retry."
-                        );
-                        println!("{}", json!({}));
-                        return Ok(());
-                    }
-                },
+            // AUTO-PLUMB (first sight of this project): launch the proxy NOW to learn its
+            // OS-assigned ephemeral port, then bake THAT route into settings.local.json
+            // (gitignored) and record it Plumbed. We launch EAGERLY — so a one-time restart
+            // activates masking instantly with no first-message ConnectionRefused hang — but
+            // make NO claim of masking THIS session: Claude Code applies a route written during
+            // SessionStart only unreliably (~1/5), so the SURE activation is a restart, which
+            // the statusline surfaces as "⟳ ZlauDeR: restart to mask".
+            let bake_port = match ensure_up(&root, config.clone(), &proxy_bin) {
+                Ok(EnsureOutcome::Ours { port }) => port,
+                Ok(EnsureOutcome::Failed { diag }) => {
+                    // Proxy didn't come up — make NO masking claim; reason on stderr, stdout a
+                    // silent valid no-op (don't exit non-zero with empty stdout).
+                    eprintln!(
+                        "ZlauDeR: could not auto-enable masking — {diag} Run /zlauder:enable to retry."
+                    );
+                    println!("{}", json!({}));
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "ZlauDeR: could not auto-enable masking for this project: {e}. \
+                         Run /zlauder:enable to retry."
+                    );
+                    println!("{}", json!({}));
+                    return Ok(());
+                }
             };
             let bake_url = format!("http://127.0.0.1:{bake_port}");
             match settings_enable(&bake_url, &bake_port.to_string(), &statusline_command()) {
@@ -1063,11 +1376,10 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                 }
                 Err(e) => {
                     // Could not write settings — make NO masking claim. stdout stays a silent,
-                    // valid no-op; the reason goes to stderr. We deliberately leave the port
-                    // reservation in place (see the acquisition note above): it is this
-                    // project's own derived port, and deleting it could strand a concurrent
-                    // same-project sibling relying on the same reservation. The project is left
-                    // un-plumbed and retried next session.
+                    // valid no-op; the reason goes to stderr. We deliberately leave the running
+                    // proxy and its rendezvous record in place: it is this project's own proxy,
+                    // and tearing it down could strand a concurrent same-project sibling already
+                    // using it. The project is left un-plumbed and retried next session.
                     eprintln!(
                         "ZlauDeR: could not auto-enable masking for this project: {e}. \
                          Run /zlauder:enable to retry."
@@ -1079,11 +1391,11 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
         }
 
         if configured {
-            // Plumbed earlier but this live session isn't routed yet (typically the very first
-            // message after enable/auto-plumb). Masking activates on the NEXT message as Claude
-            // Code re-reads the route from settings.local.json — no full restart needed in the
-            // common case. Stay a route-less no-op for now; the proxy launches on the session
-            // that actually routes.
+            // Plumbed earlier but this live session isn't routed yet (typically the first session
+            // after enable/auto-plumb, which snapshotted env before the route was written). A
+            // one-time restart reliably activates masking; every session after reads the route at
+            // startup. Stay a route-less no-op for now; the proxy launches on the session that
+            // actually routes.
             eprintln!(
                 "ZlauDeR: this project is configured but THIS session isn't masked yet. Restart \
                  Claude Code to activate it (the statusline shows '⟳ ZlauDeR: restart to mask' until \
@@ -1113,32 +1425,69 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
         return Ok(());
     }
 
-    // Bring this project's proxy up (or recycle a stale build) before announcing. If our
-    // derived port turns out to be held by a DIFFERENT project's proxy (a collision), do NOT
-    // announce masking — this session's traffic would flow through that project's proxy (its
-    // salt and its masking on/off, possibly OFF), so claiming "masking active" here would be
-    // false. Emit a not-active nudge and bail instead of the masking announcement.
-    if let ProxyStatus::ForeignOwned { other } = ensure_up(port, &root, config, &proxy_bin)? {
+    // Routed through us: bring this project's proxy up and learn the port it actually bound.
+    let routed_port = routed_port.expect("routed_port is Some on this branch");
+    let port = match ensure_up(&root, config, &proxy_bin)? {
+        EnsureOutcome::Ours { port } => port,
+        EnsureOutcome::Failed { diag } => {
+            // The route is baked + applied, but no proxy of ours is reachable — requests this
+            // session fail/hang (fail-CLOSED, never unmasked). Make NO masking claim and point
+            // at the diagnosis.
+            eprintln!("ZlauDeR: {diag}");
+            println!(
+                "{}",
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext":
+                            "ZlauDeR is configured for this project but its local proxy is NOT \
+                             currently reachable, so masking is NOT active for THIS session and \
+                             requests may fail or hang. This is only about what the provider sees; \
+                             the user always sees their own plaintext. Never tell the user their \
+                             data is hidden in this session. Run /zlauder:doctor to diagnose."
+                    }
+                })
+            );
+            return Ok(());
+        }
+    };
+
+    if port != routed_port {
+        // THE STALE-PORT WINDOW (e2e-surfaced, documented limitation). This session was ROUTED
+        // at Claude Code STARTUP to `routed_port`, but our live proxy is now on a DIFFERENT
+        // port `port` — the project's sticky port was taken by another process while our proxy
+        // was down (proxy death + an exact ephemeral-port steal — narrow, not hit in normal
+        // relaunch which reuses the sticky port). Claude Code cannot re-route a live session,
+        // so THIS session's API traffic is going to `routed_port`, which is NOT our proxy: it
+        // will HANG if that port is an unresponsive black hole, or reach a FOREIGN local
+        // process UNMASKED if it accepts. We cannot stop this session's in-flight call, so we
+        // (a) reconcile the baked route so the NEXT session is correct, and (b) probe the stale
+        // port and warn as LOUDLY and specifically as possible — telling the user to abort +
+        // restart NOW. Fail-CLOSED: we never strip the route (that would egress to the user's
+        // real upstream unmasked). A full fix needs Claude Code mid-session re-routing.
+        let reconciled = settings_enable(
+            &format!("http://127.0.0.1:{port}"),
+            &port.to_string(),
+            &statusline_command(),
+        )
+        .is_ok();
+        let (human, model) =
+            stale_route_messages(routed_port, port, classify_stale_route(routed_port), reconciled);
+        eprintln!("ZlauDeR: {human}");
         println!(
             "{}",
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": format!(
-                        "ZlauDeR is configured for this project, but its proxy port is currently \
-                         serving a DIFFERENT project ({other}), so masking is NOT active for THIS \
-                         session — outbound text reaches the API provider UNMASKED (real PII, not \
-                         tokens). This is only about what the provider sees; the user always sees \
-                         their own plaintext. Never tell the user their data is hidden in this \
-                         session. To get a fresh, isolated port, run /zlauder:disable then \
-                         /zlauder:enable in this project."
-                    )
+                    "additionalContext": model
                 }
             })
         );
         return Ok(());
     }
 
+    // port == routed_port: this session's traffic flows through our live proxy. Announce.
+    let base_url = format!("http://127.0.0.1:{port}");
     // SessionStart hook output. The static `env` written into settings.local.json (by
     // auto-plumb or `/zlauder:enable`) is the load-bearing path for ANTHROPIC_BASE_URL;
     // the `env` key here is a best-effort override for harness versions that honor it.
@@ -1171,166 +1520,326 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
     Ok(())
 }
 
-/// Whether the proxy this session is routed to is actually OURS — the signal the
-/// SessionStart hook gates its "masking active" announcement on. A healthy proxy owned by a
-/// DIFFERENT project on our port (a derived-port collision) is `ForeignOwned`: we never claim
-/// masking for a session whose traffic would flow through another project's proxy — under
-/// that project's salt AND its masking on/off — which would be a false "active" status and a
-/// cross-project isolation breach (review: foreign-proxy false-active / false-shield).
-enum ProxyStatus {
-    /// The proxy serving our port is ours (freshly launched, recycled, or already ours).
-    Ours,
-    /// A different project's proxy holds our port; we left it untouched. NOT masked through us.
-    ForeignOwned { other: String },
+/// Outcome of bringing this project's proxy up. The proxy is project-keyed (a record
+/// keyed by `blake3(root)`), so a foreign project can no longer be mistaken for ours —
+/// the only failure mode left is "we could not bring a proxy of OURS up" (spawn/bind
+/// failure, a static-port conflict that exits without publishing, or a launch that never
+/// went healthy). The hook surfaces `diag` and makes NO masking claim in that case.
+enum EnsureOutcome {
+    /// A healthy proxy of our build is serving on `port` for THIS project.
+    Ours { port: u16 },
+    /// No proxy of ours came up; `diag` is a human, actionable reason.
+    Failed { diag: String },
 }
 
-/// Ensure this project's proxy is running and is OUR current build, launching or
-/// recycling it as needed. Shared by the SessionStart hook and the `ensure-up`
-/// subcommand. A healthy proxy of our build is reused as-is; a stale build (e.g. after a
-/// plugin update) is stopped and relaunched; nothing healthy means a fresh launch. The
-/// token salt is preserved across a recycle so tokens stay prompt-cache stable. `config`
-/// defaults to the project's `zlauder.toml` when present. Returns [`ProxyStatus`] so the
-/// caller can refuse to announce masking when our port is held by another project.
-fn ensure_up(port: u16, root: &str, config: Option<PathBuf>, proxy_bin: &str) -> Result<ProxyStatus> {
+/// Ensure this project's proxy is running and is OUR current build, then return the port
+/// it bound. The proxy is the sole authority on its port (an OS-assigned ephemeral port by
+/// default, or a static `[proxy] port`); we LEARN the bound port from the project-keyed
+/// rendezvous after launch. A healthy proxy of our build is adopted as-is; a stale build
+/// (e.g. after a plugin update) is recycled; nothing live means a fresh launch under the
+/// per-project launch lock. `config` defaults to the project's `zlauder.toml` when present.
+fn ensure_up(root: &str, config: Option<PathBuf>, proxy_bin: &str) -> Result<EnsureOutcome> {
     let config = config.or_else(|| {
         let p = Path::new(root).join("zlauder.toml");
         p.exists().then_some(p)
     });
 
-    // A healthy proxy already on our port is normally reused as-is. But the proxy is
-    // long-lived (one per project, kept alive across sessions), so a plugin/proxy
-    // update does NOT take effect until the old process is recycled. Decide whether
-    // to (re)launch: nothing healthy here, or a healthy-but-STALE build of ours.
-    let mut needs_launch = !proxy_healthy(port);
-    if !needs_launch {
-        match read_state(port).ok() {
-            // Another project's proxy holds our port — never touch it; warn AND report it
-            // ForeignOwned so the caller does NOT announce masking for this session (the
-            // traffic would be masked under the other project, or not masked at all if that
-            // proxy has masking off — a false "active" status + cross-project isolation breach).
-            Some(st) if !st.project_root.is_empty() && st.project_root != root => {
-                eprintln!(
-                    "ZlauDeR: WARNING — port {port} is serving a different project ({}). \
-                     Your traffic would be masked under that project. Run `/zlauder:disable` \
-                     then `/zlauder:enable` in this project to get a fresh, isolated port.",
-                    st.project_root
-                );
-                return Ok(ProxyStatus::ForeignOwned {
-                    other: st.project_root,
-                });
+    // Adopt an already-running proxy for this project ONLY if a live `/healthz` echoes the
+    // nonce recorded in OUR rendezvous — proof it is the exact proxy instance that published
+    // the record, not a foreign 200-server that grabbed the port after a PID-reuse + port-
+    // steal. Without the nonce check, such a server would be adopted and this project's
+    // traffic would route UNMASKED through a non-zlauder process — the worst "looks fine but
+    // isn't" failure. `live_port` is project-keyed + pid-prefiltered; the nonce match is the
+    // authoritative identity. A stale BUILD (our instance, older code) is recycled so a
+    // plugin update takes effect. A hook-launched proxy always carries a nonce, so an empty
+    // `rec.nonce` (a manual/legacy proxy) is deliberately NOT adopted — we relaunch ours.
+    if let Some((port, rec)) = zlauder_state::live_port(root)
+        && !rec.nonce.is_empty()
+        && let Some((build, live_nonce)) = proxy_identity(port)
+        && live_nonce == rec.nonce
+    {
+        let ours = zlauder_state::BUILD_ID;
+        let stale = ours != "unknown" && build != "unknown" && build != ours;
+        if !stale {
+            return Ok(EnsureOutcome::Ours { port });
+        }
+        eprintln!(
+            "ZlauDeR: proxy on :{port} is an older build — restarting to apply the update."
+        );
+        stop_proxy(port, rec.pid);
+        // fall through to a fresh launch
+    }
+
+    launch_proxy(root, config.as_deref(), proxy_bin)
+}
+
+/// Spawn the proxy as the single launcher for this project (the rendezvous launch lock),
+/// then wait for it to publish a healthy, nonce-matching record. A loser of the launch
+/// race does not spawn — it waits for the winner's proxy to come live. The lock is held
+/// until the proxy has published (or we give up), so a sibling can never double-launch.
+fn launch_proxy(root: &str, config: Option<&Path>, proxy_bin: &str) -> Result<EnsureOutcome> {
+    let nonce = rand_hex16();
+    // Salt reuse: keep this project's salt across a relaunch (tokens + prompt-cache prefix
+    // stable) ONLY from a VALIDATED (owner-only, our-root) rendezvous record. Never inherit
+    // another project's salt; the proxy mints a fresh encryption key regardless.
+    let salt_hex = match zlauder_state::read_rendezvous(root) {
+        Some(rec) if rec.salt.len() == 32 => rec.salt,
+        _ => rand_hex16(),
+    };
+
+    let _lock = match zlauder_state::try_launch_lock(root, std::process::id(), &nonce)? {
+        Some(g) => g,
+        // Another launcher holds the lock — it's bringing the proxy up. Wait for ANY live,
+        // healthy proxy for this project (we don't know the winner's nonce, but the
+        // project-keyed lookup + health is enough to adopt the one it publishes).
+        None => return Ok(wait_for_live(root, None)),
+    };
+
+    let dir = zlauder_state::state_dir()?;
+    // Per-project log (keyed by project hash — we no longer know the port up front).
+    let log_path = dir.join(format!("proxy-{}.log", zlauder_state::project_key(root)));
+    let log = std::fs::File::create(&log_path).context("creating proxy log")?;
+    let log_err = log.try_clone()?;
+
+    let mut cmd = std::process::Command::new(proxy_bin);
+    cmd.arg("--project-root")
+        .arg(root)
+        .env("ZLAUDER_SESSION_SALT", &salt_hex)
+        .env("ZLAUDER_LAUNCH_NONCE", &nonce)
+        .env("ZLAUDER_PROJECT_ROOT", root)
+        // CRITICAL: strip an inherited ZLAUDER_PORT. In a routed session our own env carries
+        // ZLAUDER_PORT (the baked port, an informational hint for the CLI/statusline), but the
+        // proxy reads `--port`/ZLAUDER_PORT as a STATIC PIN. Leaking it would hard-pin the
+        // baked port and defeat the ephemeral/sticky bind (and its :0 fallback). The proxy
+        // gets its port from `[proxy] port` (static) or its own rendezvous last_port (sticky)
+        // — never from the hook's ambient env.
+        .env_remove("ZLAUDER_PORT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    // Detach the long-lived proxy from THIS process so nothing we own keeps it tethered: it
+    // must outlive the session (sibling windows / later sessions reuse the one per-project
+    // proxy) and must not hold the SessionStart stdout pipe open (else the launching `claude`
+    // stalls waiting for EOF). stdio is already redirected to the log; these flags drop the
+    // remaining console/session tether per platform.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    if let Err(e) = cmd.spawn() {
+        // Spawn failed (missing binary, or a transient EAGAIN/ENOMEM under fork pressure).
+        // Release the lock and report — nothing was published, so no record to clean up.
+        return Ok(EnsureOutcome::Failed {
+            diag: format!("could not spawn the proxy binary '{proxy_bin}': {e}"),
+        });
+    }
+
+    // Hold the lock across the wait: only release once the proxy has published a healthy
+    // record carrying OUR nonce (so we adopt the exact instance we spawned, never a stale /
+    // static-conflict / foreign record), or once we give up.
+    Ok(wait_for_live(root, Some(&nonce)))
+}
+
+/// Poll this project's rendezvous until a healthy proxy is live, up to ~5s (generous for a
+/// cold/loaded first launch — the proxy publishes its record BEFORE serving, so `/healthz`
+/// answers as soon as it serves). The live `/healthz` must echo the nonce in the PUBLISHED
+/// record — proof the serving process is the one that published it, not a foreign server on
+/// the same port. When `expect_nonce` is set (we spawned it), the record must additionally
+/// carry OUR nonce, so a concurrent unrelated publish can't be mistaken for our spawn.
+fn wait_for_live(root: &str, expect_nonce: Option<&str>) -> EnsureOutcome {
+    for _ in 0..100 {
+        if let Some((port, rec)) = zlauder_state::live_port(root)
+            && !rec.nonce.is_empty()
+            && let Some((_build, live_nonce)) = proxy_identity(port)
+            && live_nonce == rec.nonce
+        {
+            let ours = match expect_nonce {
+                Some(n) => rec.nonce == n,
+                None => true,
+            };
+            if ours {
+                return EnsureOutcome::Ours { port };
             }
-            // Ours (or unowned): recycle it if its reported build differs from ours.
-            // Guard on known ids so we never churn when either side can't report one
-            // (an "unknown" build, or a pre-build-id proxy whose /healthz says "ok"
-            // — that "ok" != our SHA, so an older proxy is correctly recycled too).
-            st => {
-                let ours = zlauder_state::BUILD_ID;
-                if ours != "unknown"
-                    && let Some(running) = proxy_build_id(port)
-                    && running != "unknown"
-                    && running != ours
-                {
-                    eprintln!(
-                        "ZlauDeR: proxy on :{port} is build '{running}', current is '{ours}' \
-                         — restarting to apply the update."
-                    );
-                    stop_proxy(port, st.as_ref().map(|s| s.pid).unwrap_or(0));
-                    needs_launch = true;
-                }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    EnsureOutcome::Failed {
+        diag: launch_failure_diag(root),
+    }
+}
+
+/// 16 random bytes, hex-encoded (a salt or a launch nonce).
+fn rand_hex16() -> String {
+    let mut b = [0u8; 16];
+    OsRng.fill_bytes(&mut b);
+    hex(&b)
+}
+
+/// One `/healthz` round-trip: `(build_id_body, nonce_header)` if the proxy answers 2xx.
+/// The body is the proxy's build id (for stale-build recycling); the `x-zlauder-nonce`
+/// header is this launch's nonce (empty if absent). `None` if unreachable / non-2xx.
+fn proxy_identity(port: u16) -> Option<(String, String)> {
+    let resp = blocking_client()
+        .get(format!("http://127.0.0.1:{port}/healthz"))
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let nonce = resp
+        .headers()
+        .get("x-zlauder-nonce")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let build = resp.text().ok()?.trim().to_string();
+    Some((build, nonce))
+}
+
+/// A human, actionable reason a launch never went healthy — the auto-diagnosis the hook
+/// surfaces (and `/zlauder:doctor` expands). Distinguishes "running but unreachable over
+/// loopback" (a local firewall/AV intercepting 127.0.0.1) from "never bound / crashed"
+/// (read the proxy log tail for the classified bind error or panic).
+fn launch_failure_diag(root: &str) -> String {
+    if let Some((port, rec)) = zlauder_state::live_port(root) {
+        return format!(
+            "the proxy (pid {}) appears to be running but is unreachable over 127.0.0.1:{port} \
+             — a local security/AV product or a hardened loopback firewall may be intercepting \
+             127.0.0.1. Run /zlauder:doctor.",
+            rec.pid
+        );
+    }
+    match read_proxy_log_tail(root, 12) {
+        Some(tail) if !tail.trim().is_empty() => {
+            format!("the proxy did not start or exited. Last log lines:\n{tail}")
+        }
+        _ => format!(
+            "the proxy did not start (no log output). Check that the zlauder-proxy binary \
+             exists and is executable, then run /zlauder:doctor."
+        ),
+    }
+}
+
+/// The last `n` lines of this project's proxy log (`proxy-<project_key>.log`), if any.
+fn read_proxy_log_tail(root: &str, n: usize) -> Option<String> {
+    let path = zlauder_state::state_dir()
+        .ok()?
+        .join(format!("proxy-{}.log", zlauder_state::project_key(root)));
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    Some(lines[start..].join("\n"))
+}
+
+/// What is sitting on a stale routed port that is NOT our proxy — drives how loud/specific
+/// the stale-route warning is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleRoute {
+    /// Nothing is listening — the session's requests fail fast (no hang, no leak).
+    Refused,
+    /// Something accepts the connection but never answers HTTP — the session HANGS.
+    Unresponsive,
+    /// A foreign HTTP server answers — the session's traffic reaches it UNMASKED.
+    ForeignResponder,
+}
+
+/// Probe a stale routed port (one this session is pointed at but that is NOT our live proxy)
+/// to classify the danger. A short connect + a short-timeout `/healthz` keeps the SessionStart
+/// delay bounded even against a black hole.
+fn classify_stale_route(port: u16) -> StaleRoute {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+        Err(_) => StaleRoute::Refused,
+        Ok(probe) => {
+            // Close the probe connection BEFORE the HTTP check — holding it open would tie up a
+            // single-threaded server and make a real responder look unresponsive.
+            drop(probe);
+            // Accepts connections. A real HTTP server answers quickly; an accept-but-silent
+            // black hole does not (the case that hangs the session).
+            let answered = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_millis(600))
+                .build()
+                .ok()
+                .and_then(|c| c.get(format!("http://127.0.0.1:{port}/healthz")).send().ok())
+                .is_some();
+            if answered {
+                StaleRoute::ForeignResponder
+            } else {
+                StaleRoute::Unresponsive
             }
         }
     }
+}
 
-    if needs_launch {
-        // Reuse this port's SALT (and only the salt) iff the existing record is
-        // OURS, so a crashed-and-relaunched proxy keeps minting the SAME tokens
-        // (prompt-cache prefix stable). We must NOT inherit another project's salt
-        // (that would correlate tokens across projects — review F6/C2), nor reuse
-        // any key: the proxy mints a fresh encryption key and writes its own state.
-        let salt_hex = match read_state(port) {
-            Ok(st) if st.project_root == root && st.salt.len() == 32 => st.salt,
-            _ => {
-                let mut salt = [0u8; 16];
-                OsRng.fill_bytes(&mut salt);
-                hex(&salt)
-            }
-        };
-
-        let dir = zlauder_state::state_dir()?;
-        let log = std::fs::File::create(dir.join(format!("proxy-{port}.log")))
-            .context("creating proxy log")?;
-        let log_err = log.try_clone()?;
-
-        let mut cmd = std::process::Command::new(proxy_bin);
-        cmd.arg("--port")
-            .arg(port.to_string())
-            .arg("--project-root")
-            .arg(root)
-            .env("ZLAUDER_SESSION_SALT", &salt_hex)
-            .env("ZLAUDER_PROJECT_ROOT", root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(log))
-            .stderr(std::process::Stdio::from(log_err));
-        if let Some(cfg) = &config {
-            cmd.arg("--config").arg(cfg);
-        }
-        // Detach the long-lived proxy from THIS process so nothing we own can keep it
-        // tethered: the proxy must outlive the session (sibling `claude` windows and
-        // later sessions reuse the one per-project proxy), and it must not hold the
-        // SessionStart hook's stdout pipe — the one Claude Code reads our hook JSON from —
-        // open, or the FIRST `claude` (the one that launches it) stalls waiting for EOF.
-        // The stdio handles are already redirected to log files; these flags drop the
-        // remaining console/session tether on each platform.
-        #[cfg(windows)]
-        {
-            // No inherited console (DETACHED_PROCESS) => no live handle back to us;
-            // CREATE_NEW_PROCESS_GROUP isolates the daemon from our Ctrl-C/console events.
-            use std::os::windows::process::CommandExt;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-        }
-        #[cfg(unix)]
-        {
-            // POSIX analogue: setsid() puts the proxy in its OWN session with no
-            // controlling terminal, so a terminal SIGHUP (or a process-group kill on
-            // session exit) can't reap a daemon meant to persist. pre_exec runs in the
-            // forked child before exec; setsid() is async-signal-safe and always succeeds
-            // there (the fresh child is never already a process-group leader).
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
-        }
-        if let Err(e) = cmd.spawn() {
-            // Do NOT drop the port reservation on a spawn failure. `cmd.spawn()` fails not
-            // only on a missing binary but also on TRANSIENT errors (EAGAIN/ENOMEM from a
-            // fork under resource pressure), and on the routed path the route is ALREADY
-            // baked into settings.local.json — so clearing the (pid==0) reservation would
-            // surrender this project's ownership of a port it still permanently points at.
-            // A colliding different project could then bake the same port and, once
-            // resources recover, bind a proxy on it, masking THIS project's traffic under
-            // the wrong project's salt/store (review: ensure_up sibling-reservation race).
-            // Keeping the reservation is correct — it is this project's own derived port; a
-            // colliding project just probes past it, the live proxy overwrites the record
-            // when a later launch succeeds, and the worst residual (a stale pid==0
-            // reservation) lives in the volatile state dir and clears on reboot.
-            return Err(e).with_context(|| format!("spawning proxy binary '{proxy_bin}'"));
-        }
-
-        // Wait for the listener so the first request doesn't race the bind.
-        for _ in 0..40 {
-            if proxy_healthy(port) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+/// The (human-on-stderr, model-in-additionalContext) warnings for a session stuck on a stale
+/// routed port. Both tell the user to abort + restart; the model copy forbids any masking
+/// claim. `new_port` is where our live proxy actually is now.
+fn stale_route_messages(
+    routed_port: u16,
+    new_port: u16,
+    danger: StaleRoute,
+    reconciled: bool,
+) -> (String, String) {
+    let tail = if reconciled {
+        format!("The route is repointed to the new proxy on :{new_port} for your NEXT session.")
+    } else {
+        "The route could NOT be updated — run /zlauder:enable.".to_string()
+    };
+    match danger {
+        StaleRoute::Unresponsive => (
+            format!(
+                "THIS session may HANG (or leak) — it is routed to :{routed_port}, now held by an \
+                 unresponsive or non-HTTP process (not the zlauder proxy). Press Ctrl-C and restart \
+                 Claude Code now. {tail}"
+            ),
+            format!(
+                "ZlauDeR: THIS session is routed to a non-zlauder local port (:{routed_port}) that \
+                 does not answer as our proxy — its API requests will HANG, or reach a foreign \
+                 process UNMASKED. Either way it is NOT masked. Tell the user to press Ctrl-C and \
+                 restart Claude Code now. Never claim masking is active. {tail}"
+            ),
+        ),
+        StaleRoute::ForeignResponder => (
+            format!(
+                "DANGER: THIS session's traffic is going UNMASKED to a DIFFERENT local process on \
+                 :{routed_port} (not the zlauder proxy). Press Ctrl-C and restart Claude Code NOW. \
+                 {tail}"
+            ),
+            format!(
+                "ZlauDeR: THIS session is NOT masked — its traffic is reaching a DIFFERENT local \
+                 process on :{routed_port}, UNMASKED (real PII, not tokens). Tell the user to press \
+                 Ctrl-C and restart Claude Code immediately. Never claim masking is active or that \
+                 the user's data is hidden in this session. {tail}"
+            ),
+        ),
+        StaleRoute::Refused => (
+            format!(
+                "THIS session isn't masked — its proxy port :{routed_port} is gone, so requests \
+                 fail. Restart Claude Code to use the new proxy. {tail}"
+            ),
+            format!(
+                "ZlauDeR: THIS session is NOT masked — its proxy port (:{routed_port}) is no longer \
+                 listening, so requests fail. Tell the user to restart Claude Code. Never claim \
+                 masking is active. {tail}"
+            ),
+        ),
     }
-
-    Ok(ProxyStatus::Ours)
 }
 
 /// `ensure-up` subcommand: ensure this project's proxy is running (the shared
@@ -1338,32 +1847,22 @@ fn ensure_up(port: u16, root: &str, config: Option<PathBuf>, proxy_bin: &str) ->
 /// `session-start`, it does NOT gate on the session already being routed — it brings the
 /// proxy up unconditionally, so it can warm the proxy ahead of time, or back a future
 /// zero-state launcher that exec's Claude Code with `--settings` injecting that URL.
-fn ensure_up_cmd(
-    port: Option<u16>,
-    config: Option<PathBuf>,
-    proxy_bin: String,
-    print_url: bool,
-) -> Result<()> {
+fn ensure_up_cmd(config: Option<PathBuf>, proxy_bin: String, print_url: bool) -> Result<()> {
     let root = canonical(&project_root());
-    let port = match port {
-        Some(p) => p,
-        None => reserve_port(&root)?,
-    };
-    if let ProxyStatus::ForeignOwned { other } = ensure_up(port, &root, config, &proxy_bin)? {
-        // Our derived port is held by another project's proxy — there is no proxy of OURS to
-        // route through. Do NOT print a URL: a launcher consuming `ensure-up --print-url` must
-        // fall through to an UNROUTED session rather than route this project through the foreign
-        // proxy (its salt/store, possibly masking-off). Fail loud (the warning already hit
-        // stderr in ensure_up) so the caller never treats a foreign port as ours.
-        bail!(
-            "port {port} is serving a different project ({other}); refusing to print a route URL. \
-             Run /zlauder:disable then /zlauder:enable in this project for a fresh, isolated port."
-        );
+    match ensure_up(&root, config, &proxy_bin)? {
+        EnsureOutcome::Ours { port } => {
+            if print_url {
+                println!("http://127.0.0.1:{port}");
+            }
+            Ok(())
+        }
+        // No proxy of ours came up. Do NOT print a URL — a launcher consuming
+        // `ensure-up --print-url` must fall through to an UNROUTED session rather than route
+        // through a phantom port. Fail loud with the diagnosis.
+        EnsureOutcome::Failed { diag } => {
+            bail!("could not bring this project's proxy up: {diag}")
+        }
     }
-    if print_url {
-        println!("http://127.0.0.1:{port}");
-    }
-    Ok(())
 }
 
 /// Derive the conversation id the monitor groups turns under (and that the proxy
@@ -1459,18 +1958,21 @@ fn safe_conversation_id(raw: &str) -> String {
 // reserve-port
 // ---------------------------------------------------------------------------
 
-/// Reserve this project's derived proxy port and print it (bare integer on stdout).
+/// Bring up this project's proxy (if needed) and print its bound port (bare integer on stdout).
 /// `/zlauder:enable` calls this to learn the port to write into settings.local.json. Unlike
 /// `session-start` it never launches the proxy or emits hook JSON — so it works during
 /// a first-time enable, where the session is not yet routed through the proxy.
-fn reserve_port_cmd(port: Option<u16>) -> Result<()> {
+fn reserve_port_cmd(config: Option<PathBuf>, proxy_bin: String) -> Result<()> {
     let root = canonical(&project_root());
-    let port = match port {
-        Some(p) => p,
-        None => reserve_port(&root)?,
-    };
-    println!("{port}");
-    Ok(())
+    match ensure_up(&root, config, &proxy_bin)? {
+        EnsureOutcome::Ours { port } => {
+            println!("{port}");
+            Ok(())
+        }
+        EnsureOutcome::Failed { diag } => {
+            bail!("could not bring this project's proxy up: {diag}")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,7 +2007,10 @@ fn sl_mode() -> SlMode {
 fn statusline(port: Option<u16>) -> Result<()> {
     let proj = project_root();
     let root = canonical(&proj);
-    let port = port.unwrap_or_else(|| pick_port(&root));
+    // The session's routed port (`$ZLAUDER_PORT`, set in-session) when present; else a
+    // best-effort fall back to OUR live proxy's port for a manual run. `None` ⇒ no proxy
+    // known ⇒ the segment renders the honest not-masking/restart state.
+    let port = port.or_else(|| resolve_live_port(&root).ok());
     let mode = sl_mode();
 
     // The zlauder segment (None only in `off` mode). Built first so a slow/absent
@@ -1549,15 +2054,17 @@ fn compose_line(segment: Option<String>, wrapped: Option<String>) -> String {
 /// we have CONFIRMED masking is on; any unconfirmed state (proxy down / key desync /
 /// 403 / stale state / unfamiliar shape) degrades to an explicit offline/off/unverified
 /// marker — never a false shield (review finding C5).
-fn render_segment(port: u16, root: &str, mode: SlMode) -> String {
+fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
     // Ground truth for THIS session: does its ANTHROPIC_BASE_URL (inherited from Claude
-    // Code) actually point at our proxy? That reflects the route ACTUALLY applied to this
-    // session, not merely what settings.local.json says — Claude Code applies a route
-    // written during SessionStart to the current session only unreliably. If we're not
-    // routed, traffic is NOT masked through us right now, so say so honestly rather than
-    // render a health-based shield that would lie during the silent first-run leak window.
-    let base_url = format!("http://127.0.0.1:{port}");
-    if !session_routed_through(&base_url) {
+    // Code) actually point at our proxy on `port`? That reflects the route ACTUALLY applied to
+    // this session, not merely what settings.local.json says — Claude Code applies a route
+    // written during SessionStart to the current session only unreliably. If we're not routed
+    // (no known port, or the env route doesn't point at `port`), traffic is NOT masked through
+    // us right now, so say so honestly rather than render a health-based shield that would lie.
+    let routed = port
+        .map(|p| session_routed_through(&format!("http://127.0.0.1:{p}")))
+        .unwrap_or(false);
+    if !routed {
         return match zlauder_state::registry_get(root) {
             // Plumbed, but the baked route hasn't been applied to THIS session yet — the
             // first-run live-reload window. A one-time restart applies it reliably (every
@@ -1573,7 +2080,8 @@ fn render_segment(port: u16, root: &str, mode: SlMode) -> String {
             },
         };
     }
-    // Routed: this session's traffic flows through our proxy. Reflect its health + masking.
+    let port = port.expect("routed implies a Some port");
+    // Routed: this session's traffic flows through `port`. Reflect its health + masking.
     if !proxy_healthy(port) {
         // The route is live but the proxy isn't answering — requests fail/hang
         // (ConnectionRefused). Distinct from "not routed through us at all".
@@ -1582,17 +2090,15 @@ fn render_segment(port: u16, root: &str, mode: SlMode) -> String {
             _ => format!("\u{26a0} ZlauDeR routed, proxy down :{port}"),
         };
     }
-    // A healthy proxy on our port owned by a DIFFERENT project (a derived-port collision)
-    // reflects THAT project's masking state, not ours — rendering its 🛡 here would falsely
-    // confirm masking for THIS project (review finding C5: never a false shield). Degrade to
-    // unverified: the masking on/off we'd read from it belongs to the other project, not us.
-    if let Ok(st) = read_state(port)
-        && !st.project_root.is_empty()
-        && st.project_root != root
-    {
+    // Is the proxy the session is routed to actually OURS? `live_identity` verifies the process
+    // on our rendezvous port echoes our nonce over /healthz (closing the PID-reuse/port-steal
+    // hole); we then require the session's routed `port` to BE that verified proxy. Any mismatch
+    // — stale record, stolen ephemeral port, foreign server answering — degrades to unverified,
+    // never a false shield (finding C5).
+    let Some((_, key)) = live_identity(root).filter(|(lp, _)| *lp == port) else {
         return unverified(port, mode);
-    }
-    match key_for(port).and_then(|k| admin_get(port, &k)) {
+    };
+    match admin_get(port, &key) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
             Ok(s) if s.enabled => render_on(&s, port, mode),
             Ok(_) => match mode {
@@ -1865,13 +2371,20 @@ fn kill_group(child: &mut std::process::Child) {
 // config (/zlauder:privacy)
 // ---------------------------------------------------------------------------
 
-fn config_cmd(port: Option<u16>, action: Option<ConfigAction>) -> Result<()> {
+fn config_cmd(action: Option<ConfigAction>) -> Result<()> {
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
+    // Best-effort live port. The mutating `--scope project|user|local` actions PERSIST to the
+    // config file even when the proxy is DOWN (the apply_* helpers degrade to "applies on the
+    // next session" — they gate every live admin call on key_for(root)), so they must NOT
+    // hard-require a live proxy. When the proxy is up the real port flows through; when down,
+    // `0` is a sentinel that never reaches a live admin call. Only `Show` and `--scope session`
+    // genuinely need a live proxy, and they surface the resolver's error themselves.
+    let port = resolve_live_port(&root).unwrap_or(0);
 
     match action.unwrap_or(ConfigAction::Show) {
         ConfigAction::Show => {
-            let snap = live_snapshot(port)
+            let port = resolve_live_port(&root)?;
+            let snap = live_snapshot(port, &root)
                 .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_status(&snap, port)?;
         }
@@ -1894,7 +2407,7 @@ fn config_cmd(port: Option<u16>, action: Option<ConfigAction>) -> Result<()> {
 fn ml_cmd(port: u16, root: &str, action: MlAction) -> Result<()> {
     match action {
         MlAction::Status => {
-            let snap = live_snapshot(port)
+            let snap = live_snapshot(port, root)
                 .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_ml_line(&parse_snapshot(&snap)?, port);
             Ok(())
@@ -1912,7 +2425,7 @@ fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>
 
     if scope == Scope::Session {
         let key =
-            key_for(port).context("proxy not running; use --scope project/user to persist")?;
+            key_for(root).context("proxy not running; use --scope project/user to persist")?;
         let snap = admin_post(port, &key, endpoint)?;
         print_ml_applied(&snap, port, "session", on);
         return Ok(());
@@ -1926,7 +2439,7 @@ fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>
     })?;
 
     let path = scope_path(scope, root);
-    let applied = match key_for(port) {
+    let applied = match key_for(root) {
         Ok(key) => {
             // For ON, reload first so a `--model` change in the file is loaded into
             // the live config before we flip the toggle (which starts the load).
@@ -1997,7 +2510,7 @@ fn print_ml_line(s: &Snapshot, port: u16) {
 fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
     if scope == Scope::Session {
         let key =
-            key_for(port).context("proxy not running; use --scope project/user to persist")?;
+            key_for(root).context("proxy not running; use --scope project/user to persist")?;
         let snap = admin_post(port, &key, if on { "enable" } else { "disable" })?;
         print_applied(&snap, port, "session")?;
         return Ok(());
@@ -2015,7 +2528,7 @@ fn apply_threshold(port: u16, root: &str, scope: Scope, value: f32) -> Result<()
     );
     if scope == Scope::Session {
         let key =
-            key_for(port).context("proxy not running; use --scope project/user to persist")?;
+            key_for(root).context("proxy not running; use --scope project/user to persist")?;
         let mut cfg = admin_get(port, &key)?;
         cfg["config"]["score_threshold"] = json!(value);
         let snap = admin_put(port, &key, &cfg["config"])?;
@@ -2048,7 +2561,7 @@ fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Resul
         .unwrap_or_else(|| "balanced".to_string());
 
     // Proxy up: the endpoint is the single source of truth for apply + persist.
-    if let Ok(key) = key_for(port) {
+    if let Ok(key) = key_for(root) {
         let path = format!("profile/{profile_id}?scope={}", scope_label(scope));
         let snap = admin_post(port, &key, &path)?;
         print_applied(&snap, port, scope_label(scope))?;
@@ -2109,7 +2622,7 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
 
     if scope == Scope::Session {
         let key =
-            key_for(port).context("proxy not running; use --scope project/user to persist")?;
+            key_for(root).context("proxy not running; use --scope project/user to persist")?;
         let mut cfg = admin_get(port, &key)?;
         cfg["config"]["enabled_categories"] = json!(cats);
         let snap = admin_put(port, &key, &cfg["config"])?;
@@ -2128,7 +2641,7 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
 /// preserves the live switch (so an unrelated edit can't flip masking — review F3).
 fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Result<()> {
     let path = scope_path(scope, root);
-    let applied = match key_for(port).and_then(|k| admin_post(port, &k, action)) {
+    let applied = match key_for(root).and_then(|k| admin_post(port, &k, action)) {
         Ok(snap) => {
             print_applied(&snap, port, scope_label(scope))?;
             true
@@ -2155,10 +2668,10 @@ fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Resul
 // reveal
 // ---------------------------------------------------------------------------
 
-fn reveal(port: Option<u16>, token: String) -> Result<()> {
+fn reveal(token: String) -> Result<()> {
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
-    let key = key_for(port).context("reading session state (is the proxy running?)")?;
+    let (port, key) = live_identity(&root)
+        .context("could not reach this project's proxy — is a `claude` session running here?")?;
     let url = format!(
         "http://127.0.0.1:{port}/zlauder/reveal/{}",
         percent_encode(&token)
@@ -2184,10 +2697,10 @@ fn reveal(port: Option<u16>, token: String) -> Result<()> {
 // monitor
 // ---------------------------------------------------------------------------
 
-fn monitor_cmd(port: Option<u16>) -> Result<()> {
+fn monitor_cmd() -> Result<()> {
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
-    let key = key_for(port).context("reading session state (is the proxy running?)")?;
+    let (port, key) = live_identity(&root)
+        .context("could not reach this project's proxy — is a `claude` session running here?")?;
     println!("http://127.0.0.1:{port}/zlauder/ui?key={key}");
     Ok(())
 }
@@ -2196,7 +2709,7 @@ fn monitor_cmd(port: Option<u16>) -> Result<()> {
 /// to resolve allow-listed broker tokens into `tool_input`, and emits `updatedInput`.
 /// Every failure path is silent (emit nothing, exit 0) so the tool runs with the
 /// broker token unresolved — fail-closed, never a leak.
-fn pre_tool_use(port: Option<u16>) -> Result<()> {
+fn pre_tool_use() -> Result<()> {
     use std::io::Read;
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
@@ -2213,11 +2726,10 @@ fn pre_tool_use(port: Option<u16>) -> Result<()> {
     }
 
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
-    // No live proxy/key ⇒ emit nothing ⇒ tool runs with the token unresolved.
-    let key = match key_for(port) {
-        Ok(k) => k,
-        Err(_) => return Ok(()),
+    // No live, identity-verified proxy ⇒ emit nothing ⇒ tool runs with the token unresolved
+    // (fail-closed). One identity round-trip (not two) keeps this per-tool-call hook cheap.
+    let Some((port, key)) = live_identity(&root) else {
+        return Ok(());
     };
 
     let req = json!({ "tool_name": tool_name, "tool_input": tool_input });
@@ -2256,10 +2768,10 @@ fn pre_tool_use(port: Option<u16>) -> Result<()> {
 /// `/zlauder:secrets` — read-only view of the registered-secret gate + status. Pulls
 /// the value-free `secrets` block from the proxy snapshot. (Registration is by
 /// reference in `[[secrets]]`; secret VALUES never transit this command.)
-fn secrets_cmd(port: Option<u16>, action: Option<SecretsAction>) -> Result<()> {
+fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
-    let snap = live_snapshot(port).context("reading secrets status (is the proxy running?)")?;
+    let port = resolve_live_port(&root)?;
+    let snap = live_snapshot(port, &root).context("reading secrets status (is the proxy running?)")?;
     let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
     let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
     let total = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
@@ -2308,13 +2820,43 @@ fn secrets_cmd(port: Option<u16>, action: Option<SecretsAction>) -> Result<()> {
 // admin HTTP helpers
 // ---------------------------------------------------------------------------
 
-fn key_for(port: u16) -> Result<String> {
-    Ok(read_state(port)?.admin_key)
+/// This project's live, IDENTITY-VERIFIED proxy: its `(port, admin_key)` from the PROJECT-keyed
+/// rendezvous, returned ONLY after a `/healthz` round-trip confirms the serving process echoes
+/// the nonce in OUR record. Resolving by project (never an ambient/shared port) scopes the CLI
+/// to OUR proxy; the nonce match proves the process on that port is the exact instance that
+/// published the record — not a foreign server that grabbed a recycled ephemeral port after a
+/// PID-reuse + port-steal. `None` if there is no live, verified proxy. (A hook-launched proxy
+/// always carries a nonce, so an empty-nonce manual/legacy record is not trusted.) This mirrors
+/// the adoption check in [`ensure_up`]/[`wait_for_live`] — every control-plane consumer routes
+/// through it so none can hand the admin key or hook payload to an unverified port.
+fn live_identity(root: &str) -> Option<(u16, String)> {
+    let (port, rec) = zlauder_state::live_port(root)?;
+    if rec.nonce.is_empty() {
+        return None;
+    }
+    let (_build, live_nonce) = proxy_identity(port)?;
+    (live_nonce == rec.nonce).then_some((port, rec.admin_key))
 }
 
-fn live_snapshot(port: u16) -> Result<Value> {
-    let key = key_for(port)?;
-    admin_get(port, &key)
+/// This project's live proxy port (identity-verified; see [`live_identity`]).
+fn resolve_live_port(root: &str) -> Result<u16> {
+    live_identity(root).map(|(p, _)| p).context(
+        "could not find this project's proxy — is a `claude` session running in this \
+         project? (start one, or run /zlauder:enable)",
+    )
+}
+
+/// This project's proxy admin key (identity-verified; see [`live_identity`]). Reading it only
+/// from the instance that proves our nonce is what keeps a consumer from ever handing the key
+/// to a different/foreign process on a colliding or recycled port.
+fn key_for(root: &str) -> Result<String> {
+    live_identity(root)
+        .map(|(_, k)| k)
+        .context("could not read this project's proxy key — is a `claude` session running here?")
+}
+
+fn live_snapshot(port: u16, root: &str) -> Result<Value> {
+    admin_get(port, &key_for(root)?)
 }
 
 fn admin_get(port: u16, key: &str) -> Result<Value> {
@@ -2382,7 +2924,7 @@ fn category_set_to_vec(cats: &std::collections::HashSet<zlauder_engine::Category
 /// the balanced default, which would silently erase a custom persisted set when the
 /// proxy happens to be down (review finding F2/C4).
 fn effective_categories(port: u16, root: &str) -> Vec<String> {
-    if let Ok(snap) = live_snapshot(port)
+    if let Ok(snap) = live_snapshot(port, root)
         && let Some(arr) = snap
             .pointer("/config/enabled_categories")
             .and_then(Value::as_array)
@@ -2643,12 +3185,12 @@ fn base_url_matches(have: &str, want: &str) -> bool {
     have == want || have.starts_with(&format!("{want}/"))
 }
 
-/// Does the project's `.claude/settings.local.json` (or `settings.json`) wire
-/// `env.ANTHROPIC_BASE_URL` to our proxy `base_url`? True ⇒ enable/auto-plumb ran here but
-/// the live session isn't routed yet — Claude Code applies the route on the next message (no
-/// full restart needed in the common case). Used only to pick a helpful "activates next
-/// message" nudge over silence when we are not routed.
-fn project_configures(root: &str, base_url: &str) -> bool {
+/// The proxy port this project has baked into `settings.local.json` (or `settings.json`) IF
+/// it carries OUR route — a loopback `env.ANTHROPIC_BASE_URL` whose port matches the
+/// co-baked `env.ZLAUDER_PORT`. Port-agnostic "is this project plumbed through us" (an
+/// ephemeral baked port can't be re-derived), and the co-key match ignores a user's own
+/// unrelated base URL.
+fn project_baked_route(root: &str) -> Option<u16> {
     for name in [".claude/settings.local.json", ".claude/settings.json"] {
         let path = Path::new(root).join(name);
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -2657,16 +3199,144 @@ fn project_configures(root: &str, base_url: &str) -> bool {
         let Ok(v) = serde_json::from_str::<Value>(strip_bom(&text)) else {
             continue;
         };
-        if let Some(url) = v
-            .get("env")
-            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
-            .and_then(|u| u.as_str())
-            && base_url_matches(url, base_url)
+        let Some(env) = v.get("env") else { continue };
+        let url = env.get("ANTHROPIC_BASE_URL").and_then(|u| u.as_str());
+        let zport = env
+            .get("ZLAUDER_PORT")
+            .and_then(|p| p.as_str())
+            .and_then(|s| s.parse::<u16>().ok());
+        if let (Some(url), Some(zp)) = (url, zport)
+            && loopback_url_port(url) == Some(zp)
         {
-            return true;
+            return Some(zp);
         }
     }
-    false
+    None
+}
+
+/// Parse a path-less loopback URL (`http://127.0.0.1:PORT`) → `PORT`. `None` for anything
+/// else (a non-loopback host, a URL with a path/query, a non-numeric port).
+fn loopback_url_port(url: &str) -> Option<u16> {
+    let authority = url.trim().trim_end_matches('/').strip_prefix("http://")?;
+    let (host, port) = authority.rsplit_once(':')?;
+    if (host != "127.0.0.1" && host != "localhost") || port.contains('/') {
+        return None;
+    }
+    port.parse::<u16>().ok()
+}
+
+#[cfg(test)]
+mod route_gate_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_url_port_parses_only_bare_loopback() {
+        assert_eq!(loopback_url_port("http://127.0.0.1:41234"), Some(41234));
+        assert_eq!(loopback_url_port("http://localhost:8080/"), Some(8080));
+        // A path/query is a user URL, not our bare host:port.
+        assert_eq!(loopback_url_port("http://127.0.0.1:41234/v1"), None);
+        // Non-loopback host, non-http scheme, non-numeric port → None.
+        assert_eq!(loopback_url_port("http://192.168.1.5:80"), None);
+        assert_eq!(loopback_url_port("https://api.anthropic.com"), None);
+        assert_eq!(loopback_url_port("http://127.0.0.1:notaport"), None);
+    }
+
+    #[test]
+    fn stale_route_messages_are_loud_and_actionable() {
+        // Every variant says NOT masked + restart, and (model copy) explicitly forbids a
+        // masking claim — never a silent false "active".
+        for danger in [StaleRoute::Refused, StaleRoute::Unresponsive, StaleRoute::ForeignResponder] {
+            let (_human, model) = stale_route_messages(40000, 40001, danger, true);
+            assert!(model.contains("NOT masked"), "{danger:?}: {model}");
+            assert!(model.to_lowercase().contains("restart"), "{danger:?}: {model}");
+            assert!(model.contains("Never claim masking is active"), "{danger:?}: {model}");
+        }
+        // The two dangerous variants tell the user to abort NOW.
+        let (h, _) = stale_route_messages(40000, 40001, StaleRoute::ForeignResponder, true);
+        assert!(h.contains("Ctrl-C") && h.contains("UNMASKED"), "{h}");
+        let (h, _) = stale_route_messages(40000, 40001, StaleRoute::Unresponsive, true);
+        assert!(h.contains("Ctrl-C") && h.contains("HANG"), "{h}");
+    }
+
+    #[test]
+    fn classify_stale_route_refused_when_nothing_listens() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        }; // listener dropped → port free → nothing listening
+        assert_eq!(classify_stale_route(port), StaleRoute::Refused);
+    }
+
+    #[test]
+    fn classify_stale_route_detects_responder_and_blackhole() {
+        use std::io::{Read, Write};
+        // A foreign HTTP responder. NOTE classify_stale_route makes TWO connections (a
+        // connect_timeout probe, then the reqwest GET), so the server must loop over
+        // connections — handling only one leaves the GET unanswered and looks unresponsive.
+        let responder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let rport = responder.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in responder.incoming().flatten() {
+                let mut s = conn;
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = s.flush();
+            }
+        });
+        // A black hole: accept every connection but never respond (hold them open).
+        let blackhole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bport = blackhole.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in blackhole.incoming().flatten() {
+                held.push(conn); // hold open; never write
+            }
+        });
+        assert_eq!(classify_stale_route(rport), StaleRoute::ForeignResponder);
+        assert_eq!(classify_stale_route(bport), StaleRoute::Unresponsive);
+    }
+
+    #[test]
+    fn project_baked_route_needs_loopback_url_with_matching_zport() {
+        let dir = std::env::temp_dir().join(format!("zlauder-baked-{}", std::process::id()));
+        let claude = dir.join(".claude");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&claude).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let settings = claude.join("settings.local.json");
+
+        // No settings → None.
+        assert_eq!(project_baked_route(&root), None);
+
+        // Our route: loopback URL whose port matches the co-baked ZLAUDER_PORT.
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:41999","ZLAUDER_PORT":"41999"}}"#,
+        )
+        .unwrap();
+        assert_eq!(project_baked_route(&root), Some(41999));
+
+        // A user's own base URL (no/with mismatched ZLAUDER_PORT) is NOT ours.
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gw.corp.example/v1","ZLAUDER_PORT":"41999"}}"#,
+        )
+        .unwrap();
+        assert_eq!(project_baked_route(&root), None);
+
+        // URL/port disagreement (stale ZLAUDER_PORT) → not trusted.
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:41999","ZLAUDER_PORT":"40000"}}"#,
+        )
+        .unwrap();
+        assert_eq!(project_baked_route(&root), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn canonical(p: &Path) -> String {
@@ -2693,19 +3363,6 @@ fn proxy_healthy(port: u16) -> bool {
         .send()
         .map(|r| r.status().is_success())
         .unwrap_or(false)
-}
-
-/// The build id the proxy on `port` reports (its `/healthz` body), if reachable.
-/// A pre-build-id proxy returns `"ok"`; an unreachable/erroring proxy returns None.
-fn proxy_build_id(port: u16) -> Option<String> {
-    blocking_client()
-        .get(format!("http://127.0.0.1:{port}/healthz"))
-        .send()
-        .ok()
-        .filter(|r| r.status().is_success())
-        .and_then(|r| r.text().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// Stop the proxy on `port` so a fresh build can take its place. The state file —
@@ -2969,5 +3626,32 @@ mod route_tests {
         // A different host that merely shares the port number as a prefix substring.
         assert!(!base_url_matches("http://127.0.0.1:183940", want));
         assert!(!base_url_matches("", want));
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    #[test]
+    fn probes_run_and_classify_sensibly() {
+        // Loopback + ephemeral bind work in any sane CI/dev environment.
+        assert_eq!(probe_loopback_self_connect().status, ProbeStatus::Pass);
+        assert_eq!(probe_ephemeral_bind().status, ProbeStatus::Pass);
+        // localhost may resolve v4 or v6 depending on the host — must never be a FAIL.
+        assert_ne!(probe_localhost_resolution().status, ProbeStatus::Fail);
+        // A bogus project has no rendezvous → Info (not a crash, not a false healthy).
+        assert_eq!(
+            probe_project_proxy("/no/such/zlauder/project/xyz").status,
+            ProbeStatus::Info
+        );
+        // State dir is writable (uses the default/env dir).
+        assert_eq!(probe_state_dir().status, ProbeStatus::Pass);
+        // Off Windows the excluded-range probe is skipped.
+        #[cfg(not(windows))]
+        assert_eq!(probe_windows_excluded_range().status, ProbeStatus::Skip);
+        // Status labels are stable (consumed by the JSON output + plugin command).
+        assert_eq!(ProbeStatus::Pass.label(), "PASS");
+        assert_eq!(ProbeStatus::Fail.label(), "FAIL");
     }
 }

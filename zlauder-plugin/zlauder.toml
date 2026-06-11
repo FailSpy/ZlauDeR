@@ -4,7 +4,8 @@
 # config surface, see zlauder.toml.example in the plugin or main repo.
 
 [proxy]
-# No static port here: each project gets a derived port, passed as --port.
+# No static port: each project's proxy binds an OS-assigned ephemeral port, published
+# to a per-project rendezvous file. (Set `port = N` to pin a static port instead.)
 bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 

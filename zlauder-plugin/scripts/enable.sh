@@ -37,29 +37,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bins_ok=0
 if zlauder_resolve_bins; then bins_ok=1; fi
 
-# Resolve the proxy port. The live per-project proxy listens on a port DERIVED from
-# the project root (range 18000..20000), NOT a static default. The authoritative
-# source is zlauder-hooks `reserve-port`, which atomically reserves the derived port
-# and prints it — WITHOUT launching the proxy or emitting SessionStart JSON (that hook
-# is gated on the session already being routed, which a first-time enable is not). We
-# parse that, never guess.
+# Resolve the proxy port. By default the per-project proxy binds an OS-assigned EPHEMERAL
+# port (127.0.0.1:0; or a static `[proxy] port` if pinned). The port isn't derivable, so the
+# authoritative source is zlauder-hooks `reserve-port`, which LAUNCHES the proxy (so we learn
+# the port it actually bound, and it's already running for the next session) and prints that
+# bound port. We parse it, never guess.
 port=""
 if [ "$bins_ok" -eq 1 ]; then
   # Compute the authoritative port with ZLAUDER_PORT UNSET for this one call: reserve-port
   # honors ZLAUDER_PORT via its global --port, so an ambient/global value would otherwise
-  # shortcut the derivation and get baked verbatim. Unsetting it forces the real per-project
-  # derive+reserve.
+  # pin that exact port and get baked verbatim. Unsetting it forces the real per-project
+  # ephemeral bind.
   port="$(env -u ZLAUDER_PORT "$ZLAUDER_HOOKS_BIN" reserve-port 2>/dev/null < /dev/null || true)"
 fi
 # Never bake a stale/global/foreign ZLAUDER_PORT into this project's routing: that would pin
-# the project to an unreserved or ANOTHER project's port (the runtime then refuses to mask
-# through it, and /zlauder:disable+enable couldn't even clear it while the env stays set). Use
-# the derived port; honor an explicit ZLAUDER_PORT only as a fallback when we couldn't derive
-# one, and warn when a set value disagrees. (A routed re-enable has ZLAUDER_PORT == the derived
-# port, so this stays a no-op in the common case.)
+# the project to ANOTHER project's (or a dead) port. Use the freshly-bound port; honor an
+# explicit ZLAUDER_PORT only as a fallback when reserve-port couldn't run, and warn when a set
+# value disagrees. (A routed re-enable has ZLAUDER_PORT == the live port, so this is a no-op in
+# the common case.)
 if [ -n "$port" ]; then
   if [ -n "${ZLAUDER_PORT:-}" ] && [ "$ZLAUDER_PORT" != "$port" ]; then
-    echo "ZlauDeR: ignoring ZLAUDER_PORT=${ZLAUDER_PORT}; using this project's derived port ${port} (a stale or global ZLAUDER_PORT must not pin a project to a foreign/unreserved port)." >&2
+    echo "ZlauDeR: ignoring ZLAUDER_PORT=${ZLAUDER_PORT}; using this project's freshly-bound proxy port ${port} (a stale or global ZLAUDER_PORT must not pin a project to a foreign/dead port)." >&2
   fi
 elif [ -n "${ZLAUDER_PORT:-}" ]; then
   port="$ZLAUDER_PORT"
@@ -135,11 +133,12 @@ fi
 cat >&2 <<'EOF'
 
 ================================================================================
-  Masking activates on your NEXT MESSAGE.
+  RESTART Claude Code once to activate masking.
 
-  Claude Code re-reads the route from .claude/settings.local.json on each prompt,
-  so masking kicks in on your next message — no full restart needed in the common
-  case. (If it doesn't take effect within a message or two, restart Claude Code.)
+  The route is written to .claude/settings.local.json and the proxy is already
+  running, but Claude Code applies a route written mid-session only unreliably —
+  every session AFTER a restart reads it at startup, which always works. The
+  statusline shows "\u21bb ZlauDeR: restart to mask" until it's live, then the shield.
   Toggle masking anytime with /zlauder:privacy; remove routing with /zlauder:disable.
 ================================================================================
 EOF

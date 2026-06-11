@@ -20,12 +20,15 @@ Claude Code  ──ANTHROPIC_BASE_URL=http://127.0.0.1:<project-port>──►  
    (sees plaintext)                                                   (masks/unmasks)        (sees only tokens)
 ```
 
-**One proxy per project.** Each project gets its own proxy on a port derived from
-its path, so its key, token store, and config are fully isolated — concurrent
-`claude` sessions in *different* projects never interfere or correlate, while two
-windows in the *same* project share one proxy. The Claude Code plugin assigns the
-port and writes it into the project's gitignored `.claude/settings.local.json`
-automatically on the first session (or explicitly via `/zlauder:enable`).
+**One proxy per project.** Each project gets its own proxy on an **OS-assigned
+ephemeral port** (`127.0.0.1:0`), synchronized through a per-project **rendezvous file**
+keyed by the project's path — so its key, token store, and config are fully isolated, and
+two projects can never collide on a port (the birthday problem). Concurrent `claude`
+sessions in *different* projects never interfere or correlate; two windows in the *same*
+project share one proxy. The plugin writes the bound port into the project's gitignored
+`.claude/settings.local.json` on the first session (or explicitly via `/zlauder:enable`).
+The port is **sticky** (reused across proxy restarts when free), so it rarely changes; set
+`[proxy] port = N` in `zlauder.toml` to pin a static port instead.
 
 This is **not** a TLS-intercepting MITM — Claude Code natively supports
 `ANTHROPIC_BASE_URL`, so you simply point it at the local proxy, which
@@ -62,8 +65,8 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 |---|---|
 | `zlauder-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + hot-swappable config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
 | `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated privacy control plane (live enable/disable/profile/reload) that backs `/zlauder:privacy`. |
-| `zlauder-hooks` | Claude Code control plane: `session-start` (auto-plumb routing on first sight, launch/recycle proxy, reserve port), `statusline`, `config` (backs `/zlauder:privacy`), `reveal`, `settings` (backs `/zlauder:enable` / `/zlauder:disable`). Per-project routing is auto-plumbed by `session-start`; `/zlauder:enable` is the explicit redo. |
-| `zlauder-state` | shared on-disk session state (port/key/salt/pid) + project→port derivation; the single source of truth both binaries read. |
+| `zlauder-hooks` | Claude Code control plane: `session-start` (auto-plumb routing on first sight, launch/recycle the proxy, learn its bound port), `statusline`, `config` (backs `/zlauder:privacy`), `reveal`, `settings` (backs `/zlauder:enable` / `/zlauder:disable`). Per-project routing is auto-plumbed by `session-start`; `/zlauder:enable` is the explicit redo. |
+| `zlauder-state` | shared on-disk session state — the project-keyed **rendezvous** record (bound port/key/salt/pid/nonce) + the launch-lock and bind-error primitives; the single source of truth both binaries read. |
 
 ## Build
 
@@ -93,7 +96,7 @@ commands, not shell/PowerShell commands):
 
 That's it for setup — **installed = routed**. The plugin's `SessionStart` hook
 auto-plumbs each project the first time it sees it: it resolves the binaries (shipped
-prebuilt, below), reserves a free per-project port, and writes
+prebuilt, below), launches a proxy on an OS-assigned ephemeral port, and writes
 `.claude/settings.local.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a `🛡` status
 line that wraps any existing one as `🛡 … │ {your line}`; `ZLAUDER_STATUSLINE=off|min|verbose`
 tunes or hides the `🛡` segment). The plugin also writes a `.claude/.gitignore` for that
@@ -108,12 +111,23 @@ auto-plumbs each project the first time it sees it.
 > (`user` / `project` / `local`) during `/plugin install` — choose `project` and
 > only that repo ever loads zlauder (and only it is auto-plumbed).
 
-After install, masking comes on by itself:
+After install, masking activates with a **one-time restart**:
 
-1. **Send your next message.** Claude Code re-reads `ANTHROPIC_BASE_URL` from
-   `settings.local.json` **live** (no restart in the common case): the first session
-   writes the route, the next routes through the proxy and masking is on.
+1. **Restart Claude Code once** in this project. The first session writes the route into
+   `settings.local.json` and launches the proxy eagerly, but Claude Code applies a route
+   written *during* SessionStart to the current session only unreliably (~1 in 5) — every
+   session *after* the first reads it at startup, which always works. The statusline shows
+   `⟳ ZlauDeR: restart to mask` until it's live, then `🛡`. (A later message may
+   also pick it up, but a restart is the sure path.)
 2. **`/zlauder:privacy`** — confirm routing + masking, or flip masking on/off live.
+3. **`/zlauder:doctor`** — if masking won't come on, this preflight catches the usual causes
+   (a local firewall/AV intercepting `127.0.0.1`, a busy static port).
+
+> **Stale-port edge.** If the proxy dies *and* another process grabs its exact port before a
+> new session relaunches (rare — a normal relaunch reuses the sticky port), that session is
+> routed to the wrong port: it hangs or, if a foreign process answers, leaks unmasked to it.
+> The hook detects this and tells you to **Ctrl-C + restart**; it never silently claims
+> masking is active. Restarting re-routes to the fresh port.
 
 You rarely run anything by hand. `/zlauder:enable` does the same write explicitly (and
 seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:disable`.
@@ -138,7 +152,8 @@ assets use `zlauder-<triple>.tar.gz` for Linux/macOS and
 A plugin cannot set `ANTHROPIC_BASE_URL` itself (only `agent`/`subagentStatusLine` are
 honored from a plugin's settings.json, and there is no install-time hook), which is why
 routing goes through a real settings source — written to the gitignored
-`settings.local.json` and re-read live, so no restart is needed in the common case. See
+`settings.local.json` and read at startup — the first install needs a one-time restart to
+activate (every session after reads it reliably). See
 [`zlauder-plugin/`](./zlauder-plugin/) for the full rationale and command reference.
 On Windows, plugin runtime support assumes Claude Code can run the plugin's existing
 bash scripts; native PowerShell/cmd wrappers are not included.
@@ -346,10 +361,11 @@ suffix = "$"   #   (see zlauder.toml; written with the TOML \uXXXX escape)
   per-session salt), so masked content is byte-stable across turns and
   Anthropic's prompt-cache prefix is preserved. Verified: two identical requests
   produce byte-identical masked output. The salt is reused across proxy restarts
-  on a port, so cross-turn consistency survives a crash. A live `/zlauder:privacy` config
+  for a project (keyed by the rendezvous, stable even if the port changes), so cross-turn
+  consistency survives a crash. A live `/zlauder:privacy` config
   change keeps the store (and salt), so determinism survives reconfiguration too.
 - **Multi-session / multi-project:** each project runs its **own** proxy on a
-  project-derived port — separate key, salt, store, and config. Concurrent
+  project-keyed ephemeral port — separate key, salt, store, and config. Concurrent
   sessions in different projects can't corrupt each other, cross-contaminate
   responses, or correlate tokens (a value masked in project A is a *different*
   token in project B, and isn't resolvable by B's store). Two windows in the same

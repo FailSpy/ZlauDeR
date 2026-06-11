@@ -24,7 +24,10 @@ pub struct ConfigLayers {
 }
 
 pub struct LoadedConfig {
-    pub port: u16,
+    /// A user-pinned static port (`[proxy] port = N`), or `None` for the default
+    /// OS-assigned ephemeral port. `Some` means "bind exactly this, fail on conflict";
+    /// `None` means "bind 127.0.0.1:0 (sticky-reuse the last port when free)".
+    pub port: Option<u16>,
     pub bind: String,
     pub upstream_base_url: String,
     pub engine: EngineConfig,
@@ -112,8 +115,9 @@ struct FileConfig {
 
 #[derive(Deserialize)]
 struct ProxySection {
-    #[serde(default = "default_port")]
-    port: u16,
+    /// Absent ⇒ OS-assigned ephemeral port (the default). `Some(n)` ⇒ a static pin.
+    #[serde(default)]
+    port: Option<u16>,
     #[serde(default = "default_bind")]
     bind: String,
     #[serde(default = "default_upstream")]
@@ -123,16 +127,13 @@ struct ProxySection {
 impl Default for ProxySection {
     fn default() -> Self {
         Self {
-            port: default_port(),
+            port: None,
             bind: default_bind(),
             upstream_base_url: default_upstream(),
         }
     }
 }
 
-fn default_port() -> u16 {
-    8787
-}
 fn default_bind() -> String {
     "127.0.0.1".to_string()
 }
@@ -442,7 +443,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../zlauder.toml");
         let cfg = load(Some(&path)).expect("zlauder.toml should parse");
 
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, None); // omitted [proxy] port ⇒ OS-assigned ephemeral
         assert_eq!(cfg.upstream_base_url, "https://api.anthropic.com");
         assert!(cfg.engine.enabled, "enabled defaults true");
 
@@ -467,7 +468,7 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../zlauder.toml.example");
         let cfg = load(Some(&path)).expect("zlauder.toml.example should parse");
 
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, None); // omitted [proxy] port ⇒ OS-assigned ephemeral
         assert!(cfg.engine.enabled);
         assert_eq!(cfg.engine.detection_cache_cap, 50_000);
         assert!(cfg.engine.reveal_marker.enabled);
@@ -481,8 +482,8 @@ mod tests {
         let cfg = load(Some(&path)).expect("plugin zlauder.toml should parse");
 
         assert_eq!(
-            cfg.port, 8787,
-            "plugin seed omits port and uses loader default"
+            cfg.port, None,
+            "plugin seed omits port ⇒ OS-assigned ephemeral default"
         );
         assert!(cfg.engine.enabled);
         assert!(cfg.engine.reveal_marker.enabled);
@@ -498,7 +499,7 @@ mod tests {
             .join("../../zlauder-plugin/zlauder.toml.example");
         let cfg = load(Some(&path)).expect("plugin zlauder.toml.example should parse");
 
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, None); // omitted [proxy] port ⇒ OS-assigned ephemeral
         assert!(cfg.engine.enabled);
         assert_eq!(cfg.engine.detection_cache_cap, 50_000);
         assert!(cfg.engine.reveal_marker.enabled);
@@ -511,7 +512,7 @@ mod tests {
         // SAFETY: single-threaded unit test.
         unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
         let cfg = load(None).expect("defaults");
-        assert_eq!(cfg.port, 8787);
+        assert_eq!(cfg.port, None); // omitted [proxy] port ⇒ OS-assigned ephemeral
         assert!(cfg.engine.enabled);
         assert!(cfg.engine.allow_list.is_allowed("localhost"));
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };

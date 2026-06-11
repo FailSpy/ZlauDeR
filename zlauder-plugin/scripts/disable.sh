@@ -47,7 +47,7 @@ rc=$?
 case "$rc" in
   0)
     echo "Removed ZlauDeR routing from this project (.claude/settings.local.json; restored your original status line, if any)."
-    echo "ZlauDeR is now disabled — effective on your next message (Claude Code re-reads the route; no restart needed in the common case)."
+    echo "ZlauDeR is now disabled — restart Claude Code once to reliably apply it; the next session reads the cleared route and goes straight to Anthropic."
     ;;
   3)
     echo "ZlauDeR already disabled: no ZlauDeR wiring in this project."

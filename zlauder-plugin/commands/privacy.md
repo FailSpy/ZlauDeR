@@ -24,8 +24,8 @@ everyday on/off, live and with no restart. It is the real "is ZlauDeR being used
 control. Do not confuse it with **routing** (whether traffic goes through the proxy at
 all): routing is plumbed AUTOMATICALLY the first time the plugin sees a project (written
 to `.claude/settings.local.json`, gitignored) and is then effectively permanent;
-`/zlauder:enable` / `/zlauder:disable` set it explicitly (each takes effect on the next
-message — no restart in the common case). Because masking is policy *on top of* routing,
+`/zlauder:enable` / `/zlauder:disable` set it explicitly (a one-time Claude Code restart
+reliably applies the change). Because masking is policy *on top of* routing,
 flipping it off (transparent pass-through) can never strand the session. The `status`
 view shows both — proxy health, whether `ANTHROPIC_BASE_URL` is routed, and the masking
 config.
@@ -40,8 +40,7 @@ Report the result concisely:
   (`ANTHROPIC_BASE_URL` = `http://127.0.0.1:<port>` vs `(unset)`/the Anthropic
   API), and the masking state (ON/OFF, profile, enabled categories). If the proxy is
   up but not routed, tell the user it routes automatically on the next session, or to run
-  `/zlauder:enable` to plumb it now (it takes effect on their next message — no restart in
-  the common case).
+  `/zlauder:enable` to plumb it now (a one-time restart reliably activates it).
 - For a change (`on`/`off`/`profile`/`category`/`threshold`): confirm what changed
   and at which `--scope` (default `session`, i.e. live-only and lost on restart;
   `project`/`local`/`user` persist to a TOML layer).

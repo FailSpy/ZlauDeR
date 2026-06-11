@@ -2,6 +2,7 @@
 //! The binary (`main.rs`) is a thin wrapper around these modules.
 
 pub mod admin;
+pub mod bind;
 pub mod config;
 pub mod headers;
 pub mod ml;

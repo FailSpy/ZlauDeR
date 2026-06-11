@@ -17,8 +17,10 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 pub fn router(state: AppState) -> Router {
     Router::new()
         // Body is this proxy's build id — the SessionStart hook reads it to detect a
-        // stale long-lived proxy (older build) and restart it. Health = HTTP 200.
-        .route("/healthz", get(|| async { zlauder_state::BUILD_ID }))
+        // stale long-lived proxy (older build) and restart it. Health = HTTP 200. The
+        // `x-zlauder-nonce` header echoes this launch's nonce so the launcher can confirm
+        // the live proxy is the exact instance it just spawned (not a stale/foreign one).
+        .route("/healthz", get(healthz))
         .route("/zlauder/reveal/{token}", get(reveal))
         // `/privacy` control plane (all key-gated; per-project proxy).
         .route(
@@ -73,6 +75,23 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/responses", post(openai_responses::responses))
         .fallback(passthrough)
         .with_state(state)
+}
+
+/// Liveness + identity probe. Body is the build id (for stale-build recycling); the
+/// `x-zlauder-nonce` header carries this launch's nonce (from `ZLAUDER_LAUNCH_NONCE`,
+/// read at request time — it never changes for a live proxy) so the launcher can
+/// confirm it adopted the instance it spawned. Unauthenticated by design (liveness).
+async fn healthz() -> Response {
+    let mut headers = HeaderMap::new();
+    // Attach the launch nonce only if it forms a valid header value (it is hook-minted
+    // hex, so it always does — but build the response so an odd env can never degrade
+    // /healthz to a 500: liveness must answer 200 with the BUILD_ID body unconditionally).
+    if let Ok(nonce) = std::env::var("ZLAUDER_LAUNCH_NONCE")
+        && let Ok(value) = http::HeaderValue::from_str(&nonce)
+    {
+        headers.insert("x-zlauder-nonce", value);
+    }
+    respond(StatusCode::OK, headers, Body::from(zlauder_state::BUILD_ID))
 }
 
 /// Audit reveal: `GET /zlauder/reveal/{token}` with header `x-zlauder-key`.
