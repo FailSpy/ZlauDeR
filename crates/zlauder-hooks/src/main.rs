@@ -43,7 +43,7 @@ mod transcript;
 #[command(name = "zlauder-hooks", version, about)]
 struct Cli {
     /// Target proxy port. Defaults to `$ZLAUDER_PORT` (set per project by auto-plumb /
-    /// `/zlauder:enable`), else a port derived from the project path.
+    /// `/zlauder:enable`), else the project's live proxy port resolved from its rendezvous record.
     #[arg(long, env = "ZLAUDER_PORT", global = true)]
     port: Option<u16>,
     #[command(subcommand)]
@@ -588,7 +588,7 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
     // settings.local.json can't be `git add`-ed and strand a teammate on a dead pointer.
     ensure_local_gitignored(&settings_dir);
     // Route via settings.local.json (gitignored), NOT settings.json (committed): a baked
-    // `http://127.0.0.1:<derived-port>` is machine/path-specific, so committing it would
+    // `http://127.0.0.1:<ephemeral-port>` is machine/path-specific, so committing it would
     // strand a teammate who pulls the repo on a dead pointer (the ~3-minute ConnectionRefused
     // hang). settings.local.json is loaded for routing exactly like settings.json but never
     // travels.
@@ -2328,10 +2328,11 @@ fn safe_conversation_id(raw: &str) -> String {
 // reserve-port
 // ---------------------------------------------------------------------------
 
-/// Bring up this project's proxy (if needed) and print its bound port (bare integer on stdout).
+/// Bring this project's proxy up (binding an OS-assigned ephemeral port if it isn't already
+/// running) and print the port it bound (bare integer on stdout).
 /// `/zlauder:enable` calls this to learn the port to write into settings.local.json. Unlike
-/// `session-start` it never launches the proxy or emits hook JSON — so it works during
-/// a first-time enable, where the session is not yet routed through the proxy.
+/// `session-start` it emits NO hook JSON — only the bare port — so /zlauder:enable can call it
+/// during a first-time enable, where the session is not yet routed through the proxy.
 fn reserve_port_cmd(config: Option<PathBuf>, proxy_bin: String) -> Result<()> {
     let root = canonical(&project_root());
     match ensure_up(&root, config, &proxy_bin)? {
