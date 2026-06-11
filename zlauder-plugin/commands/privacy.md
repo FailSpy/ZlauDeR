@@ -36,15 +36,18 @@ config.
 
 Report the result concisely:
 
-- For `status` (or no args): read the status line's distinct states — `🛡` = proxy up
-  **and** masking on; `⚠ ZlauDeR OFF` = proxy up but masking off (transparent
-  pass-through); `⚠ ZlauDeR offline` = proxy not reachable; `❔ … (unverified)` = up but
-  the state couldn't be confirmed. Don't conflate "OFF" (up, not masking) with "offline"
-  (down). Also report whether this project is **routed** through it
-  (`ANTHROPIC_BASE_URL` = `http://127.0.0.1:<port>` vs `(unset)`/the Anthropic
-  API), and the masking state (ON/OFF, profile, enabled categories). If the proxy is
-  up but not routed, tell the user it routes automatically on the next session, or to run
-  `/zlauder:enable` to plumb it now (a one-time restart reliably activates it).
+- For `status` (or no args): read the status-line's distinct states — `🛡` = proxy up
+  **and** masking on **and** this session routed (fully active); `⟳ ZlauDeR: restart to mask`
+  = plumbed but this session isn't routed yet, so restart Claude Code once to activate it;
+  `✗ ZlauDeR not masking` = routing is off for this project (opted out); `⚠ ZlauDeR OFF :<port>`
+  = proxy up but masking is off (transparent pass-through); `⚠ ZlauDeR routed, proxy down
+  :<port>` = routed but the proxy isn't answering; `❔ ZlauDeR :<port> (unverified)` = up but the
+  state couldn't be confirmed. Don't conflate "OFF" (up, not masking) with "proxy down"
+  (unreachable) or "not masking" (routing off). Also report whether this session is **routed**
+  (`ANTHROPIC_BASE_URL` = `http://127.0.0.1:<port>` vs `(unset)`/the Anthropic API) and the
+  masking state (ON/OFF, profile, categories). If the proxy is up but this session isn't routed,
+  tell the user a just-written route takes effect after a **one-time restart** of Claude Code
+  (or to run `/zlauder:enable`); suggest `/zlauder:verify` to confirm both legs.
 - For a change (`on`/`off`/`profile`/`category`/`threshold`): confirm what changed
   and at which `--scope` (default `session`, i.e. live-only and lost on restart;
   `project`/`local`/`user` persist to a TOML layer).

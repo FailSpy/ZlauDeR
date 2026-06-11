@@ -90,6 +90,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Verify this session is BOTH masking and routed (two distinct verdicts).
+    Verify {
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a one-line status indicator for the Claude Code status line.
     Statusline,
     /// View or change privacy settings (backs the `/zlauder:privacy` command).
@@ -321,6 +327,7 @@ fn main() -> Result<()> {
             print_url,
         } => ensure_up_cmd(config, proxy_bin, print_url),
         Cmd::Doctor { json } => doctor(json),
+        Cmd::Verify { json } => verify(json),
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(action),
         Cmd::PreToolUse => pre_tool_use(),
@@ -1239,6 +1246,146 @@ fn doctor(json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `/zlauder:verify` — proves THIS session both MASKS and ROUTES, as two DISTINCT verdicts.
+/// A green engine is NOT a routed session: Leg 1 (engine masks) is a key-gated canary echo via
+/// /zlauder/diag/mask; Leg 2 (session routed) is whether $ANTHROPIC_BASE_URL points at this
+/// project's proxy. A green engine + red session reads ✗ overall — the exact bug verify exists
+/// to surface (masking is on, but this session bypasses it and sends UNMASKED).
+fn verify(json: bool) -> Result<()> {
+    let root = canonical(&project_root());
+    let legs = vec![verify_engine_masks(&root), verify_session_routed(&root)];
+    let any_fail = legs.iter().any(|p| p.status == ProbeStatus::Fail);
+    if json {
+        let arr: Vec<Value> = legs
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p.name,
+                    "status": p.status.label(),
+                    "detail": p.detail,
+                    "remediation": p.remediation,
+                })
+            })
+            .collect();
+        println!("{}", json!({ "ok": !any_fail, "legs": arr }));
+    } else {
+        println!(
+            "ZlauDeR verify — {}",
+            if any_fail {
+                "NOT fully active"
+            } else {
+                "active (masking ON + this session routed)"
+            }
+        );
+        for p in &legs {
+            println!("  [{}] {} — {}", p.status.label(), p.name, p.detail);
+        }
+        for p in legs
+            .iter()
+            .filter(|p| matches!(p.status, ProbeStatus::Fail | ProbeStatus::Warn))
+        {
+            if let Some(r) = &p.remediation {
+                println!("        → {r}");
+            }
+        }
+    }
+    if any_fail {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Verify Leg 1: does the proxy actually MASK? A key-gated /zlauder/diag/mask canary echo —
+/// distinct from "is this session routed" (Leg 2).
+fn verify_engine_masks(root: &str) -> Probe {
+    let name = "engine masks (key-gated canary)";
+    let (port, key) = match (resolve_live_port(root), key_for(root)) {
+        (Ok(p), Ok(k)) => (p, k),
+        _ => {
+            return probe(
+                name,
+                ProbeStatus::Fail,
+                "proxy not reachable — cannot run the masking canary".to_string(),
+                Some("open a session in this project (it auto-starts the proxy), or /zlauder:doctor"),
+            );
+        }
+    };
+    let canary = "verify.canary@example.com";
+    let resp = blocking_client()
+        .post(format!("http://127.0.0.1:{port}/zlauder/diag/mask"))
+        .header("x-zlauder-key", &key)
+        .json(&json!({ "text": format!("contact {canary} please") }))
+        .send();
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let out: Value = r.json().unwrap_or(Value::Null);
+            let changed = out.get("changed").and_then(Value::as_bool).unwrap_or(false);
+            let masked = out.get("masked").and_then(Value::as_str).unwrap_or("");
+            if changed && !masked.contains(canary) {
+                probe(
+                    name,
+                    ProbeStatus::Pass,
+                    "the proxy tokenized a canary value (masking is ON)".to_string(),
+                    None,
+                )
+            } else {
+                probe(
+                    name,
+                    ProbeStatus::Fail,
+                    "the canary came back UNMASKED — masking is OFF (transparent pass-through)"
+                        .to_string(),
+                    Some("turn masking on: /zlauder:privacy on"),
+                )
+            }
+        }
+        _ => probe(
+            name,
+            ProbeStatus::Fail,
+            "the diag/mask canary call failed".to_string(),
+            Some("check proxy health with /zlauder:doctor"),
+        ),
+    }
+}
+
+/// Verify Leg 2: does THIS session ROUTE through the proxy? `$ANTHROPIC_BASE_URL` == our proxy.
+/// A correctly-plumbed-but-pre-restart session legitimately reports NOT routed (matching the
+/// statusline ⟳ "restart to mask" state) — phrase it honestly, never falsely "verified".
+fn verify_session_routed(root: &str) -> Probe {
+    let name = "this session is routed through the proxy";
+    let routed = match resolve_live_port(root) {
+        Ok(p) => session_routed_through(&format!("http://127.0.0.1:{p}")),
+        // No live proxy ⇒ nothing to route to ⇒ not routed. (Comparing against a
+        // `:0` sentinel would, in the degenerate case of ANTHROPIC_BASE_URL literally
+        // being `http://127.0.0.1:0`, false-pass — so short-circuit instead.)
+        Err(_) => false,
+    };
+    if routed {
+        probe(
+            name,
+            ProbeStatus::Pass,
+            "ANTHROPIC_BASE_URL points at this project's proxy".to_string(),
+            None,
+        )
+    } else {
+        let abu = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_default();
+        let detail = if abu.is_empty() {
+            "ANTHROPIC_BASE_URL is unset — this session sends DIRECT to the API, UNMASKED"
+                .to_string()
+        } else {
+            format!(
+                "ANTHROPIC_BASE_URL ({abu}) does NOT route through this project's proxy — this \
+                 session is UNMASKED"
+            )
+        };
+        probe(
+            name,
+            ProbeStatus::Fail,
+            detail,
+            Some("restart Claude Code once to apply the route (written but not live this session), or /zlauder:enable"),
+        )
+    }
 }
 
 /// The foundation: can we connect to 127.0.0.1 over a fresh loopback socket at all?

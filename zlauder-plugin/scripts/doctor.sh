@@ -20,3 +20,7 @@ if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
   echo "error: \`zlauder-hooks doctor\` failed to run (exit $rc)." >&2
   exit "$rc"
 fi
+# A completed run propagates its own verdict so the contract above is observable:
+# 0 = all probes passed, 1 = it ran and one or more probes FAILed. (Without this the
+# script would fall off at 0 and a real FAIL would masquerade as success.)
+exit "$rc"

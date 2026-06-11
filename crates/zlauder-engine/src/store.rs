@@ -258,6 +258,15 @@ impl SessionStore {
         })
     }
 
+    /// Peek a token's CLASS (+ the registered name for a broker secret) WITHOUT decrypting,
+    /// so an audit reveal can tell "unknown token" apart from "exists but isn't revealable
+    /// here". `None` ⇒ unknown, expired, or tombstoned (a dead token can't be revealed
+    /// anyway, so it reads as unknown). The plaintext is never touched.
+    pub fn class_of(&self, token: &str) -> Option<(TokenKind, Option<String>)> {
+        let entry = self.token_map.get(token)?;
+        Self::live(entry).then(|| (entry.kind, entry.secret_name.clone()))
+    }
+
     /// Every live LOCAL ("owner-reveal") token as a `(plaintext, handle)` pair. The monitor
     /// capture uses this to re-mask a `Local` value (the admin key) that is revealed on the
     /// display path and so can appear in a captured reply CROSS-TURN — when the model echoes
@@ -337,6 +346,24 @@ mod tests {
         assert_eq!(r.secret_name.as_deref(), Some("db_password"));
         // A PII-kind reveal of a broker token is `None`.
         assert!(s.reveal_for(&tok, TokenKind::Pii).is_none());
+    }
+
+    #[test]
+    fn class_of_peeks_kind_and_name_without_decrypting() {
+        let mut s = SessionStore::new();
+        let broker = s.intern_broker("db_password", "hunter2", None).unwrap();
+        let pii = s.intern("EMAIL_ADDRESS", "a@b.com").unwrap();
+        let local = s.intern_local("ZLAUDER_ADMIN_KEY", "k").unwrap();
+        // Broker: peeked as Broker + the EXACT registered name (so the audit endpoint can say
+        // WHAT it is) — class_of NEVER decrypts the value.
+        assert_eq!(
+            s.class_of(&broker),
+            Some((TokenKind::Broker, Some("db_password".to_string())))
+        );
+        assert_eq!(s.class_of(&pii), Some((TokenKind::Pii, None)));
+        assert!(matches!(s.class_of(&local), Some((TokenKind::Local, _))));
+        // Unknown handle ⇒ None (lets the audit endpoint say "unknown" vs "not revealable").
+        assert_eq!(s.class_of("[NOPE_000000000000]"), None);
     }
 
     #[test]

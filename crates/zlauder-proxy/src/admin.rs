@@ -591,6 +591,35 @@ fn deny_reason_label(reason: &zlauder_engine::DenyReason) -> &'static str {
     }
 }
 
+/// `POST /zlauder/diag/mask` (key-gated): a masking canary for `/zlauder:verify` Leg 1. Masks a
+/// caller-supplied `{"text": ...}` through THIS project's live engine + merged config and
+/// reports whether anything changed — proving the engine actually masks, a verdict distinct
+/// from "this session is routed". Never forwards upstream. Key-gated so the model can't use it
+/// as a masking oracle.
+pub async fn diag_mask(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    #[derive(Deserialize)]
+    struct Req {
+        text: String,
+    }
+    let req: Req = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid diag/mask body: {e}")),
+    };
+    match st.engine.mask(&req.text, zlauder_engine::Surface::UserMessage) {
+        Ok(m) => {
+            let changed = m.masked_text != req.text;
+            json_ok(&json!({ "masked": m.masked_text, "changed": changed }))
+        }
+        Err(e) => text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("mask failed: {e}"),
+        ),
+    }
+}
+
 // --- small response helpers (mirrors routes.rs style) -----------------------
 
 fn json_ok(v: &serde_json::Value) -> Response {

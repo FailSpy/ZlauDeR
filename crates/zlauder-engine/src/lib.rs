@@ -37,6 +37,23 @@ pub use token::{
     token_regex,
 };
 
+/// Outcome of a class-aware AUDIT reveal ([`MaskEngine::reveal_audit`]): distinguishes a
+/// genuinely unknown handle from one that EXISTS but is not revealable on the audit path, so
+/// the operator-facing reveal can explain WHY — without ever returning a broker secret value.
+#[derive(Clone, Debug)]
+pub enum RevealAudit {
+    /// A PII token, resolved to its plaintext (reversible, display-revealable).
+    Pii(String),
+    /// A `Local` ("owner-reveal") token, resolved to its plaintext (the display path reveals
+    /// `Local`, and the audit endpoint is key-gated to the operator).
+    Local(String),
+    /// A registered broker secret: it exists, but its value is resolved ONLY at the tool
+    /// boundary and is NEVER revealable here. Carries the registered NAME (not the value).
+    Broker { secret_name: Option<String> },
+    /// No live token by that handle — unknown, expired, or tombstoned.
+    Unknown,
+}
+
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -1145,6 +1162,25 @@ impl MaskEngine {
             .lock()
             .expect("store mutex poisoned")
             .reveal(token)
+    }
+
+    /// Class-aware audit reveal: like [`Self::reveal`] but distinguishes a genuinely unknown
+    /// handle from one that EXISTS but isn't revealable here (a broker secret). Pii/Local
+    /// return the plaintext; Broker returns only the registered NAME (its value is resolved
+    /// solely at the tool boundary); Unknown means no live token by that handle. The broker
+    /// value is NEVER decrypted — `class_of` peeks the kind + name without touching plaintext.
+    pub fn reveal_audit(&self, token: &str) -> RevealAudit {
+        let store = self.store.lock().expect("store mutex poisoned");
+        match store.class_of(token) {
+            None => RevealAudit::Unknown,
+            Some((TokenKind::Broker, secret_name)) => RevealAudit::Broker { secret_name },
+            Some((TokenKind::Pii, _)) => {
+                store.reveal(token).map_or(RevealAudit::Unknown, RevealAudit::Pii)
+            }
+            Some((TokenKind::Local, _)) => store
+                .reveal_for(token, TokenKind::Local)
+                .map_or(RevealAudit::Unknown, |r| RevealAudit::Local(r.value)),
+        }
     }
 
     /// Promote a `Local` ("owner-reveal") token handle for SESSION tool-input use — the

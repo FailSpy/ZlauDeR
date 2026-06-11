@@ -153,6 +153,8 @@ prompt on its edits of `zlauder.toml` / `zlauder.local.toml`).
 | `/zlauder:status` | **Read-only** (model-invocable): proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Changes nothing — the model uses this to report status; to *change* anything it surfaces the `/zlauder:privacy` command for you to run. |
 | `/zlauder:privacy [args]` | **User-only.** Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state. Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
 | `/zlauder:privacy model …` | The optional `openai/privacy-filter` ML recognizer (CPU) for free-text PII (names, locations). `model download [<repo>]` caches the weights (large/slow first run); `model on`/`off` toggles it (on **loads in the background** — text is not filtered through the model until `model status` shows `ready`, so masking stays regex-only meanwhile); `model status` reports `disabled\|loading\|ready\|failed`. Pair with `category personal on`. |
+| `/zlauder:verify` | **Read-only** (model-invocable): proves THIS session is fully active in two distinct legs — the engine **masks** (a key-gated canary comes back tokenized) AND this session is **routed** (`ANTHROPIC_BASE_URL` points at the proxy). A green engine with an unrouted session reads ✗ — the case to catch (masking is on, but this session bypasses it and sends unmasked). |
+| `/zlauder:doctor` | **Read-only** (model-invocable): preflight self-check for the loopback / firewall / port footguns that would make masking requests hang. |
 
 > **Changed in 0.2.0:** `/zlauder:status` and `/zlauder:reveal` were folded into
 > `/zlauder:privacy` (`/zlauder:privacy status` and `/zlauder:privacy reveal <token>`).
@@ -163,6 +165,28 @@ prompt on its edits of `zlauder.toml` / `zlauder.local.toml`).
 > model can check masking state without being able to change it; `/zlauder:privacy` (which
 > can *loosen* masking) is now user-only. `reveal` / `scrub` stay inside the user-only
 > `/zlauder:privacy`.
+
+## Troubleshooting
+
+- **"Is masking actually on?"** Run `/zlauder:verify`. It checks two independent things — the
+  engine **masks** (a key-gated canary) AND this session **routes** through the proxy; both must
+  pass. `/zlauder:status` shows the same at a glance via the status line.
+- **Masking won't activate / the status line shows `⟳ ZlauDeR: restart to mask`.** Routing was
+  just written, but Claude Code applies a new route reliably only at startup — **restart Claude
+  Code once**, then `/zlauder:verify`. (`/zlauder:enable` re-writes the route if it went missing.)
+- **Requests hang for ~3 minutes, or the status line shows `⚠ ZlauDeR routed, proxy down`.** A
+  local security/AV product or a hardened loopback firewall is intercepting `127.0.0.1`. Run
+  `/zlauder:doctor` — it pinpoints the loopback / firewall / port problem and prints the fix.
+- **A token won't decode with `/zlauder:privacy reveal`.** "unknown token" means no such handle
+  in this session's store (it may be from another session, or expired). "token is a broker
+  secret … never revealable here" means the value is a registered secret resolved only at the
+  tool boundary — by design; use `/zlauder:monitor` to inspect it locally.
+- **Every request fails right after uninstalling.** A project's `settings.local.json` still
+  points at a now-dead proxy. Run **`/zlauder:disable --all` BEFORE uninstalling** to sweep every
+  plumbed project; if you already uninstalled, run `/zlauder:disable` in the affected project (or
+  delete the `ANTHROPIC_BASE_URL` / `ZLAUDER_PORT` lines from its `.claude/settings.local.json`).
+- **See what's being masked.** `/zlauder:monitor` prints a local, key-gated URL to inspect this
+  project's masked traffic; `/zlauder:secrets` shows which registered `[[secrets]]` resolved.
 
 ## Updating the plugin
 

@@ -8,7 +8,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
-use zlauder_engine::UnmaskManifest;
+use zlauder_engine::{RevealAudit, UnmaskManifest};
 
 use crate::{admin, headers, monitor, openai_chat, openai_responses, sse, state::AppState, walk};
 
@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/zlauder/disable", post(admin::disable))
         .route("/zlauder/reload", post(admin::reload))
         .route("/zlauder/broker/resolve", post(admin::broker_resolve))
+        .route("/zlauder/diag/mask", post(admin::diag_mask))
         .route("/zlauder/ml/enable", post(admin::ml_enable))
         .route("/zlauder/ml/disable", post(admin::ml_disable))
         .route("/zlauder/ui", get(monitor::ui))
@@ -104,9 +105,24 @@ async fn reveal(
     if !st.authed(&hdrs) {
         return err(StatusCode::FORBIDDEN, "missing or invalid x-zlauder-key");
     }
-    match st.engine.reveal(&token) {
-        Some(plain) => respond(StatusCode::OK, HeaderMap::new(), Body::from(plain)),
-        None => err(StatusCode::NOT_FOUND, "unknown token"),
+    // Class-aware: distinguish an UNKNOWN handle (404) from one that EXISTS but is not
+    // revealable here (409 for a broker secret — its value lives only at the tool boundary).
+    // The broker value is never decrypted; we return only its registered name.
+    match st.engine.reveal_audit(&token) {
+        RevealAudit::Pii(plain) | RevealAudit::Local(plain) => {
+            respond(StatusCode::OK, HeaderMap::new(), Body::from(plain))
+        }
+        RevealAudit::Broker { secret_name } => {
+            let what = secret_name.as_deref().unwrap_or("a registered secret");
+            err(
+                StatusCode::CONFLICT,
+                &format!(
+                    "token is a broker secret ({what}) — resolved only at the tool boundary, \
+                     never revealable here"
+                ),
+            )
+        }
+        RevealAudit::Unknown => err(StatusCode::NOT_FOUND, "unknown token"),
     }
 }
 
