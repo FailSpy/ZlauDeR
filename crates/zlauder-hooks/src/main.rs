@@ -2391,9 +2391,6 @@ fn emit_mask_delta(
 ) {
     let Some(cur) = session_mask_state(opted_out, baked_port, escape_hatch, root) else { return };
     let prev = read_session_mask_state(conversation);
-    if prev == Some(cur.state) {
-        return; // unchanged — silent, no rewrite
-    }
     if should_narrate(prev, cur.state) {
         println!(
             "{}",
@@ -2405,6 +2402,11 @@ fn emit_mask_delta(
             })
         );
     }
+    // ALWAYS persist, even when unchanged: `should_narrate` already gates the model-facing line, so
+    // the rewrite costs no tokens — but it keeps an actively-masked session's record mtime FRESH so
+    // `prune_stale_status` can't evict a live baseline. If it did, a later `Masked -> Off` would
+    // read `prev == None` and `should_narrate(None, Off) == false` — a SILENT un-masking. The write
+    // is the per-turn activity signal the prune relies on.
     write_session_mask_state(conversation, cur.state);
 }
 
