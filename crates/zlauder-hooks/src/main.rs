@@ -2047,6 +2047,13 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 /// first-session direct-leak. Every other state is a silent ALLOW (emit nothing): not plumbed,
 /// already routed, opted out, or the `ZLAUDER_NO_INTAKE_GATE` escape hatch.
 ///
+/// ONE prompt-shaped exception: a `/zlauder:` control-plane command always passes, even with the
+/// gate closed — it is how the user RECOVERS from the unrouted state (/zlauder:disable to opt out
+/// and continue, /zlauder:enable to retry, /zlauder:status/doctor/verify to inspect). Otherwise
+/// the gate is a trap: the command that would release it is itself blocked. These prompts are
+/// ZlauDeR's own command text (no user PII), and only a human keystroke reaches this hook, so the
+/// exception widens nothing an attacker controls.
+///
 /// The decision uses only fast LOCAL reads (the baked route + `$ANTHROPIC_BASE_URL`) — no
 /// network. This matters BECAUSE a UserPromptSubmit hook that hangs (30s timeout) or crashes
 /// FAILS OPEN (the prompt proceeds unmasked); only an explicit block decision is fail-closed.
@@ -2057,9 +2064,13 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 /// path precedes the block emission. A missing binary likewise fails open at the shell wrapper,
 /// which is correct: no zlauder installed ⇒ no masking promise ⇒ nothing to gate.
 fn user_prompt_submit() -> Result<()> {
-    // Drain the hook payload so the pipe never blocks; its contents aren't needed.
+    // Drain the hook payload so the pipe never blocks, and pull the submitted prompt out of it —
+    // we need the text to let ZlauDeR's own control-plane commands through a closed gate (below).
+    // serde is Option-fallible, so a malformed payload degrades to an empty prompt (no command
+    // match → still fail-CLOSED), never a panic on this safety path.
     let mut stdin = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin);
+    let prompt = prompt_from_hook_payload(&stdin).unwrap_or_default();
 
     let root = canonical(&project_root());
     // Gather the routing facts with fast LOCAL reads only (registry file, settings.local.json,
@@ -2083,15 +2094,27 @@ fn user_prompt_submit() -> Result<()> {
         return Ok(()); // allow: emit nothing
     }
 
+    // The gate would block — but it must never TRAP the user inside it. A `/zlauder:` control-
+    // plane command is exactly how a user recovers from the unrouted state: /zlauder:disable to
+    // opt out (and continue this session, unmasked by choice), /zlauder:enable to retry, or
+    // /zlauder:status/doctor/verify to inspect. The prompt is ZlauDeR's own command text — no
+    // zlauder command takes a PII argument — and only a human keystroke reaches a UserPromptSubmit
+    // hook (never model output or file contents), so passing it widens nothing an attacker holds.
+    // A prompt that merely MENTIONS a command ("should I run /zlauder:disable?") does not start
+    // with it and so stays blocked — it could carry PII.
+    if prompt_is_zlauder_command(&prompt) {
+        return Ok(()); // allow: control-plane recovery command
+    }
+
     // PLUMBED but THIS session is NOT routed: the prompt would reach the API UNMASKED. Block it
     // (exit 0 + `decision:"block"` is the fail-closed contract; the reason is shown to the user).
     let reason = "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session \
                   is not yet routed through the masking proxy — so your message would reach the \
                   API provider UNMASKED (real PII, not tokens). Restart Claude Code once to \
                   activate masking; every session after the first picks it up automatically. \
-                  (Only what the provider sees is affected — you always see your own plaintext. \
-                  To send this session WITHOUT masking, set ZLAUDER_NO_INTAKE_GATE=1 in your \
-                  environment and try again.)";
+                  Prefer to continue this session as-is? Run /zlauder:disable to turn masking off \
+                  for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to bypass the gate for now. \
+                  (Only what the provider sees is affected — you always see your own plaintext.)";
     println!("{}", json!({ "decision": "block", "reason": reason }));
     Ok(())
 }
@@ -2110,6 +2133,15 @@ fn intake_should_block(opted_out: bool, plumbed: bool, routed: bool, escape_hatc
 /// be flipped off by a `=0` a user meant as "keep it on".
 fn is_truthy_flag(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Is this submitted prompt an invocation of a ZlauDeR control-plane command (pure — for
+/// testing)? True only when the prompt, ignoring leading whitespace, BEGINS with the `/zlauder:`
+/// command prefix — so the command launch itself passes a closed intake gate, while prose that
+/// merely mentions one ("should I run /zlauder:disable?") does not. Case-sensitive: slash commands
+/// are lowercase, and this must never widen past an exact command launch.
+fn prompt_is_zlauder_command(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("/zlauder:")
 }
 
 /// Outcome of bringing this project's proxy up. The proxy is project-keyed (a record
@@ -2493,6 +2525,16 @@ fn conversation_id_from_hook_payload(stdin: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the submitted prompt text from a UserPromptSubmit hook payload. Tries the canonical
+/// `prompt` key plus casing variants across harness versions; returns `None` for a malformed or
+/// keyless payload, which the intake gate treats as "no command" → stays fail-CLOSED.
+fn prompt_from_hook_payload(stdin: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin).ok()?;
+    ["prompt", "user_prompt", "userPrompt"]
+        .iter()
+        .find_map(|key| find_string_key(&value, key))
 }
 
 /// Extract the durable conversation key embedded in a transcript path: its file
@@ -4308,6 +4350,39 @@ mod route_gate_tests {
         assert!(!intake_should_block(false, true, false, true));
         // Escape hatch wins even over the block state with all other flags set to block.
         assert!(!intake_should_block(false, true, false, true));
+    }
+
+    #[test]
+    fn zlauder_commands_pass_a_closed_intake_gate() {
+        // The recovery levers a user reaches for while the gate is closed all pass.
+        assert!(prompt_is_zlauder_command("/zlauder:disable"));
+        assert!(prompt_is_zlauder_command("/zlauder:enable"));
+        assert!(prompt_is_zlauder_command("/zlauder:status"));
+        // Tolerates leading whitespace and trailing args/newlines.
+        assert!(prompt_is_zlauder_command("  /zlauder:secrets status"));
+        assert!(prompt_is_zlauder_command("/zlauder:verify\n"));
+
+        // A real prompt that merely MENTIONS a command is NOT a launch — it could carry PII, so
+        // it stays gated.
+        assert!(!prompt_is_zlauder_command("should I run /zlauder:disable?"));
+        // Other namespaces, near-misses (no colon), and empty input never open the gate.
+        assert!(!prompt_is_zlauder_command("/other:thing"));
+        assert!(!prompt_is_zlauder_command("/zlauder-ish"));
+        assert!(!prompt_is_zlauder_command("/zlauder"));
+        assert!(!prompt_is_zlauder_command(""));
+        assert!(!prompt_is_zlauder_command("my email is a@b.com"));
+    }
+
+    #[test]
+    fn prompt_extracted_from_hook_payload_or_none() {
+        assert_eq!(
+            prompt_from_hook_payload(r#"{"prompt":"/zlauder:disable","session_id":"abc"}"#)
+                .as_deref(),
+            Some("/zlauder:disable")
+        );
+        // Missing key / non-JSON degrade to None (→ empty prompt → fail-closed block).
+        assert_eq!(prompt_from_hook_payload(r#"{"foo":"bar"}"#), None);
+        assert_eq!(prompt_from_hook_payload("not json"), None);
     }
 
     #[test]
