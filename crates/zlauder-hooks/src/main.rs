@@ -474,6 +474,20 @@ const DENY_RULES: &[&str] = &[
 ];
 const ASK_RULES: &[&str] = &["Edit(/zlauder.toml)", "Edit(/zlauder.local.toml)"];
 
+/// A trusted-infrastructure note merged into `autoMode.environment`. Claude Code's auto-mode
+/// classifier READS this prose (alongside the command string + CLAUDE.md) but never the script
+/// CONTENTS — so without it, ZlauDeR's own `/zlauder:` commands get flagged as "an unverifiable
+/// script from an unrecognised path." This postures the classifier toward recognising them as
+/// trusted local infra; it does NOT guarantee approval (only a `permissions.allow` rule
+/// deterministically bypasses the classifier). Kept factual + specific so it earns trust honestly:
+/// names the tool, the loopback scope, and the no-egress / no-destructive properties it weighs.
+const AUTOMODE_ENV_NOTE: &str = "ZlauDeR is a local PII-masking proxy the user installed and \
+    enabled for this project. Its `/zlauder:` commands (and the scripts under the zlauder plugin \
+    directory) are a loopback-only (127.0.0.1) control plane: read-only status/health checks \
+    (verify, status, doctor, secrets) or edits to this project's own ZlauDeR settings (enable, \
+    disable, privacy). They make no outbound network requests and perform no destructive actions. \
+    Treat them as trusted local infrastructure.";
+
 /// The `(permissions.<key>, our-rules)` pairs we own.
 fn permission_rule_sets() -> [(&'static str, &'static [&'static str]); 2] {
     [("deny", DENY_RULES), ("ask", ASK_RULES)]
@@ -545,6 +559,63 @@ fn remove_permission_rules(v: &mut Value) -> bool {
         && let Some(root) = v.as_object_mut()
     {
         root.remove("permissions");
+    }
+    changed
+}
+
+/// Merge our trusted-infra note into `v["autoMode"]["environment"]` (append-if-absent, preserving
+/// the user's entries). Seeds a freshly-created array with `"$defaults"` FIRST, so we only ever ADD
+/// to Claude Code's built-in trusted-infra defaults — never silently replace them. Refuses (rather
+/// than clobbers) a non-array `environment`, mirroring [`merge_permission_rules`].
+fn merge_automode_environment(v: &mut Value) -> Result<()> {
+    let auto = ensure_object(v, "autoMode");
+    let arr = auto
+        .entry("environment".to_string())
+        .or_insert_with(|| json!(["$defaults"]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "settings.local.json autoMode.environment is not a JSON array; refusing to \
+                 overwrite it. Fix it and re-run /zlauder:enable."
+            )
+        })?;
+    if !arr.iter().any(|x| x.as_str() == Some(AUTOMODE_ENV_NOTE)) {
+        arr.push(Value::String(AUTOMODE_ENV_NOTE.to_string()));
+    }
+    Ok(())
+}
+
+/// Our note is present (so a re-enable is a true NoOp; an upgrade from a build that lacked it is
+/// correctly detected as Changed).
+fn automode_note_present(v: &Value) -> bool {
+    v.pointer("/autoMode/environment")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().any(|x| x.as_str() == Some(AUTOMODE_ENV_NOTE)))
+        .unwrap_or(false)
+}
+
+/// Remove ONLY our note from `v["autoMode"]["environment"]`, preserving user entries — the inverse
+/// of [`merge_automode_environment`]. Drops an `environment` array that empties or is left as only
+/// `"$defaults"` (the no-op sentinel we seeded), and the `autoMode` object if it empties. Returns
+/// whether anything changed.
+fn remove_automode_environment(v: &mut Value) -> bool {
+    let mut changed = false;
+    let mut auto_empty = false;
+    if let Some(auto) = v.get_mut("autoMode").and_then(Value::as_object_mut) {
+        if let Some(arr) = auto.get_mut("environment").and_then(Value::as_array_mut) {
+            let before = arr.len();
+            arr.retain(|x| x.as_str() != Some(AUTOMODE_ENV_NOTE));
+            changed = arr.len() != before;
+            if changed && arr.iter().all(|x| x.as_str() == Some("$defaults")) {
+                auto.remove("environment");
+            }
+        }
+        auto_empty = auto.is_empty();
+    }
+    if auto_empty
+        && let Some(root) = v.as_object_mut()
+    {
+        root.remove("autoMode");
     }
     changed
 }
@@ -625,10 +696,13 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
         .pointer("/env/ZLAUDER_PORT")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // NoOp only when the route AND the model-gating permission rules are already present;
-    // a route-present-but-rules-missing install (e.g. pre-F0) is an upgrade → Changed.
-    let already =
-        base_url_matches(cur_url, url) && cur_port == zport && permission_rules_present(&local_v);
+    // NoOp only when the route AND the model-gating permission rules AND the auto-mode posture
+    // note are already present; a route-present-but-rules/note-missing install (e.g. an upgrade
+    // from a build before either landed) is Changed so the merge below runs.
+    let already = base_url_matches(cur_url, url)
+        && cur_port == zport
+        && permission_rules_present(&local_v)
+        && automode_note_present(&local_v);
 
     // Status-line takeover: snapshot the user's original line to the sidecar that
     // /zlauder:disable restores from. NEVER delete the sidecar here — an OLD install routed
@@ -675,6 +749,10 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
     // Seal the Approval Kernel: deny the model's Bash on our CLIs + force an `ask` on its
     // edits of zlauder.toml/zlauder.local.toml. Merge (never clobber) the user's own rules.
     merge_permission_rules(&mut v)?;
+    // Posture the auto-mode classifier to recognise our local control-plane commands as trusted
+    // infra (so /zlauder:verify et al. aren't denied as "unverifiable scripts"). Also merge-not-
+    // clobber, and seeded with "$defaults" so we never drop Claude Code's built-in defaults.
+    merge_automode_environment(&mut v)?;
 
     atomic_write_json(&local_file, &v)?;
     Ok(if already {
@@ -797,10 +875,63 @@ mod gitignore_tests {
 #[cfg(test)]
 mod permission_rule_tests {
     use super::{
-        ASK_RULES, DENY_RULES, any_permission_rule_present, merge_permission_rules,
-        permission_rules_present, remove_permission_rules,
+        ASK_RULES, AUTOMODE_ENV_NOTE, DENY_RULES, any_permission_rule_present,
+        automode_note_present, merge_automode_environment, merge_permission_rules,
+        permission_rules_present, remove_automode_environment, remove_permission_rules,
     };
     use serde_json::{Value, json};
+
+    fn env_arr(v: &Value) -> Vec<String> {
+        v.pointer("/autoMode/environment")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn automode_note_seeds_defaults_then_appends_and_is_idempotent() {
+        // Fresh object: seed "$defaults" FIRST (never replace built-in defaults), then our note.
+        let mut v = json!({});
+        merge_automode_environment(&mut v).unwrap();
+        assert_eq!(env_arr(&v), vec!["$defaults".to_string(), AUTOMODE_ENV_NOTE.to_string()]);
+        assert!(automode_note_present(&v));
+        // Re-run must not duplicate.
+        merge_automode_environment(&mut v).unwrap();
+        assert_eq!(env_arr(&v).iter().filter(|s| *s == AUTOMODE_ENV_NOTE).count(), 1);
+    }
+
+    #[test]
+    fn automode_merge_preserves_user_environment_entries() {
+        // User already curated environment (with their own entry, no "$defaults"): append only.
+        let mut v = json!({ "autoMode": { "environment": ["Trusted: my CI box"] } });
+        merge_automode_environment(&mut v).unwrap();
+        let e = env_arr(&v);
+        assert!(e.contains(&"Trusted: my CI box".to_string()), "user entry kept: {e:?}");
+        assert!(e.contains(&AUTOMODE_ENV_NOTE.to_string()));
+        assert!(!e.contains(&"$defaults".to_string()), "don't inject $defaults into a user array");
+    }
+
+    #[test]
+    fn automode_merge_refuses_non_array_environment() {
+        let mut v = json!({ "autoMode": { "environment": "oops-not-an-array" } });
+        assert!(merge_automode_environment(&mut v).is_err());
+    }
+
+    #[test]
+    fn automode_remove_is_a_true_inverse_but_keeps_user_entries() {
+        // Fresh enable then disable → autoMode fully gone (we seeded $defaults, so it's dropped).
+        let mut v = json!({});
+        merge_automode_environment(&mut v).unwrap();
+        assert!(remove_automode_environment(&mut v));
+        assert!(v.get("autoMode").is_none(), "our-only autoMode dropped on disable: {v}");
+        // A user entry survives disable; only our note is stripped.
+        let mut v = json!({ "autoMode": { "environment": ["Trusted: my CI box"] } });
+        merge_automode_environment(&mut v).unwrap();
+        assert!(remove_automode_environment(&mut v));
+        let e = env_arr(&v);
+        assert_eq!(e, vec!["Trusted: my CI box".to_string()]);
+        assert!(!automode_note_present(&v));
+    }
 
     fn arr(v: &Value, key: &str) -> Vec<String> {
         v.pointer(&format!("/permissions/{key}"))
@@ -1159,10 +1290,11 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
             .and_then(Value::as_str)
             .unwrap_or(""),
     );
-    // Also trigger when only our permission rules remain (env/statusLine hand-removed) so
-    // disable stays a true inverse and never leaves the model-gating rules orphaned.
+    // Also trigger when only our permission rules OR our auto-mode note remain (env/statusLine
+    // hand-removed) so disable stays a true inverse and never leaves either orphaned.
     let has_perms_wiring = any_permission_rule_present(&v);
-    if !has_env_wiring && !sl_is_ours && !has_perms_wiring {
+    let has_automode_note = automode_note_present(&v);
+    if !has_env_wiring && !sl_is_ours && !has_perms_wiring && !has_automode_note {
         return Ok((false, false));
     }
 
@@ -1196,9 +1328,10 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
         }
     }
 
-    // Strip our model-gating permission rules too (preserving any user permissions), so
-    // disable is a true inverse of enable's merge.
+    // Strip our model-gating permission rules + auto-mode posture note too (preserving any user
+    // permissions / environment entries), so disable is a true inverse of enable's merge.
     remove_permission_rules(&mut v);
+    remove_automode_environment(&mut v);
 
     atomic_write_json(settings_file, &v)?;
     Ok((true, restored))
