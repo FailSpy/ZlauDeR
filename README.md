@@ -5,6 +5,22 @@ the Anthropic Messages API, masks personal data on the way *out*, and unmasks it
 on the way *back* — so the model provider only ever sees deterministic tokens
 like `[EMAIL_ADDRESS_a47n1d8s9c0f]`, while you keep seeing real values locally.
 
+## Quick start (Claude Code)
+
+Run these **inside a `claude` session** — they are Claude Code slash commands, not
+shell commands:
+
+```
+/plugin marketplace add FailSpy/zlauder
+/plugin install zlauder
+[restart Claude Code]
+```
+
+That's it. The plugin ships prebuilt binaries (no compile, no download) and
+auto-routes each project the first time it sees it. After the one-time restart,
+masking is live — run `/zlauder:status` to confirm. Details, scoping options, and
+the standalone proxy are below.
+
 Detection is done by [`presidio-rs`](../jcc/presidio-rs) (offline regex
 recognizers — email, phone, credit card, IP, API keys, IBAN, SSN, …). The
 mask/unmask design is ported from the orchestr8 Privacy Engine: deterministic
@@ -85,16 +101,10 @@ ZlauDeR is licensed under the Business Source License 1.1
 ## Install into Claude Code
 
 zlauder installs as a **Claude Code plugin** — that is the only supported
-interface. Run these **inside a `claude` session** (they are Claude Code slash
-commands, not shell/PowerShell commands):
+interface. The [Quick start](#quick-start-claude-code) above is the entire
+install; this section explains what those three lines actually do.
 
-```
-/plugin marketplace add FailSpy/zlauder
-/plugin install zlauder
-/reload-plugins                 # make the new plugin's commands live now (no restart)
-```
-
-That's it for setup — **installed = routed**. The plugin's `SessionStart` hook
+**Installed = routed.** The plugin's `SessionStart` hook
 auto-plumbs each project the first time it sees it: it resolves the binaries (shipped
 prebuilt, below), launches a proxy on an OS-assigned ephemeral port, and writes
 `.claude/settings.local.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a `🛡` status
