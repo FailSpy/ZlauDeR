@@ -13,6 +13,15 @@ presidio-analyzer = { workspace = true }
 # ML recognizer (openai/privacy-filter, Candle CPU backend). Optional, but ON by
 # default (the `ml` feature is in `default`) so normal builds are "ML-capable".
 # `zlauder-hooks` opts OUT with `default-features = false` to stay lean.
+# `backend-candle`: zlauder builds the ML recognizer through presidio-classifier's
+# `select()` API but pins it to the candle substrate (cuda > metal > cpu) via the
+# `Candle` trapdoor. candle is freely re-buildable, so it survives zlauder's ML
+# reload lifecycle (disable→re-enable, failed-retry, model-param change). The auto
+# ladder's burn-wgpu rung is deliberately NOT pulled in: cubecl allows only ONE wgpu
+# init per process, which would make a reload on a wgpu-GPU host fail until restart.
+# Enabling burn-wgpu for zlauder is a follow-up that needs backend reuse across
+# reloads (cache the resident backend; restart-on-GPU-param-change). The NVIDIA
+# candle-CUDA perf tier is opt-in via `ml-cuda` below.
 presidio-classifier = { workspace = true, features = ["backend-candle"], optional = true }
 
 blake3   = { workspace = true }
@@ -41,6 +50,14 @@ tracing   = { workspace = true }
 # `[engine.ml]` config (it just never loads a model).
 default = ["ml"]
 ml = ["dep:presidio-classifier"]
+# Opt-in NVIDIA build: enables candle-CUDA (the `select()` candle path then resolves
+# cuda > metal > cpu). SEPARATE artifact — the binary gains a hard libcuda.so launch
+# dependency (won't start on a non-NVIDIA host) and the build host needs the CUDA
+# toolkit (+ the cudarc version pin). presidio-classifier's `cuda` feature exists on
+# presidio-rs `main` (re-pin Cargo.lock when bumping), so this passthrough resolves;
+# cf. the R1 `mkl` note below for why the upstream feature MUST be on the pinned
+# manifest first.
+ml-cuda = ["ml", "presidio-classifier/cuda"]
 # NOTE (R1, gemm-vs-MKL lever): an opt-in `mkl` passthrough feature was attempted
 # here (`mkl = ["ml", "presidio-classifier/mkl"]`) but it CANNOT be wired without
 # breaking the default build. presidio-classifier is consumed as a git dependency
