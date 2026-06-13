@@ -40,7 +40,7 @@ use crate::ml_api::catch_recognizer_panic;
 
 #[cfg(feature = "ml")]
 use presidio_classifier::backends::{
-    CandleBackend, CandleConfig, CpuPrecision, DeviceHint, PrecisionHint, Quant,
+    select, BackendChoice, CandleConfig, CpuPrecision, DeviceHint, PrecisionHint, Quant,
 };
 #[cfg(feature = "ml")]
 use crate::config::{ComputePrecision, Quantization};
@@ -147,22 +147,19 @@ fn quant(q: Quantization) -> Quant {
     }
 }
 
-/// Translate an `MlConfig` into the Candle backend's config. `prefer_gpu` only
-/// matters if the crate was built with `cuda`/`metal`; otherwise it falls through
-/// to CPU regardless (see `select_device`).
+/// Translate an `MlConfig` into a [`CandleConfig`]. `prefer_gpu` => `DeviceHint::Auto`
+/// (candle resolves cuda > metal > cpu — all freely re-buildable, so this survives
+/// zlauder's ML reload lifecycle), else pin `Cpu`. `PrecisionHint::Auto` resolves to
+/// BF16 on sm80+/Metal and degrades to F16 below (both gate-proven recall-safe;
+/// router/experts/score-head stay F32). When `force_cpu` is set (cache pre-warm), the
+/// device is pinned `Cpu` regardless of `prefer_gpu`. `MlConfig.prefer_gpu` stays the
+/// engine-facing knob; richer device selection is a future `MlConfig` extension.
 #[cfg(feature = "ml")]
-fn candle_config(cfg: &MlConfig) -> CandleConfig {
+fn candle_config(cfg: &MlConfig, force_cpu: bool) -> CandleConfig {
     CandleConfig {
         repo_id: cfg.model.clone(),
         revision: cfg.revision.clone(),
-        // presidio-classifier's GPU foundation replaced `prefer_gpu: bool` with a
-        // `device: DeviceHint` + `gpu_precision: PrecisionHint` pair. Preserve the
-        // prior engine-facing semantics exactly: `prefer_gpu` => `Auto` (try cuda >
-        // metal > cpu), otherwise pin to `Cpu`. `PrecisionHint::Auto` resolves to
-        // BF16 on sm80+/Metal and degrades to F16 below (router/experts/score-head
-        // stay F32). `MlConfig.prefer_gpu` stays the knob; richer device selection
-        // is a future MlConfig extension.
-        device: if cfg.prefer_gpu {
+        device: if cfg.prefer_gpu && !force_cpu {
             DeviceHint::Auto
         } else {
             DeviceHint::Cpu
@@ -174,9 +171,22 @@ fn candle_config(cfg: &MlConfig) -> CandleConfig {
     }
 }
 
-/// Refuse to fetch or load model repos outside the authorized allowlist.
-/// Runs before any network or loader work. Local-only: the http backend pulls
-/// no weights, so there is no checkpoint supply-chain surface to gate.
+/// The [`BackendChoice`] for an `MlConfig` — the candle substrate via the `Candle`
+/// trapdoor. Deliberately NOT `BackendChoice::Auto` (which would add the burn-wgpu
+/// rung): cubecl's single-wgpu-init-per-process collides with zlauder's drop+rebuild
+/// reload lifecycle, so the burn rung is deferred until a backend-reuse path exists.
+#[cfg(feature = "ml")]
+fn backend_choice(cfg: &MlConfig) -> BackendChoice {
+    BackendChoice::Candle(candle_config(cfg, false))
+}
+
+/// Refuse to fetch or load any model repo that is not on the authorized allowlist
+/// ([`crate::config::AUTHORIZED_ML_MODELS`]). This is the SINGLE chokepoint covering
+/// every override source — `--download-model --model <repo>`, `model on --model
+/// <repo> --scope <file>`, and a raw `[engine.ml] model = "…"` edit all resolve here
+/// before any network/loader work, so an arbitrary (model-supplied, injected, or
+/// typo'd) checkpoint can never be pulled. Local-only: the http backend pulls no
+/// weights, so there is no checkpoint supply-chain surface to gate.
 #[cfg(feature = "ml")]
 fn ensure_authorized(cfg: &MlConfig) -> Result<(), EngineError> {
     if !crate::config::is_authorized_model(&cfg.model) {
@@ -211,16 +221,23 @@ pub fn download(cfg: &MlConfig) -> Result<(), EngineError> {
 #[cfg(feature = "ml")]
 fn build_local(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineError> {
     ensure_authorized(cfg)?;
-    let backend =
-        CandleBackend::new(candle_config(cfg)).map_err(|e| EngineError::Ml(e.to_string()))?;
-    let rec: Arc<dyn MlRecognizer> = build_token_recognizer(Arc::new(backend), cfg);
+    // Build via presidio-classifier's `select()` API, pinned to the candle substrate
+    // (cuda > metal > cpu under `prefer_gpu`, else CPU). candle is re-buildable, so
+    // this survives ML reload; the burn-wgpu rung is deferred (see `backend_choice`).
+    // `select()` returns a ready (warmed) `Arc<dyn InferenceBackend>`; route it through
+    // the shared `build_token_recognizer` so the local path can never drift from http.
+    let backend = select(backend_choice(cfg)).map_err(|e| EngineError::Ml(e.to_string()))?;
+    let rec: Arc<dyn MlRecognizer> = build_token_recognizer(backend, cfg);
     Ok(rec)
 }
 
 #[cfg(feature = "ml")]
 fn download_local(cfg: &MlConfig) -> Result<(), EngineError> {
     ensure_authorized(cfg)?;
-    CandleBackend::new(candle_config(cfg)).map_err(|e| EngineError::Ml(e.to_string()))?;
+    // Device-irrelevant for a cache pre-warm: force candle CPU so a `--download-model`
+    // never spins up a GPU just to populate the hf-hub cache.
+    select(BackendChoice::Candle(candle_config(cfg, true)))
+        .map_err(|e| EngineError::Ml(e.to_string()))?;
     Ok(())
 }
 

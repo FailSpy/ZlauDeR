@@ -474,6 +474,20 @@ const DENY_RULES: &[&str] = &[
 ];
 const ASK_RULES: &[&str] = &["Edit(/zlauder.toml)", "Edit(/zlauder.local.toml)"];
 
+/// A trusted-infrastructure note merged into `autoMode.environment`. Claude Code's auto-mode
+/// classifier READS this prose (alongside the command string + CLAUDE.md) but never the script
+/// CONTENTS — so without it, ZlauDeR's own `/zlauder:` commands get flagged as "an unverifiable
+/// script from an unrecognised path." This postures the classifier toward recognising them as
+/// trusted local infra; it does NOT guarantee approval (only a `permissions.allow` rule
+/// deterministically bypasses the classifier). Kept factual + specific so it earns trust honestly:
+/// names the tool, the loopback scope, and the no-egress / no-destructive properties it weighs.
+const AUTOMODE_ENV_NOTE: &str = "ZlauDeR is a local PII-masking proxy the user installed and \
+    enabled for this project. Its `/zlauder:` commands (and the scripts under the zlauder plugin \
+    directory) are a loopback-only (127.0.0.1) control plane: read-only status/health checks \
+    (verify, status, doctor, secrets) or edits to this project's own ZlauDeR settings (enable, \
+    disable, privacy). They make no outbound network requests and perform no destructive actions. \
+    Treat them as trusted local infrastructure.";
+
 /// The `(permissions.<key>, our-rules)` pairs we own.
 fn permission_rule_sets() -> [(&'static str, &'static [&'static str]); 2] {
     [("deny", DENY_RULES), ("ask", ASK_RULES)]
@@ -545,6 +559,63 @@ fn remove_permission_rules(v: &mut Value) -> bool {
         && let Some(root) = v.as_object_mut()
     {
         root.remove("permissions");
+    }
+    changed
+}
+
+/// Merge our trusted-infra note into `v["autoMode"]["environment"]` (append-if-absent, preserving
+/// the user's entries). Seeds a freshly-created array with `"$defaults"` FIRST, so we only ever ADD
+/// to Claude Code's built-in trusted-infra defaults — never silently replace them. Refuses (rather
+/// than clobbers) a non-array `environment`, mirroring [`merge_permission_rules`].
+fn merge_automode_environment(v: &mut Value) -> Result<()> {
+    let auto = ensure_object(v, "autoMode");
+    let arr = auto
+        .entry("environment".to_string())
+        .or_insert_with(|| json!(["$defaults"]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "settings.local.json autoMode.environment is not a JSON array; refusing to \
+                 overwrite it. Fix it and re-run /zlauder:enable."
+            )
+        })?;
+    if !arr.iter().any(|x| x.as_str() == Some(AUTOMODE_ENV_NOTE)) {
+        arr.push(Value::String(AUTOMODE_ENV_NOTE.to_string()));
+    }
+    Ok(())
+}
+
+/// Our note is present (so a re-enable is a true NoOp; an upgrade from a build that lacked it is
+/// correctly detected as Changed).
+fn automode_note_present(v: &Value) -> bool {
+    v.pointer("/autoMode/environment")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().any(|x| x.as_str() == Some(AUTOMODE_ENV_NOTE)))
+        .unwrap_or(false)
+}
+
+/// Remove ONLY our note from `v["autoMode"]["environment"]`, preserving user entries — the inverse
+/// of [`merge_automode_environment`]. Drops an `environment` array that empties or is left as only
+/// `"$defaults"` (the no-op sentinel we seeded), and the `autoMode` object if it empties. Returns
+/// whether anything changed.
+fn remove_automode_environment(v: &mut Value) -> bool {
+    let mut changed = false;
+    let mut auto_empty = false;
+    if let Some(auto) = v.get_mut("autoMode").and_then(Value::as_object_mut) {
+        if let Some(arr) = auto.get_mut("environment").and_then(Value::as_array_mut) {
+            let before = arr.len();
+            arr.retain(|x| x.as_str() != Some(AUTOMODE_ENV_NOTE));
+            changed = arr.len() != before;
+            if changed && arr.iter().all(|x| x.as_str() == Some("$defaults")) {
+                auto.remove("environment");
+            }
+        }
+        auto_empty = auto.is_empty();
+    }
+    if auto_empty
+        && let Some(root) = v.as_object_mut()
+    {
+        root.remove("autoMode");
     }
     changed
 }
@@ -625,10 +696,13 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
         .pointer("/env/ZLAUDER_PORT")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // NoOp only when the route AND the model-gating permission rules are already present;
-    // a route-present-but-rules-missing install (e.g. pre-F0) is an upgrade → Changed.
-    let already =
-        base_url_matches(cur_url, url) && cur_port == zport && permission_rules_present(&local_v);
+    // NoOp only when the route AND the model-gating permission rules AND the auto-mode posture
+    // note are already present; a route-present-but-rules/note-missing install (e.g. an upgrade
+    // from a build before either landed) is Changed so the merge below runs.
+    let already = base_url_matches(cur_url, url)
+        && cur_port == zport
+        && permission_rules_present(&local_v)
+        && automode_note_present(&local_v);
 
     // Status-line takeover: snapshot the user's original line to the sidecar that
     // /zlauder:disable restores from. NEVER delete the sidecar here — an OLD install routed
@@ -675,6 +749,10 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
     // Seal the Approval Kernel: deny the model's Bash on our CLIs + force an `ask` on its
     // edits of zlauder.toml/zlauder.local.toml. Merge (never clobber) the user's own rules.
     merge_permission_rules(&mut v)?;
+    // Posture the auto-mode classifier to recognise our local control-plane commands as trusted
+    // infra (so /zlauder:verify et al. aren't denied as "unverifiable scripts"). Also merge-not-
+    // clobber, and seeded with "$defaults" so we never drop Claude Code's built-in defaults.
+    merge_automode_environment(&mut v)?;
 
     atomic_write_json(&local_file, &v)?;
     Ok(if already {
@@ -797,10 +875,63 @@ mod gitignore_tests {
 #[cfg(test)]
 mod permission_rule_tests {
     use super::{
-        ASK_RULES, DENY_RULES, any_permission_rule_present, merge_permission_rules,
-        permission_rules_present, remove_permission_rules,
+        ASK_RULES, AUTOMODE_ENV_NOTE, DENY_RULES, any_permission_rule_present,
+        automode_note_present, merge_automode_environment, merge_permission_rules,
+        permission_rules_present, remove_automode_environment, remove_permission_rules,
     };
     use serde_json::{Value, json};
+
+    fn env_arr(v: &Value) -> Vec<String> {
+        v.pointer("/autoMode/environment")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn automode_note_seeds_defaults_then_appends_and_is_idempotent() {
+        // Fresh object: seed "$defaults" FIRST (never replace built-in defaults), then our note.
+        let mut v = json!({});
+        merge_automode_environment(&mut v).unwrap();
+        assert_eq!(env_arr(&v), vec!["$defaults".to_string(), AUTOMODE_ENV_NOTE.to_string()]);
+        assert!(automode_note_present(&v));
+        // Re-run must not duplicate.
+        merge_automode_environment(&mut v).unwrap();
+        assert_eq!(env_arr(&v).iter().filter(|s| *s == AUTOMODE_ENV_NOTE).count(), 1);
+    }
+
+    #[test]
+    fn automode_merge_preserves_user_environment_entries() {
+        // User already curated environment (with their own entry, no "$defaults"): append only.
+        let mut v = json!({ "autoMode": { "environment": ["Trusted: my CI box"] } });
+        merge_automode_environment(&mut v).unwrap();
+        let e = env_arr(&v);
+        assert!(e.contains(&"Trusted: my CI box".to_string()), "user entry kept: {e:?}");
+        assert!(e.contains(&AUTOMODE_ENV_NOTE.to_string()));
+        assert!(!e.contains(&"$defaults".to_string()), "don't inject $defaults into a user array");
+    }
+
+    #[test]
+    fn automode_merge_refuses_non_array_environment() {
+        let mut v = json!({ "autoMode": { "environment": "oops-not-an-array" } });
+        assert!(merge_automode_environment(&mut v).is_err());
+    }
+
+    #[test]
+    fn automode_remove_is_a_true_inverse_but_keeps_user_entries() {
+        // Fresh enable then disable → autoMode fully gone (we seeded $defaults, so it's dropped).
+        let mut v = json!({});
+        merge_automode_environment(&mut v).unwrap();
+        assert!(remove_automode_environment(&mut v));
+        assert!(v.get("autoMode").is_none(), "our-only autoMode dropped on disable: {v}");
+        // A user entry survives disable; only our note is stripped.
+        let mut v = json!({ "autoMode": { "environment": ["Trusted: my CI box"] } });
+        merge_automode_environment(&mut v).unwrap();
+        assert!(remove_automode_environment(&mut v));
+        let e = env_arr(&v);
+        assert_eq!(e, vec!["Trusted: my CI box".to_string()]);
+        assert!(!automode_note_present(&v));
+    }
 
     fn arr(v: &Value, key: &str) -> Vec<String> {
         v.pointer(&format!("/permissions/{key}"))
@@ -1159,10 +1290,11 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
             .and_then(Value::as_str)
             .unwrap_or(""),
     );
-    // Also trigger when only our permission rules remain (env/statusLine hand-removed) so
-    // disable stays a true inverse and never leaves the model-gating rules orphaned.
+    // Also trigger when only our permission rules OR our auto-mode note remain (env/statusLine
+    // hand-removed) so disable stays a true inverse and never leaves either orphaned.
     let has_perms_wiring = any_permission_rule_present(&v);
-    if !has_env_wiring && !sl_is_ours && !has_perms_wiring {
+    let has_automode_note = automode_note_present(&v);
+    if !has_env_wiring && !sl_is_ours && !has_perms_wiring && !has_automode_note {
         return Ok((false, false));
     }
 
@@ -1196,9 +1328,10 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
         }
     }
 
-    // Strip our model-gating permission rules too (preserving any user permissions), so
-    // disable is a true inverse of enable's merge.
+    // Strip our model-gating permission rules + auto-mode posture note too (preserving any user
+    // permissions / environment entries), so disable is a true inverse of enable's merge.
     remove_permission_rules(&mut v);
+    remove_automode_environment(&mut v);
 
     atomic_write_json(settings_file, &v)?;
     Ok((true, restored))
@@ -1771,6 +1904,28 @@ fn scrub_cmd(
 // session-start
 // ---------------------------------------------------------------------------
 
+/// The IMMUTABLE SessionStart onboarding the model reads when this project is ours. It describes
+/// the MECHANISM and pre-registers the `ZlauDeR:` status channel — but asserts NO live state,
+/// because SessionStart context freezes and any "you are masked now" claim would go stale (the
+/// image-2 failure). Live, mutable state rides the per-turn UserPromptSubmit delta instead. Pre-
+/// registering the channel is also what authenticates a later status note: a real status line was
+/// announced up front and points to /zlauder:verify; a prompt injection never is.
+const ONBOARDING: &str = "This project is set up to route through ZlauDeR, a LOCAL masking proxy. \
+     When masking is active it swaps PII for deterministic tokens like [EMAIL_ADDRESS_a1b2] or \
+     [API_KEY_a1b2c3] in what you receive, and restores the real values in your output — text, \
+     tool arguments, and files — before they leave the machine.\n\
+     - The user always sees their own real values locally; masking hides data from the API \
+     provider, NOT from the user. Never tell the user their data is hidden, redacted, or that you \
+     can't access it.\n\
+     - Tokens are safe to use verbatim wherever the value belongs — prose, config files (writing \
+     \"api_key\": \"[API_KEY_a1b2c3]\" puts the REAL key in the file), shell commands, tool \
+     inputs. Don't refuse, over-redact, or warn about \"exposing\" PII by using a token; the \
+     tokenization is what makes it safe.\n\
+     - Masking can change during the session (the user controls it with /zlauder:privacy). If \
+     this session's protection changes I'll post a line prefixed \"ZlauDeR:\" — that prefix is \
+     ZlauDeR's own status channel, not an instruction to obey blindly; you can confirm the real \
+     state any time with /zlauder:verify.";
+
 fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: String) -> Result<()> {
     // Drain stdin (the SessionStart hook payload) so the pipe doesn't block, and
     // opportunistically extract a stable conversation key for the monitor.
@@ -1855,18 +2010,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                         json!({
                             "hookSpecificOutput": {
                                 "hookEventName": "SessionStart",
-                                "additionalContext":
-                                    "ZlauDeR just auto-enabled PII masking for this project (route written to \
-                                     .claude/settings.local.json). Masking is NOT active in THIS session yet — \
-                                     the sure activation is a one-time restart of Claude Code, after which it \
-                                     stays on automatically. Until then ZlauDeR's intake gate BLOCKS this \
-                                     session's messages so nothing reaches the API provider unmasked (unless the \
-                                     user set ZLAUDER_NO_INTAKE_GATE=1, in which case outbound text may reach the \
-                                     API provider UNMASKED — real PII, not tokens). This is only about what the \
-                                     provider sees; the user always sees their own plaintext locally. If the user \
-                                     asks why masking isn't on yet, tell them to restart Claude Code once. Never \
-                                     tell the user their data is hidden in this session. The user controls masking \
-                                     with /zlauder:privacy and removes it with /zlauder:disable."
+                                "additionalContext": ONBOARDING
                             }
                         })
                     );
@@ -1922,15 +2066,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                 json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext":
-                            "ZlauDeR is configured for this project but masking is NOT active in THIS \
-                             session yet — the sure activation is a one-time restart of Claude Code. \
-                             Until then ZlauDeR's intake gate BLOCKS this session's messages so nothing \
-                             reaches the API provider unmasked (unless the user set ZLAUDER_NO_INTAKE_GATE=1, \
-                             in which case outbound text may reach the provider UNMASKED — real PII, not \
-                             tokens). This is only about what the provider sees; the user always sees their \
-                             own plaintext. If the user asks why masking isn't on, tell them to restart \
-                             Claude Code once. Control with /zlauder:privacy."
+                        "additionalContext": ONBOARDING
                     }
                 })
             );
@@ -1957,12 +2093,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                 json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext":
-                            "ZlauDeR is configured for this project but its local proxy is NOT \
-                             currently reachable, so masking is NOT active for THIS session and \
-                             requests may fail or hang. This is only about what the provider sees; \
-                             the user always sees their own plaintext. Never tell the user their \
-                             data is hidden in this session. Run /zlauder:doctor to diagnose."
+                        "additionalContext": ONBOARDING
                     }
                 })
             );
@@ -1989,7 +2120,14 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
             &statusline_command(),
         )
         .is_ok();
-        let (human, model) =
+        // The model used to get the alarmist stale-port copy frozen into context — which then
+        // read as a prompt injection and outlived its truth the instant Claude Code live-reloaded
+        // the reconciled route (image 2). Keep the loud warning on stderr for the HUMAN; the model
+        // gets only the immutable onboarding. This session's real state is enforced downstream: the
+        // intake gate BLOCKS its first prompt (baked route now points at the new port, this session
+        // doesn't), or — if the route did live-reload — the UserPromptSubmit delta reports the
+        // now-correct masked state. Either way, no frozen panic.
+        let (human, _model) =
             stale_route_messages(routed_port, port, classify_stale_route(routed_port), reconciled);
         eprintln!("ZlauDeR: {human}");
         println!(
@@ -1997,7 +2135,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": model
+                    "additionalContext": ONBOARDING
                 }
             })
         );
@@ -2013,24 +2151,13 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
         .as_deref()
         .map(|c| format!("{base_url}/zlauder/session/{c}"))
         .unwrap_or_else(|| base_url.clone());
+    // Routed + healthy. The model gets the immutable onboarding; the live "masking is active on
+    // :{port}" baseline is the first UserPromptSubmit delta's job (it reads ground truth and stays
+    // fresh), so nothing here can go stale. `env` remains the best-effort live-route override.
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext":
-                "ZlauDeR is masking this project: a local proxy swaps PII for deterministic \
-                 tokens like [EMAIL_ADDRESS_a1b2] or [API_KEY_a1b2c3] in what you receive, and \
-                 restores the real values in your output — text, tool arguments, and files — \
-                 before they land.\n\
-                 - The user sees their real values locally; only you and the API provider ever \
-                 see the tokens. Masking hides data from the provider, NOT the user — never \
-                 tell the user their data is hidden, redacted, or that you can't access it.\n\
-                 - Tokens are safe to use freely and reveal nothing (you only ever hold the \
-                 token; it becomes the real value on the way out). Use the exact token verbatim \
-                 wherever the value belongs — prose, config files (writing \
-                 \"api_key\": \"[API_KEY_a1b2c3]\" puts the REAL key in the file), shell \
-                 commands, tool inputs. Don't refuse, over-redact, or warn about \"exposing\" \
-                 PII by using tokens; the tokenization is what makes it safe.\n\
-                 Configure masking/routing with /zlauder:privacy (this project only)."
+            "additionalContext": ONBOARDING
         },
         "env": { "ANTHROPIC_BASE_URL": session_base_url, "ZLAUDER_PORT": port.to_string() }
     });
@@ -2047,6 +2174,13 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 /// first-session direct-leak. Every other state is a silent ALLOW (emit nothing): not plumbed,
 /// already routed, opted out, or the `ZLAUDER_NO_INTAKE_GATE` escape hatch.
 ///
+/// ONE prompt-shaped exception: a `/zlauder:` control-plane command always passes, even with the
+/// gate closed — it is how the user RECOVERS from the unrouted state (/zlauder:disable to opt out
+/// and continue, /zlauder:enable to retry, /zlauder:status/doctor/verify to inspect). Otherwise
+/// the gate is a trap: the command that would release it is itself blocked. These prompts are
+/// ZlauDeR's own command text (no user PII), and only a human keystroke reaches this hook, so the
+/// exception widens nothing an attacker controls.
+///
 /// The decision uses only fast LOCAL reads (the baked route + `$ANTHROPIC_BASE_URL`) — no
 /// network. This matters BECAUSE a UserPromptSubmit hook that hangs (30s timeout) or crashes
 /// FAILS OPEN (the prompt proceeds unmasked); only an explicit block decision is fail-closed.
@@ -2057,9 +2191,14 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 /// path precedes the block emission. A missing binary likewise fails open at the shell wrapper,
 /// which is correct: no zlauder installed ⇒ no masking promise ⇒ nothing to gate.
 fn user_prompt_submit() -> Result<()> {
-    // Drain the hook payload so the pipe never blocks; its contents aren't needed.
+    // Drain the hook payload so the pipe never blocks, and pull the submitted prompt out of it —
+    // we need the text to let ZlauDeR's own control-plane commands through a closed gate (below).
+    // serde is Option-fallible, so a malformed payload degrades to an empty prompt (no command
+    // match → still fail-CLOSED), never a panic on this safety path.
     let mut stdin = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin);
+    let prompt = prompt_from_hook_payload(&stdin).unwrap_or_default();
+    let conversation = conversation_id_from_hook_payload(&stdin);
 
     let root = canonical(&project_root());
     // Gather the routing facts with fast LOCAL reads only (registry file, settings.local.json,
@@ -2079,20 +2218,36 @@ fn user_prompt_submit() -> Result<()> {
         .map(|v| is_truthy_flag(&v))
         .unwrap_or(false);
 
-    if !intake_should_block(opted_out, baked_port.is_some(), routed, escape_hatch) {
-        return Ok(()); // allow: emit nothing
+    // Fail-CLOSED block decision FIRST, from the local reads above only (this path must never
+    // hang or fail-open). Block iff the gate fires AND the prompt isn't a `/zlauder:` control-
+    // plane command — the recovery levers (/zlauder:disable to opt out and continue, enable to
+    // retry, status/doctor/verify to inspect) must never be trapped inside the gate they'd
+    // release. Those prompts are ZlauDeR's own command text (no zlauder command takes a PII
+    // argument) and only a human keystroke reaches this hook, so passing them widens nothing an
+    // attacker holds; a prompt that merely MENTIONS a command stays blocked (it could carry PII).
+    if intake_should_block(opted_out, baked_port.is_some(), routed, escape_hatch)
+        && !prompt_is_zlauder_command(&prompt)
+    {
+        // PLUMBED but THIS session is NOT routed: the prompt would reach the API UNMASKED.
+        // `decision:"block"` (exit 0) is the fail-closed contract; the reason is shown to the user.
+        let reason = "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session \
+                      is not yet routed through the masking proxy — so your message would reach the \
+                      API provider UNMASKED (real PII, not tokens). Restart Claude Code once to \
+                      activate masking; every session after the first picks it up automatically. \
+                      Prefer to continue this session as-is? Run /zlauder:disable to turn masking off \
+                      for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to bypass the gate for now. \
+                      (Only what the provider sees is affected — you always see your own plaintext.)";
+        println!("{}", json!({ "decision": "block", "reason": reason }));
+        return Ok(());
     }
 
-    // PLUMBED but THIS session is NOT routed: the prompt would reach the API UNMASKED. Block it
-    // (exit 0 + `decision:"block"` is the fail-closed contract; the reason is shown to the user).
-    let reason = "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session \
-                  is not yet routed through the masking proxy — so your message would reach the \
-                  API provider UNMASKED (real PII, not tokens). Restart Claude Code once to \
-                  activate masking; every session after the first picks it up automatically. \
-                  (Only what the provider sees is affected — you always see your own plaintext. \
-                  To send this session WITHOUT masking, set ZLAUDER_NO_INTAKE_GATE=1 in your \
-                  environment and try again.)";
-    println!("{}", json!({ "decision": "block", "reason": reason }));
+    // ALLOW. Post a masking-status DELTA to the model only when this session crosses the masked
+    // boundary since it was last told — delta-only, so no per-turn token cost and silence in the
+    // steady state. The block decision above is already made, so the best-effort short-timeout
+    // proxy read inside can only drop a status line, never fail-open the gate.
+    if let Some(conv) = conversation {
+        emit_mask_delta(&conv, opted_out, baked_port, escape_hatch, &root);
+    }
     Ok(())
 }
 
@@ -2110,6 +2265,282 @@ fn intake_should_block(opted_out: bool, plumbed: bool, routed: bool, escape_hatc
 /// be flipped off by a `=0` a user meant as "keep it on".
 fn is_truthy_flag(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Is this submitted prompt an invocation of a ZlauDeR control-plane command (pure — for
+/// testing)? True only when the prompt BEGINS, at byte 0 with NO leading trim, with the `/zlauder:`
+/// command prefix. Claude Code recognises a slash command only when `/` is the first character, so
+/// requiring byte-0 keeps this exactly as wide as a real command launch: leading-whitespace text
+/// is ordinary prose (could carry PII) and stays gated, and prose that merely mentions a command
+/// ("should I run /zlauder:disable?") never matches. Case-sensitive — slash commands are lowercase.
+fn prompt_is_zlauder_command(prompt: &str) -> bool {
+    prompt.starts_with("/zlauder:")
+}
+
+/// The masking-protection state of THIS session, as last communicated to its model. SessionStart
+/// carries only immutable onboarding (it freezes and would go stale); live state rides this
+/// per-session delta channel so the model always reconciles against ground truth — and so a
+/// SECOND session in the same project, off the shared proxy, reconciles against its OWN baseline.
+/// Deliberately coarse: we narrate the protection BOUNDARY, not cosmetic profile tuning.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MaskState {
+    /// Routed to our identity-verified proxy AND masking enabled — outbound PII is tokenized.
+    Masked,
+    /// Routed to our verified proxy but masking toggled OFF (passthrough). Only the key-gated
+    /// local admin plane can flip this, so it is always a local/user-authorized change.
+    Off,
+    /// This session is NOT reaching our verified proxy (route not applied, proxy down, or a
+    /// stale/foreign port) — so its traffic is not being masked by us right now.
+    NotReaching,
+    /// The project is opted out of ZlauDeR (`/zlauder:disable`) — a direct, unmasked connection.
+    Disabled,
+    /// Plumbed for masking, NOT routed this session, and the user set `ZLAUDER_NO_INTAKE_GATE` —
+    /// the fail-closed gate is deliberately bypassed, so this session's text egresses UNMASKED
+    /// (real values, not tokens). The ONE allow-path state where real PII genuinely leaves the
+    /// machine; the model is told once so the onboarding's "when active" framing can't mislead it.
+    UnmaskedBypass,
+}
+
+/// Live status plus the detail the delta message needs (port/profile only meaningful when routed).
+struct SessionStatus {
+    state: MaskState,
+    port: u16,
+    profile: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionStatusRecord {
+    state: MaskState,
+}
+
+/// Should we post a status line to the model, given what it was last told (`prev`) and the
+/// current state (`cur`)? (pure — for testing). Narrate ONLY when the masked/not-masked boundary
+/// is crossed relative to the last-communicated state: a fresh `Masked` baseline, a drop OUT of
+/// masked, or a recovery back INTO it — PLUS the first appearance of `UnmaskedBypass`, the one
+/// not-masked state that means real PII is actively leaving (a deliberate gate bypass), which the
+/// model must hear about once. Transitions between two *other* not-masked states (or a cold open on
+/// a session that was never masking) stay silent — "not noisy, but never let a silent un-masking
+/// slip past."
+fn should_narrate(prev: Option<MaskState>, cur: MaskState) -> bool {
+    prev != Some(cur)
+        && (prev == Some(MaskState::Masked)
+            || cur == MaskState::Masked
+            || cur == MaskState::UnmaskedBypass)
+}
+
+/// The model-facing delta line. Always prefixed `ZlauDeR:` — the status channel SessionStart
+/// pre-registers — and framed factually (no urgency, no "never claim", a verification path), so a
+/// legitimate status note never wears the shape of a prompt injection.
+fn mask_delta_message(s: &SessionStatus) -> String {
+    match s.state {
+        MaskState::Masked => format!(
+            "ZlauDeR: masking is active for this session — your traffic is tokenized through the \
+             verified local proxy on :{} (profile: {}). Keep using tokens verbatim wherever the \
+             value belongs.",
+            s.port,
+            if s.profile.is_empty() { "on" } else { &s.profile }
+        ),
+        MaskState::Off => "ZlauDeR: masking is now OFF for this project — the local proxy is \
+             passing text through UNtokenized (a local setting; re-enable with /zlauder:privacy). \
+             Treat values you see as real until masking is back on."
+            .to_string(),
+        MaskState::NotReaching => "ZlauDeR: this session is NOT masking right now — its traffic \
+             isn't reaching the verified proxy (the route may not have applied this session, or \
+             the proxy is down). Confirm with /zlauder:verify; restarting Claude Code rebinds it."
+            .to_string(),
+        MaskState::Disabled => "ZlauDeR: masking has been turned off for this project \
+             (/zlauder:disable) — this session now connects directly and is not tokenized."
+            .to_string(),
+        MaskState::UnmaskedBypass => "ZlauDeR: this session is sending text UNMASKED (real values, \
+             not tokens) — ZLAUDER_NO_INTAKE_GATE is set and this session isn't routed to the \
+             proxy, so the masking gate is bypassed. Restart Claude Code to mask, or unset \
+             ZLAUDER_NO_INTAKE_GATE to re-enable the gate."
+            .to_string(),
+    }
+}
+
+/// Per-session status record path (`<state_dir>/session-status/<conversation>.json`). `conversation`
+/// is already filename-safe (see [`safe_conversation_id`]).
+fn session_status_path(conversation: &str) -> Option<PathBuf> {
+    let dir = zlauder_state::state_dir().ok()?.join("session-status");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{conversation}.json")))
+}
+
+fn read_mask_state_at(dir: &Path, conversation: &str) -> Option<MaskState> {
+    let raw = std::fs::read_to_string(dir.join(format!("{conversation}.json"))).ok()?;
+    serde_json::from_str::<SessionStatusRecord>(&raw)
+        .ok()
+        .map(|r| r.state)
+}
+
+fn write_mask_state_at(dir: &Path, conversation: &str, state: MaskState) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Ok(raw) = serde_json::to_string(&SessionStatusRecord { state }) {
+        let _ = std::fs::write(dir.join(format!("{conversation}.json")), raw);
+    }
+}
+
+fn read_session_mask_state(conversation: &str) -> Option<MaskState> {
+    let dir = zlauder_state::state_dir().ok()?.join("session-status");
+    read_mask_state_at(&dir, conversation)
+}
+
+fn write_session_mask_state(conversation: &str, state: MaskState) {
+    if let Some(path) = session_status_path(conversation)
+        && let Some(dir) = path.parent()
+    {
+        write_mask_state_at(dir, conversation, state);
+        prune_stale_status(dir); // bound the per-conversation file set; best-effort
+    }
+}
+
+/// Best-effort removal of status records not touched in two weeks, so the per-conversation files
+/// don't grow without bound over a project's lifetime. Every error is swallowed — pruning must
+/// never fail or slow the write it rides on (a small dir; `read_dir` is sub-millisecond).
+fn prune_stale_status(dir: &Path) {
+    let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(Duration::from_secs(14 * 24 * 60 * 60))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime < cutoff)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Compute THIS session's current masking state. `None` ⇒ this project is not ours (no masking
+/// intent) ⇒ say nothing. Routing is decided from LOCAL reads; only an env-routed session pays a
+/// (short-timeout) loopback read to confirm the proxy is OURS and whether masking is enabled —
+/// and that read NEVER claims `Masked` unless it positively reads `enabled=true` from our
+/// identity-verified proxy (never a false "you're protected").
+fn session_mask_state(
+    opted_out: bool,
+    baked_port: Option<u16>,
+    escape_hatch: bool,
+    root: &str,
+) -> Option<SessionStatus> {
+    if opted_out {
+        return Some(SessionStatus { state: MaskState::Disabled, port: 0, profile: String::new() });
+    }
+    let routed_port = baked_port?; // not plumbed through us → not ours → silent
+    if !session_routed_through(&format!("http://127.0.0.1:{routed_port}")) {
+        // Plumbed, but this session's $ANTHROPIC_BASE_URL doesn't point at the baked port. With the
+        // gate bypassed (ZLAUDER_NO_INTAKE_GATE) this is real unmasked egress — surface it; without
+        // it, this branch is only reached by a /zlauder: command turn (transient), so stay quiet.
+        let state = if escape_hatch { MaskState::UnmaskedBypass } else { MaskState::NotReaching };
+        return Some(SessionStatus { state, port: 0, profile: String::new() });
+    }
+    let (state, profile) = routed_proxy_status(routed_port, root);
+    Some(SessionStatus { state, port: routed_port, profile })
+}
+
+/// For a session whose env IS routed to `routed_port`: confirm the listener is our identity-
+/// verified proxy (rendezvous nonce echoed over `/healthz`) and read `enabled`/`profile`. Mirrors
+/// the statusline's `render_segment` verification but returns a typed state. Uses a SHORT timeout
+/// so a wedged proxy can never stall prompt submission; any failure degrades to `NotReaching`
+/// (the honest "can't confirm masking" answer), never an optimistic `Masked`.
+fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
+    let unconfirmed = (MaskState::NotReaching, String::new());
+    // ONE client, NO global timeout: the two reads (identity + enabled) share a SINGLE ~600ms
+    // deadline via per-request `.timeout()`, so the whole best-effort tail is bounded as a unit
+    // (not 500ms-per-request → ~1s). A slow proxy can only shrink the status read to nothing and
+    // degrade to `NotReaching`; it can never stall prompt submission for long.
+    let Ok(client) = reqwest::blocking::Client::builder().build() else {
+        return unconfirmed;
+    };
+    let start = std::time::Instant::now();
+    let remaining = || {
+        Duration::from_millis(600)
+            .checked_sub(start.elapsed())
+            .unwrap_or(Duration::ZERO)
+            .max(Duration::from_millis(50))
+    };
+    // Identity: the live rendezvous port must equal the routed port AND the process there must
+    // echo our recorded nonce — closing the foreign-server-on-a-colliding-port hole.
+    let Some((live, rec)) = zlauder_state::live_port(root) else { return unconfirmed };
+    if live != routed_port || rec.nonce.is_empty() {
+        return unconfirmed;
+    }
+    let id_ok = client
+        .get(format!("http://127.0.0.1:{live}/healthz"))
+        .timeout(remaining())
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| {
+            r.headers()
+                .get("x-zlauder-nonce")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .is_some_and(|n| n == rec.nonce);
+    if !id_ok {
+        return unconfirmed;
+    }
+    match client
+        .get(format!("http://127.0.0.1:{live}/zlauder/config"))
+        .timeout(remaining())
+        .header("x-zlauder-key", &rec.admin_key)
+        .send()
+    {
+        Ok(r) if r.status().is_success() => {
+            let v: Value = r.json().unwrap_or(Value::Null);
+            let profile = v
+                .pointer("/config/profile")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match v.get("enabled").and_then(Value::as_bool) {
+                Some(true) => (MaskState::Masked, profile),
+                Some(false) => (MaskState::Off, profile),
+                None => unconfirmed,
+            }
+        }
+        _ => unconfirmed,
+    }
+}
+
+/// On an ALLOW turn, post a masking-status line to the model IFF this session crossed the masked
+/// boundary since it was last told (see [`should_narrate`]). Best-effort: an undetermined state
+/// (`None`) or an unkeyable session is simply silent. Always tracks the latest state so the next
+/// turn's delta is computed against reality.
+fn emit_mask_delta(
+    conversation: &str,
+    opted_out: bool,
+    baked_port: Option<u16>,
+    escape_hatch: bool,
+    root: &str,
+) {
+    let Some(cur) = session_mask_state(opted_out, baked_port, escape_hatch, root) else { return };
+    let prev = read_session_mask_state(conversation);
+    if should_narrate(prev, cur.state) {
+        println!(
+            "{}",
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": mask_delta_message(&cur)
+                }
+            })
+        );
+    }
+    // ALWAYS persist, even when unchanged: `should_narrate` already gates the model-facing line, so
+    // the rewrite costs no tokens — but it keeps an actively-masked session's record mtime FRESH so
+    // `prune_stale_status` can't evict a live baseline. If it did, a later `Masked -> Off` would
+    // read `prev == None` and `should_narrate(None, Off) == false` — a SILENT un-masking. The write
+    // is the per-turn activity signal the prune relies on.
+    write_session_mask_state(conversation, cur.state);
 }
 
 /// Outcome of bringing this project's proxy up. The proxy is project-keyed (a record
@@ -2493,6 +2924,20 @@ fn conversation_id_from_hook_payload(stdin: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the submitted prompt text from a UserPromptSubmit hook payload. TOP-LEVEL keys only
+/// (the canonical `prompt` plus casing variants across harness versions) — deliberately NOT the
+/// recursive `find_string_key`: the real user prompt is always a top-level field, and recursing
+/// would risk a nested `prompt` becoming the gate's allow decision on a malformed payload. A
+/// keyless/malformed payload returns `None` → empty prompt → no command match → stays fail-CLOSED.
+fn prompt_from_hook_payload(stdin: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin).ok()?;
+    let obj = value.as_object()?;
+    ["prompt", "user_prompt", "userPrompt"]
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// Extract the durable conversation key embedded in a transcript path: its file
@@ -4365,6 +4810,164 @@ mod route_gate_tests {
         assert!(!intake_should_block(false, true, false, true));
         // Escape hatch wins even over the block state with all other flags set to block.
         assert!(!intake_should_block(false, true, false, true));
+    }
+
+    #[test]
+    fn zlauder_commands_pass_a_closed_intake_gate() {
+        // The recovery levers a user reaches for while the gate is closed all pass.
+        assert!(prompt_is_zlauder_command("/zlauder:disable"));
+        assert!(prompt_is_zlauder_command("/zlauder:enable"));
+        assert!(prompt_is_zlauder_command("/zlauder:status"));
+        // Trailing args/newlines are fine; the prefix is matched at byte 0.
+        assert!(prompt_is_zlauder_command("/zlauder:secrets status"));
+        assert!(prompt_is_zlauder_command("/zlauder:verify\n"));
+
+        // LEADING WHITESPACE is not a slash command (Claude Code recognises `/` only at byte 0),
+        // so it stays gated — it could be ordinary prose carrying PII.
+        assert!(!prompt_is_zlauder_command("  /zlauder:disable"));
+        // A real prompt that merely MENTIONS a command is NOT a launch — it could carry PII, so
+        // it stays gated.
+        assert!(!prompt_is_zlauder_command("should I run /zlauder:disable?"));
+        // Other namespaces, near-misses (no colon), and empty input never open the gate.
+        assert!(!prompt_is_zlauder_command("/other:thing"));
+        assert!(!prompt_is_zlauder_command("/zlauder-ish"));
+        assert!(!prompt_is_zlauder_command("/zlauder"));
+        assert!(!prompt_is_zlauder_command(""));
+        assert!(!prompt_is_zlauder_command("my email is a@b.com"));
+    }
+
+    #[test]
+    fn prompt_extracted_from_hook_payload_or_none() {
+        assert_eq!(
+            prompt_from_hook_payload(r#"{"prompt":"/zlauder:disable","session_id":"abc"}"#)
+                .as_deref(),
+            Some("/zlauder:disable")
+        );
+        // Missing key / non-JSON degrade to None (→ empty prompt → fail-closed block).
+        assert_eq!(prompt_from_hook_payload(r#"{"foo":"bar"}"#), None);
+        assert_eq!(prompt_from_hook_payload("not json"), None);
+    }
+
+    #[test]
+    fn narrate_only_on_crossing_the_masked_boundary() {
+        use MaskState::*;
+        // Fresh masked baseline speaks; a cold open on any NOT-masked state stays silent (don't
+        // nag a session that was never masking — the gate already governs those).
+        assert!(should_narrate(None, Masked));
+        assert!(!should_narrate(None, NotReaching));
+        assert!(!should_narrate(None, Off));
+        assert!(!should_narrate(None, Disabled));
+        // Dropping OUT of masked always speaks (the security-critical delta).
+        assert!(should_narrate(Some(Masked), Off));
+        assert!(should_narrate(Some(Masked), NotReaching));
+        assert!(should_narrate(Some(Masked), Disabled));
+        // Recovery back INTO masked speaks.
+        assert!(should_narrate(Some(NotReaching), Masked));
+        assert!(should_narrate(Some(Disabled), Masked));
+        // Unchanged: silent.
+        assert!(!should_narrate(Some(Masked), Masked));
+        assert!(!should_narrate(Some(Off), Off));
+        // Between two NOT-masked states no boundary is crossed → silent (still unmasked either way).
+        assert!(!should_narrate(Some(Off), NotReaching));
+        assert!(!should_narrate(Some(NotReaching), Disabled));
+        // UnmaskedBypass (deliberate gate bypass = real unmasked egress) announces on first
+        // appearance and then stays silent; dropping out of masked into it, or recovering from it
+        // back to masked, both speak.
+        assert!(should_narrate(None, UnmaskedBypass));
+        assert!(!should_narrate(Some(UnmaskedBypass), UnmaskedBypass));
+        assert!(should_narrate(Some(Masked), UnmaskedBypass));
+        assert!(should_narrate(Some(UnmaskedBypass), Masked));
+    }
+
+    #[test]
+    fn delta_messages_are_factual_status_not_injection_shaped() {
+        let masked = mask_delta_message(&SessionStatus {
+            state: MaskState::Masked,
+            port: 8787,
+            profile: "balanced".to_string(),
+        });
+        assert!(masked.starts_with("ZlauDeR:"));
+        assert!(masked.contains(":8787") && masked.contains("balanced"));
+
+        let off = mask_delta_message(&SessionStatus {
+            state: MaskState::Off,
+            port: 0,
+            profile: String::new(),
+        });
+        assert!(off.contains("/zlauder:privacy")); // points at the re-enable lever
+        let not = mask_delta_message(&SessionStatus {
+            state: MaskState::NotReaching,
+            port: 0,
+            profile: String::new(),
+        });
+        assert!(not.contains("/zlauder:verify")); // offers a verification path
+        let bypass = mask_delta_message(&SessionStatus {
+            state: MaskState::UnmaskedBypass,
+            port: 0,
+            profile: String::new(),
+        });
+        // The one allow-path state where real PII egresses — must say so plainly and name the lever.
+        assert!(bypass.contains("UNMASKED") && bypass.contains("ZLAUDER_NO_INTAKE_GATE"));
+
+        // Every variant is on the announced channel and free of the alarmist / gag register that
+        // made the old stale-port copy read as a prompt injection.
+        for state in [
+            MaskState::Masked,
+            MaskState::Off,
+            MaskState::NotReaching,
+            MaskState::Disabled,
+            MaskState::UnmaskedBypass,
+        ] {
+            let m = mask_delta_message(&SessionStatus { state, port: 8787, profile: "balanced".into() });
+            assert!(m.starts_with("ZlauDeR:"));
+            assert!(!m.contains("Ctrl-C"));
+            assert!(!m.to_ascii_lowercase().contains("never claim"));
+        }
+    }
+
+    #[test]
+    fn mask_state_serializes_snake_case_and_roundtrips() {
+        assert_eq!(serde_json::to_string(&MaskState::NotReaching).unwrap(), "\"not_reaching\"");
+        assert_eq!(
+            serde_json::to_string(&MaskState::UnmaskedBypass).unwrap(),
+            "\"unmasked_bypass\""
+        );
+        assert_eq!(serde_json::from_str::<MaskState>("\"masked\"").unwrap(), MaskState::Masked);
+        assert_eq!(serde_json::from_str::<MaskState>("\"disabled\"").unwrap(), MaskState::Disabled);
+    }
+
+    #[test]
+    fn session_status_record_roundtrips_per_conversation() {
+        let dir = std::env::temp_dir().join(format!("zlauder-ss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Missing record → None (a first message has no baseline yet).
+        assert_eq!(read_mask_state_at(&dir, "conv-a"), None);
+
+        write_mask_state_at(&dir, "conv-a", MaskState::Masked);
+        assert_eq!(read_mask_state_at(&dir, "conv-a"), Some(MaskState::Masked));
+        // Overwrite tracks the latest state.
+        write_mask_state_at(&dir, "conv-a", MaskState::Off);
+        assert_eq!(read_mask_state_at(&dir, "conv-a"), Some(MaskState::Off));
+        // A second session in the same project keeps its OWN baseline.
+        assert_eq!(read_mask_state_at(&dir, "conv-b"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_keeps_fresh_records_and_tolerates_missing_dir() {
+        let dir = std::env::temp_dir().join(format!("zlauder-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_mask_state_at(&dir, "fresh-a", MaskState::Masked);
+        write_mask_state_at(&dir, "fresh-b", MaskState::Off);
+        // Nothing is two weeks old → both survive.
+        prune_stale_status(&dir);
+        assert_eq!(read_mask_state_at(&dir, "fresh-a"), Some(MaskState::Masked));
+        assert_eq!(read_mask_state_at(&dir, "fresh-b"), Some(MaskState::Off));
+        // Pruning a non-existent directory must not panic.
+        prune_stale_status(&dir.join("does-not-exist"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
