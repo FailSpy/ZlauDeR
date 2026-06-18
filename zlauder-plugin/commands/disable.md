@@ -1,7 +1,7 @@
 ---
 description: Stop routing this project through the ZlauDeR proxy (reverts .claude/settings.local.json). Stops routing reliably after a one-time restart (the current session may keep routing until then). `--all` sweeps every plumbed project — run it before uninstalling.
 argument-hint: "[--all]"
-allowed-tools: Bash(bash:*)
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/disable.sh":*)
 # User-only: tearing down routing is a loosen action; the model surfaces it, the user runs it.
 disable-model-invocation: true
 ---

@@ -1,7 +1,7 @@
 ---
 description: Verify ZlauDeR is fully active in THIS session — both masking (the engine) and routing ($ANTHROPIC_BASE_URL) — as two distinct verdicts.
 argument-hint: ""
-allowed-tools: Bash
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/verify.sh":*)
 ---
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/verify.sh"`

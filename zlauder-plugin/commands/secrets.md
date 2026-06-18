@@ -1,7 +1,7 @@
 ---
 description: View ZlauDeR registered-secret status for this project — the readiness gate and which secrets resolved (registered by reference; values are never shown)
 argument-hint: "[status | list]"
-allowed-tools: Bash
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/secrets.sh":*)
 ---
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/secrets.sh" "$ARGUMENTS"`

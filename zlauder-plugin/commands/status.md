@@ -1,7 +1,7 @@
 ---
 description: Show ZlauDeR proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML) for this project — read-only.
 argument-hint: ""
-allowed-tools: Bash(bash:*)
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/privacy.sh":*)
 ---
 
 ZlauDeR status:

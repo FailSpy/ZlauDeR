@@ -1,6 +1,6 @@
 ---
 description: Explicitly route this project's Claude Code through the ZlauDeR masking proxy (writes .claude/settings.local.json, seeds practical zlauder.toml). Usually automatic; masking activates after a one-time restart of Claude Code (ZlauDeR blocks the first unrouted message until then, so nothing sends unmasked).
-allowed-tools: Bash(bash:*)
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/enable.sh":*)
 ---
 
 Script output:

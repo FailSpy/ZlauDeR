@@ -1,7 +1,7 @@
 ---
 description: Print the local ZlauDeR request monitor URL for this project
 argument-hint: ""
-allowed-tools: Bash
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/monitor.sh":*)
 # User-only: the monitor URL is the key-gated control plane and monitor.sh opens a browser on
 # the user's machine — a side effect the model must not trigger. The model surfaces it instead.
 disable-model-invocation: true

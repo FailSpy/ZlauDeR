@@ -1,7 +1,7 @@
 ---
 description: Run the ZlauDeR preflight self-check (loopback / firewall / port footguns) for this project
 argument-hint: ""
-allowed-tools: Bash
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.sh":*)
 ---
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.sh"`
