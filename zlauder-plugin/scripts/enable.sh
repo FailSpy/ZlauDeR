@@ -128,6 +128,7 @@ fi
 
 if [ "$rc" -eq 3 ]; then
   echo "ZlauDeR: already pointed at the proxy; nothing changed."
+  echo "ZlauDeR: masking is PROJECT-SCOPED (this project only). Watch it live with /zlauder:monitor." >&2
   exit 0
 fi
 
@@ -140,6 +141,13 @@ cat >&2 <<'EOF'
   running, but Claude Code applies a route written mid-session only unreliably —
   every session AFTER a restart reads it at startup, which always works. The
   statusline shows "\u21bb ZlauDeR: restart to mask" until it's live, then the shield.
-  Toggle masking anytime with /zlauder:privacy; remove routing with /zlauder:disable.
+
+  This is PROJECT-SCOPED: masking applies only to this project (the routing lives
+  in this project's .claude/settings.local.json). Other projects are untouched
+  until you run /zlauder:enable in each.
+
+  Watch live masking activity with /zlauder:monitor (opens a local web view of
+  what's being masked for this project). Toggle masking anytime with
+  /zlauder:privacy; remove routing with /zlauder:disable.
 ================================================================================
 EOF

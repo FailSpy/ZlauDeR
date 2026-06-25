@@ -37,3 +37,14 @@ categories — which is live and managed with `/zlauder:privacy`; flipping maski
 routing in place (transparent pass-through) and can never strand the session. Confirm both
 with `/zlauder:privacy` (or `/zlauder:privacy status`). Before UNINSTALLING the plugin, the
 user should run `/zlauder:disable --all` so no project is left pointing at a proxy that's gone.
+
+After reporting the result, give the user a **brief onboarding** (a few lines, not a wall of
+text) so they know what just happened and how to use it. Cover, in your own words:
+- **It's project-scoped** — masking is enabled for THIS project only; other projects are
+  untouched until they run `/zlauder:enable` there.
+- **Watch it live** — `/zlauder:monitor` opens a local web view of what's being masked for
+  this project.
+- **The everyday controls** — `/zlauder:privacy` to toggle masking or change what's masked,
+  `/zlauder:verify` to confirm the live state, `/zlauder:disable` to stop routing.
+- **Restart once** to activate (per the activation note above).
+Keep it short and practical — an orientation, not documentation.
