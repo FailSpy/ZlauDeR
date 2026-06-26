@@ -185,6 +185,18 @@ enum Cmd {
         #[command(subcommand)]
         action: CodexConfigAction,
     },
+    /// Codex SessionStart hook delegate: read the SessionStart payload on stdin, verify whether
+    /// THIS Codex session is actually routed through the masking proxy (config route + auth +
+    /// /healthz identity + launch-generation), and emit ONLY a schema-valid
+    /// `hookSpecificOutput.additionalContext` — a NEUTRAL token-handling onboarding when fully
+    /// verified, a warn-only message otherwise, and NEVER an unqualified "masking is active" claim.
+    ///
+    /// SessionStart fires BEFORE any turn egresses, so the effective route is UNOBSERVABLE here;
+    /// the onboarding is the conditional token-contract form, never a live-masking assertion. The
+    /// output schema is `deny_unknown_fields`: emitting a top-level `env` key makes the parse FAIL
+    /// and the context is silently DROPPED, so we emit NO `env` key. Diagnostics go to stderr;
+    /// exit is always 0 in non-error paths (an empty stdout is a valid no-op).
+    CodexSessionStart,
 }
 
 #[derive(Subcommand)]
@@ -418,6 +430,7 @@ fn main() -> Result<()> {
         Cmd::Settings { action } => settings_cmd(action),
         Cmd::CodexAuthCheck { json } => codex_auth_check_cmd(json),
         Cmd::CodexConfig { action } => codex_config_cmd(action),
+        Cmd::CodexSessionStart => codex_session_start_cmd(),
     }
 }
 
@@ -972,6 +985,808 @@ fn codex_config_cmd(action: CodexConfigAction) -> Result<()> {
             println!("model_providers.{id}.base_url = {base_url}");
             Ok(())
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex-session-start — the SessionStart hook verification delegate. Verifies the
+// config route + auth + /healthz identity + launch-generation, and emits ONLY a
+// schema-valid `hookSpecificOutput.additionalContext`: a NEUTRAL token-handling
+// onboarding when fully verified, a warn-only message otherwise — NEVER an
+// unqualified active-masking claim (SessionStart precedes egress, so the effective
+// route is unobservable). See `Cmd::CodexSessionStart`.
+//
+// The pure helpers below (`codex_route_from_config`, `session_start_ms_from_transcript`,
+// `launch_generation_ok`, `codex_session_start_verdict`, `session_start_output_json`) are
+// factored small + side-effect-free so the A7 intake-gate atomic can reuse them.
+// ---------------------------------------------------------------------------
+
+/// The loopback route this Codex session is configured for: `(base_url, port)`, returned IFF the
+/// effective top-level `model_provider` == `id` AND its `base_url` is exactly `http://127.0.0.1:<port>/v1`.
+/// Any other shape (foreign provider, non-loopback host, missing `/v1`, unparseable port) → `None`
+/// = NOT routed through us. Pure: parses the supplied config text, no I/O.
+fn codex_route_from_config(config_text: &str, id: &str) -> Option<(String, u16)> {
+    let doc = config_text.parse::<toml_edit::DocumentMut>().ok()?;
+    let sel = doc
+        .get("model_provider")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())?;
+    if sel != id {
+        return None;
+    }
+    let base_url = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|p| p.get(id))
+        .and_then(|i| i.as_table_like())
+        .and_then(|b| b.get("base_url"))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())?;
+    let port = loopback_v1_port(base_url)?;
+    Some((base_url.to_string(), port))
+}
+
+/// Parse `http://127.0.0.1:<port>/v1` → `<port>`. Requires the exact loopback host, an http scheme,
+/// and a `/v1` suffix (trailing slash tolerated). Anything else → `None`.
+fn loopback_v1_port(base_url: &str) -> Option<u16> {
+    let rest = base_url.strip_prefix("http://127.0.0.1:")?;
+    // Tolerate a trailing slash on the path.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let port_str = rest.strip_suffix("/v1")?;
+    // The port segment must be all digits (no extra path before /v1).
+    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port_str.parse::<u16>().ok()
+}
+
+/// Days in each (1-based) month of `year` (Gregorian, with leap years).
+fn days_in_month(year: i64, month: u32) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+/// The local timezone's offset from UTC, in seconds, for the instant `epoch_secs` (east-of-UTC
+/// positive). This is what reconciles the two launch-generation comparands: the Codex rollout
+/// filename encodes LOCAL naive wall-clock time, while a filesystem mtime is a true UTC epoch — so
+/// the two only compare correctly once the mtime is shifted into the same local-naive frame (see
+/// `config_mtime_local_naive_ms`). On unix we read `localtime_r(...).tm_gmtoff`; on non-unix
+/// (where the Codex hook does not run) we conservatively return `0` (treat local == UTC).
+#[cfg(unix)]
+fn local_utc_offset_secs(epoch_secs: i64) -> i64 {
+    // SAFETY: localtime_r writes into a caller-owned, zeroed `tm`; `t` is a valid pointer to a
+    // local time_t. No aliasing, no retained pointers past the call.
+    unsafe {
+        let t = epoch_secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset_secs(_epoch_secs: i64) -> i64 {
+    0
+}
+
+/// Civil (Y-M-D H:M:S) → ms serial, treating the components as a naive wall-clock (a deterministic
+/// civil→serial conversion, no timezone DB). The Codex rollout filename is LOCAL naive time, so the
+/// result is a LOCAL-NAIVE serial; the launch-generation guard compares it against a config mtime
+/// shifted into the same local-naive frame (see `codex_config_mtime_ms`). Returns `None` on an
+/// out-of-range field.
+fn civil_to_epoch_ms(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {
+    if !(1..=12).contains(&mo) || mi > 59 || s > 59 || h > 23 {
+        return None;
+    }
+    let dim = days_in_month(y, mo);
+    if d < 1 || (d as i64) > dim {
+        return None;
+    }
+    // Days from the Unix epoch (1970-01-01) to the start of this Y-M-D.
+    let mut days: i64 = 0;
+    if y >= 1970 {
+        for yr in 1970..y {
+            days += if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+        }
+    } else {
+        for yr in y..1970 {
+            days -= if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+        }
+    }
+    for m in 1..mo {
+        days += days_in_month(y, m);
+    }
+    days += (d as i64) - 1;
+    let secs = days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (s as i64);
+    Some(secs * 1_000)
+}
+
+/// Parse the SESSION-START timestamp from a Codex transcript (rollout) path. The filename encodes
+/// it as `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl` (the time fields dash-separated). Returns a
+/// LOCAL-NAIVE ms serial (the filename is local wall-clock; see `launch_generation_ok`). `None` for any
+/// path whose basename isn't a parseable `rollout-<ISO>` (fail-closed at the call site).
+fn session_start_ms_from_transcript(transcript_path: &str) -> Option<i64> {
+    // Basename only (tolerate both separators).
+    let base = transcript_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(transcript_path);
+    let stem = base.strip_prefix("rollout-")?;
+    // stem = "YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl". Split on 'T' into date and the rest.
+    let (date, rest) = stem.split_once('T')?;
+    let mut dparts = date.split('-');
+    let y: i64 = dparts.next()?.parse().ok()?;
+    let mo: u32 = dparts.next()?.parse().ok()?;
+    let d: u32 = dparts.next()?.parse().ok()?;
+    if dparts.next().is_some() {
+        return None; // more than 3 date parts → not our shape
+    }
+    // rest = "HH-MM-SS-<uuid>.jsonl"; the first three dash fields are the time.
+    let mut tparts = rest.splitn(4, '-');
+    let h: u32 = tparts.next()?.parse().ok()?;
+    let mi: u32 = tparts.next()?.parse().ok()?;
+    let s: u32 = tparts.next()?.parse().ok()?;
+    // REQUIRE the "<uuid>.jsonl" tail — fail closed on a truncated/ambiguous path. A real rollout
+    // name always carries the uuid + .jsonl suffix; A7's security gate reuses this helper for
+    // launch-generation evidence, so a permissive shape-match here is a narrow fail-open.
+    let tail = tparts.next()?;
+    if !tail.ends_with(".jsonl") || tail.len() <= ".jsonl".len() {
+        return None;
+    }
+    civil_to_epoch_ms(y, mo, d, h, mi, s)
+}
+
+/// LAUNCH-GENERATION guard. Codex resolves its provider AT LAUNCH; a config written DURING a
+/// running session does not route it. `true` IFF a session-start ts was parsed from the transcript
+/// AND `config_mtime_ms <= session_start_ms` (the route was present at launch). FAIL-CLOSED: an
+/// absent/unparseable transcript, or a config mtime NEWER than session-start (written this
+/// session), → `false` → the caller emits the restart/warn variant, never the onboarding.
+fn launch_generation_ok(transcript_path: Option<&str>, config_mtime_ms: i64) -> bool {
+    match transcript_path.and_then(session_start_ms_from_transcript) {
+        Some(session_start_ms) => config_mtime_ms <= session_start_ms,
+        None => false,
+    }
+}
+
+/// Which SessionStart additionalContext variant to emit, decided purely from the four verified
+/// signals. `route` is the parsed loopback route (None ⇒ not configured to route through us).
+/// The ordering is a fail-closed cascade: a failure at any earlier stage short-circuits to its
+/// warn-only variant, and ONLY the fully-verified path reaches `NeutralOnboarding`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionStartVerdict {
+    /// Not configured to route through us → warn-only, no masking claim, no additionalContext-as-claim.
+    NotRouted,
+    /// Configured but no usable exported OpenAI key → requests fail, nothing masked → warn-only.
+    AuthFail,
+    /// Auth ok but the /healthz identity probe couldn't confirm OUR proxy → warn-only.
+    ProxyDown,
+    /// Verified, but the config was written THIS session (not live until restart) → warn-only.
+    RestartNeeded,
+    /// Fully verified at launch → the NEUTRAL token-contract onboarding (NOT an active-masking claim).
+    NeutralOnboarding,
+}
+
+/// PURE decision logic. Returns WHICH variant to emit. The cascade is fail-closed: each stage
+/// gates the next, so a false at any stage degrades to that stage's warn-only verdict and the
+/// onboarding is reachable only when every signal is positively verified.
+fn codex_session_start_verdict(
+    routed: bool,
+    auth_ok: bool,
+    identity_ok: bool,
+    launch_gen_ok: bool,
+) -> SessionStartVerdict {
+    if !routed {
+        return SessionStartVerdict::NotRouted;
+    }
+    if !auth_ok {
+        return SessionStartVerdict::AuthFail;
+    }
+    if !identity_ok {
+        return SessionStartVerdict::ProxyDown;
+    }
+    if !launch_gen_ok {
+        return SessionStartVerdict::RestartNeeded;
+    }
+    SessionStartVerdict::NeutralOnboarding
+}
+
+/// The NEUTRAL token-contract onboarding. Conditional, NOT an unqualified active-masking claim:
+/// it never asserts "masking is active right now" / "your data is hidden", because SessionStart
+/// cannot observe the effective route. It frames the token contract and the per-prompt-verified
+/// caveat, and reminds the model that masking hides data from the PROVIDER, not from the user.
+const CODEX_NEUTRAL_ONBOARDING: &str = "This Codex session is configured to route through ZlauDeR, \
+    a LOCAL PII-masking proxy. If you receive tokens like `[EMAIL_ADDRESS_ab12]` or \
+    `[API_KEY_ab12c3]`, they are tokenized PII placeholders — handle them VERBATIM: do not \
+    over-redact, rewrite, or refuse them. In a routed session the real values are restored locally \
+    before they reach you, so the tokens stand in for the original data. Masking hides data from \
+    the PROVIDER, NOT from the user — never tell the user their data is hidden or redacted from \
+    them. Whether any individual prompt is actually routed is verified separately at send time.";
+
+/// The warn-only additionalContext for a given non-onboarding verdict. Each is explicit that
+/// NOTHING is assumed masked, and tells the user the concrete fix. NotRouted/error paths return
+/// their own copy at the call site (NotRouted still warns; it just isn't reached via this fn for
+/// the onboarding). NEVER an unqualified masking claim.
+fn session_start_warn_text(verdict: SessionStartVerdict) -> &'static str {
+    match verdict {
+        SessionStartVerdict::NotRouted => {
+            "ZlauDeR is installed but this Codex session is NOT routed through the masking proxy. \
+             Run the zlauder-openai enable skill, then restart codex. Do NOT assume any PII is \
+             masked in this session."
+        }
+        SessionStartVerdict::AuthFail => {
+            "ZlauDeR is configured for this Codex session, but no usable OpenAI API key is exported \
+             — Codex requests will FAIL at provider construction and nothing is masked because \
+             nothing is sent. Set OPENAI_API_KEY (sk-...) in your environment and restart codex. \
+             Do NOT assume PII is masked."
+        }
+        SessionStartVerdict::ProxyDown => {
+            "ZlauDeR is configured for this Codex session, but the masking proxy could not be \
+             reached/verified (it may be down, or a foreign listener holds the port). Until the \
+             proxy is confirmed, do NOT assume PII is masked — re-run the zlauder-openai enable \
+             skill or restart codex."
+        }
+        SessionStartVerdict::RestartNeeded => {
+            "ZlauDeR is configured, but this Codex session was started BEFORE routing was enabled \
+             (the config was written after launch). Codex resolves its provider at launch, so this \
+             session is NOT yet routed — restart codex once to activate masking. Until then, do \
+             NOT assume PII is masked."
+        }
+        // The onboarding verdict has no warn text; callers use CODEX_NEUTRAL_ONBOARDING.
+        SessionStartVerdict::NeutralOnboarding => CODEX_NEUTRAL_ONBOARDING,
+    }
+}
+
+/// Build the schema-valid SessionStart hook output for a verdict: exactly
+/// `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"<text>"}}` with NO
+/// top-level `env` key (which would make codex's deny_unknown_fields parse FAIL and silently drop
+/// the context). The `additionalContext` is the neutral onboarding for `NeutralOnboarding`, else
+/// the verdict's warn-only text — never an unqualified masking claim.
+fn session_start_output_json(verdict: SessionStartVerdict) -> Value {
+    let context = if verdict == SessionStartVerdict::NeutralOnboarding {
+        CODEX_NEUTRAL_ONBOARDING
+    } else {
+        session_start_warn_text(verdict)
+    };
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    })
+}
+
+/// Read `$CODEX_HOME/config.toml`'s mtime as a LOCAL-NAIVE epoch-ms comparand for the
+/// launch-generation guard. The mtime is a true UTC epoch, but `session_start_ms_from_transcript`
+/// returns the rollout filename's LOCAL naive wall-clock interpreted as a serial (via
+/// `civil_to_epoch_ms`). To compare in ONE frame, we shift the UTC mtime by the local UTC offset so
+/// it, too, is expressed as local-naive ms. (Without this shift the comparison is off by the local
+/// offset — east-of-UTC, a config written AFTER launch could spuriously pass the guard and yield a
+/// false NeutralOnboarding for an unrouted session.) On ANY failure (missing file, no mtime,
+/// clock-before-epoch, overflow) returns `i64::MAX` — the FAIL-CLOSED value forcing
+/// `launch_generation_ok` to false (restart variant), so an unreadable mtime can never produce a
+/// false onboarding.
+fn codex_config_mtime_ms(path: &Path) -> i64 {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => match mtime.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => {
+                let utc_ms = match i64::try_from(d.as_millis()) {
+                    Ok(ms) => ms,
+                    Err(_) => return i64::MAX,
+                };
+                // Shift UTC → local-naive: add the local offset at this instant (saturating keeps
+                // the fail-closed sentinel intact).
+                let offset_ms = local_utc_offset_secs(utc_ms / 1_000).saturating_mul(1_000);
+                utc_ms.saturating_add(offset_ms)
+            }
+            Err(_) => i64::MAX,
+        },
+        Err(_) => i64::MAX,
+    }
+}
+
+/// Extract `transcript_path` from the SessionStart stdin payload (best-effort). Absent/unparseable
+/// stdin → `None`, which the launch-generation guard treats as fail-closed.
+fn transcript_path_from_payload(stdin: &str) -> Option<String> {
+    string_field_from_payload(stdin, "transcript_path")
+}
+
+/// Extract the SessionStart payload's `cwd` (the Codex session's project directory) — the root that
+/// `ensure_up` / `intake_identity_ok` must run against, NOT the hook process CWD. Absent/unparseable
+/// stdin → `None`; the call site falls back to `project_root()` (fail-closed).
+fn cwd_from_payload(stdin: &str) -> Option<String> {
+    string_field_from_payload(stdin, "cwd")
+}
+
+/// Pull a non-empty top-level string field out of the SessionStart stdin payload (best-effort).
+fn string_field_from_payload(stdin: &str, field: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(stdin.trim()).ok()?;
+    v.get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `zlauder-hooks codex-session-start`. Reads the SessionStart payload on stdin, runs the
+/// config-route / auth / identity / launch-generation verification, and prints the schema-valid
+/// hook output. Exit is always 0 in the non-error path; diagnostics go to stderr.
+fn codex_session_start_cmd() -> Result<()> {
+    // Drain stdin (the SessionStart payload) so the pipe never blocks. Best-effort: an empty or
+    // unparseable payload degrades to a fail-closed (transcript-absent) verdict.
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let transcript_path = transcript_path_from_payload(&stdin);
+    // The SessionStart payload carries the Codex session's project dir as `cwd`. ensure_up /
+    // intake_identity_ok MUST run against THAT root, not the hook process CWD (CLAUDE_PROJECT_DIR is
+    // a Claude-Code var and is unlikely to be set under a Codex hook). Fail closed: fall back to
+    // project_root() only when `cwd` is absent/unparseable.
+    let session_cwd = cwd_from_payload(&stdin);
+
+    let id = CODEX_DEFAULT_PROVIDER_ID;
+    let config_path = match codex_config_path() {
+        Ok(p) => p,
+        Err(e) => {
+            // Can't even resolve CODEX_HOME → not routed; warn, never claim masking.
+            eprintln!("ZlauDeR: cannot resolve $CODEX_HOME ({e}); treating this Codex session as NOT routed.");
+            emit_verdict(SessionStartVerdict::NotRouted);
+            return Ok(());
+        }
+    };
+    let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    // STEP 1/2 — config route. Not our provider / not a loopback /v1 URL → NOT routed.
+    let Some((_base_url, port)) = codex_route_from_config(&config_text, id) else {
+        eprintln!(
+            "ZlauDeR: this Codex session is NOT routed through the masking proxy (no zlauder \
+             loopback provider in {}).",
+            config_path.display()
+        );
+        emit_verdict(SessionStartVerdict::NotRouted);
+        return Ok(());
+    };
+
+    // STEP 3 — auth reachability (the SAME classifier codex-auth-check uses). No usable exported
+    // sk- key → requests fail at provider construction → nothing masked.
+    let (_mode, auth_ok, _unmapped) = detect_codex_auth();
+    if !auth_ok {
+        eprintln!(
+            "ZlauDeR: this Codex session is configured to route, but no usable OPENAI_API_KEY is \
+             exported — requests will fail and nothing is masked."
+        );
+        emit_verdict(SessionStartVerdict::AuthFail);
+        return Ok(());
+    }
+
+    // STEP 4 — warm the proxy, then the 600ms /healthz nonce identity probe (reused unchanged).
+    let root = canonical(&session_cwd.map(PathBuf::from).unwrap_or_else(project_root));
+    match ensure_up(&root, None, &default_proxy_bin()) {
+        Ok(EnsureOutcome::Ours { .. }) => {}
+        Ok(EnsureOutcome::Failed { diag }) => {
+            eprintln!("ZlauDeR: could not bring the masking proxy up — {diag}");
+        }
+        Err(e) => {
+            eprintln!("ZlauDeR: could not bring the masking proxy up: {e}");
+        }
+    }
+    let identity_ok = intake_identity_ok(port, &root);
+    if !identity_ok {
+        eprintln!(
+            "ZlauDeR: configured to route on :{port}, but the masking proxy could not be \
+             identity-verified (down or a foreign listener) — making NO masking claim."
+        );
+        emit_verdict(SessionStartVerdict::ProxyDown);
+        return Ok(());
+    }
+
+    // STEP 5 — launch-generation: a config written DURING this session does not route it. Compare
+    // the session-start timestamp (from the transcript rollout filename) to config.toml's mtime.
+    let config_mtime_ms = codex_config_mtime_ms(&config_path);
+    let launch_gen_ok = launch_generation_ok(transcript_path.as_deref(), config_mtime_ms);
+    if !launch_gen_ok {
+        eprintln!(
+            "ZlauDeR: routing config is present but this Codex session predates it (or the \
+             session-start timestamp could not be parsed) — restart codex once to activate \
+             masking. Making NO masking claim for this session."
+        );
+    }
+
+    let verdict = codex_session_start_verdict(true, true, true, launch_gen_ok);
+    emit_verdict(verdict);
+    Ok(())
+}
+
+/// Print the schema-valid SessionStart hook output for `verdict` to stdout (single line of JSON).
+fn emit_verdict(verdict: SessionStartVerdict) {
+    println!("{}", session_start_output_json(verdict));
+}
+
+#[cfg(test)]
+mod codex_session_start_tests {
+    use super::{
+        CODEX_DEFAULT_PROVIDER_ID, CODEX_NEUTRAL_ONBOARDING, SessionStartVerdict,
+        codex_config_mtime_ms, codex_route_from_config, codex_session_start_verdict,
+        cwd_from_payload, launch_generation_ok, local_utc_offset_secs,
+        session_start_ms_from_transcript, session_start_output_json, transcript_path_from_payload,
+    };
+    use serde_json::Value;
+
+    const ID: &str = CODEX_DEFAULT_PROVIDER_ID;
+
+    // --- codex_route_from_config -------------------------------------------------
+
+    #[test]
+    fn route_matches_our_loopback_v1_provider() {
+        let cfg = "model_provider = \"zlauder\"\n\
+                   [model_providers.zlauder]\n\
+                   base_url = \"http://127.0.0.1:18920/v1\"\n";
+        assert_eq!(
+            codex_route_from_config(cfg, ID),
+            Some(("http://127.0.0.1:18920/v1".to_string(), 18920))
+        );
+    }
+
+    #[test]
+    fn route_none_when_provider_is_foreign() {
+        // Our block exists but the selected provider is someone else's → NOT routed.
+        let cfg = "model_provider = \"openai\"\n\
+                   [model_providers.zlauder]\n\
+                   base_url = \"http://127.0.0.1:18920/v1\"\n";
+        assert_eq!(codex_route_from_config(cfg, ID), None);
+    }
+
+    #[test]
+    fn route_none_when_base_url_not_loopback_v1() {
+        // Selected as our provider, but the URL is not a loopback /v1 endpoint.
+        for url in [
+            "https://api.openai.com/v1",
+            "http://10.0.0.1:18920/v1",
+            "http://127.0.0.1:18920",       // missing /v1
+            "http://127.0.0.1:abc/v1",      // non-numeric port
+            "http://127.0.0.1:18920/extra/v1", // extra path segment
+        ] {
+            let cfg = format!(
+                "model_provider = \"zlauder\"\n[model_providers.zlauder]\nbase_url = \"{url}\"\n"
+            );
+            assert_eq!(codex_route_from_config(&cfg, ID), None, "url={url}");
+        }
+    }
+
+    #[test]
+    fn route_tolerates_trailing_slash() {
+        let cfg = "model_provider = \"zlauder\"\n\
+                   [model_providers.zlauder]\n\
+                   base_url = \"http://127.0.0.1:7777/v1/\"\n";
+        assert_eq!(
+            codex_route_from_config(cfg, ID).map(|(_, p)| p),
+            Some(7777)
+        );
+    }
+
+    // --- session_start_ms_from_transcript ---------------------------------------
+
+    #[test]
+    fn transcript_ts_parses_rollout_filename() {
+        let p = "/home/u/.codex/sessions/2026/06/26/rollout-2026-06-26T15-23-18-2f9c0b1a-1111-2222-3333-444455556666.jsonl";
+        // Expected: 2026-06-26T15:23:18 as epoch ms (civil-as-UTC).
+        // Days from 1970-01-01 to 2026-06-26 computed by the same algorithm.
+        let got = session_start_ms_from_transcript(p).expect("should parse");
+        // Sanity: it must be a positive, second-granular ms value matching the civil time.
+        // Reconstruct via the public helper to avoid hard-coding the constant.
+        assert!(got > 0);
+        assert_eq!(got % 1000, 0, "second granularity");
+        // 15:23:18 within its day = 15*3600 + 23*60 + 18 = 55398 s.
+        let within_day_ms = got - day_floor_ms(got);
+        assert_eq!(within_day_ms, 55_398 * 1000);
+    }
+
+    // Floor an epoch-ms to the start of its UTC day.
+    fn day_floor_ms(ms: i64) -> i64 {
+        let day = 86_400_000;
+        (ms / day) * day
+    }
+
+    #[test]
+    fn transcript_ts_none_for_non_rollout_path() {
+        assert_eq!(session_start_ms_from_transcript("/tmp/notes.txt"), None);
+        assert_eq!(
+            session_start_ms_from_transcript("/x/rollout-not-a-time-uuid.jsonl"),
+            None
+        );
+        assert_eq!(session_start_ms_from_transcript(""), None);
+    }
+
+    #[test]
+    fn transcript_ts_fails_closed_on_truncated_or_tailless_path() {
+        // A truncated rollout name with the time but NO uuid/.jsonl tail must NOT parse — fail
+        // closed (A7's gate reuses this for launch-generation evidence; a permissive parse there
+        // would be a narrow fail-open).
+        assert_eq!(
+            session_start_ms_from_transcript("rollout-2026-06-26T15-23-18"),
+            None,
+            "truncated path (no uuid/.jsonl tail) must fail closed"
+        );
+        // uuid present but wrong suffix → still rejected.
+        assert_eq!(
+            session_start_ms_from_transcript("rollout-2026-06-26T15-23-18-abcd.txt"),
+            None
+        );
+        // empty tail before suffix (just ".jsonl") → rejected.
+        assert_eq!(
+            session_start_ms_from_transcript("rollout-2026-06-26T15-23-18-.jsonl"),
+            None
+        );
+        // the genuine shape still parses.
+        assert!(
+            session_start_ms_from_transcript(
+                "rollout-2026-06-26T15-23-18-2f9c0b1a-1111-2222-3333-444455556666.jsonl"
+            )
+            .is_some()
+        );
+    }
+
+    // --- launch_generation_ok ----------------------------------------------------
+
+    #[test]
+    fn launch_gen_true_when_config_older_than_session_start() {
+        let p = "rollout-2026-06-26T15-23-18-uuid.jsonl";
+        let ss = session_start_ms_from_transcript(p).unwrap();
+        // config written one second BEFORE session start → present at launch → ok.
+        assert!(launch_generation_ok(Some(p), ss - 1000));
+        // Equal mtime is also "present at launch".
+        assert!(launch_generation_ok(Some(p), ss));
+    }
+
+    #[test]
+    fn launch_gen_false_when_config_newer_than_session_start() {
+        let p = "rollout-2026-06-26T15-23-18-uuid.jsonl";
+        let ss = session_start_ms_from_transcript(p).unwrap();
+        // config written AFTER session start → written this session → not yet routing.
+        assert!(!launch_generation_ok(Some(p), ss + 1000));
+    }
+
+    #[test]
+    fn launch_gen_false_when_transcript_unparseable_or_absent() {
+        assert!(!launch_generation_ok(None, 0));
+        assert!(!launch_generation_ok(Some("/tmp/notes.txt"), 0));
+    }
+
+    // --- codex_session_start_verdict (the truth table) ---------------------------
+
+    #[test]
+    fn verdict_truth_table() {
+        use SessionStartVerdict::*;
+        // not routed → NotRouted (the other signals are irrelevant)
+        assert_eq!(codex_session_start_verdict(false, true, true, true), NotRouted);
+        assert_eq!(codex_session_start_verdict(false, false, false, false), NotRouted);
+        // routed + auth_ok=false → AuthFail
+        assert_eq!(codex_session_start_verdict(true, false, true, true), AuthFail);
+        // routed + auth ok + identity_ok=false → ProxyDown
+        assert_eq!(codex_session_start_verdict(true, true, false, true), ProxyDown);
+        // routed + auth ok + identity ok + launch_gen_ok=false → RestartNeeded
+        assert_eq!(codex_session_start_verdict(true, true, true, false), RestartNeeded);
+        // fully verified → NeutralOnboarding
+        assert_eq!(codex_session_start_verdict(true, true, true, true), NeutralOnboarding);
+    }
+
+    // --- emitted JSON shape (schema-valid; NO top-level env key) ------------------
+
+    #[test]
+    fn emitted_json_is_schema_valid_for_every_variant() {
+        use SessionStartVerdict::*;
+        for v in [AuthFail, ProxyDown, RestartNeeded, NeutralOnboarding, NotRouted] {
+            let out = session_start_output_json(v);
+            // Re-parse to be sure it's valid JSON and inspect top-level keys.
+            let parsed: Value = serde_json::from_str(&out.to_string()).unwrap();
+            let obj = parsed.as_object().expect("top-level object");
+            // The ONLY top-level key must be hookSpecificOutput (no env key — that re-introduces
+            // the parse-drop bug under codex's deny_unknown_fields).
+            assert_eq!(obj.len(), 1, "exactly one top-level key for {v:?}: {obj:?}");
+            assert!(obj.contains_key("hookSpecificOutput"), "{v:?}");
+            assert!(!obj.contains_key("env"), "no top-level env key for {v:?}");
+            let hso = obj["hookSpecificOutput"].as_object().expect("hso object");
+            assert_eq!(
+                hso.get("hookEventName").and_then(Value::as_str),
+                Some("SessionStart"),
+                "{v:?}"
+            );
+            assert!(
+                hso.get("additionalContext").and_then(Value::as_str).is_some(),
+                "additionalContext present for {v:?}"
+            );
+        }
+    }
+
+    // --- the onboarding text carries NO unqualified active-masking assertion ------
+
+    #[test]
+    fn neutral_onboarding_makes_no_unqualified_masking_claim() {
+        let text = CODEX_NEUTRAL_ONBOARDING.to_lowercase();
+        // Banned unqualified active-masking phrasings.
+        for banned in [
+            "masking is active",
+            "your data is hidden",
+            "is masking this project",
+            "data is hidden from you",
+            "your data is masked",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "onboarding must not assert {banned:?}: {CODEX_NEUTRAL_ONBOARDING}"
+            );
+        }
+        // The token-handling guidance MUST be present.
+        assert!(text.contains("verbatim"), "token-verbatim guidance present");
+        assert!(
+            text.contains("placeholder"),
+            "token-placeholder guidance present"
+        );
+        // And the provider-not-user caveat must be present.
+        assert!(
+            text.contains("from the provider, not from the user"),
+            "provider-not-user caveat present"
+        );
+    }
+
+    // The same banned-phrase guard, applied to the EMITTED onboarding additionalContext.
+    #[test]
+    fn emitted_onboarding_additional_context_has_no_masking_claim() {
+        let out = session_start_output_json(SessionStartVerdict::NeutralOnboarding);
+        let ctx = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        for banned in ["masking is active", "your data is hidden", "is masking this project"] {
+            assert!(!ctx.contains(banned), "emitted context asserts {banned:?}");
+        }
+    }
+
+    // --- payload field extraction (cwd + transcript_path) [Fix 2] ----------------
+
+    #[test]
+    fn payload_extracts_cwd_and_transcript_path() {
+        let payload = r#"{
+            "session_id": "2f9c0b1a-1111-2222-3333-444455556666",
+            "transcript_path": "/home/u/.codex/sessions/2026/06/26/rollout-2026-06-26T15-23-18-uuid.jsonl",
+            "cwd": "/home/u/Projects/myproj",
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        }"#;
+        assert_eq!(
+            cwd_from_payload(payload).as_deref(),
+            Some("/home/u/Projects/myproj"),
+            "cwd is the Codex session project dir — must drive root, not the hook CWD"
+        );
+        assert_eq!(
+            transcript_path_from_payload(payload).as_deref(),
+            Some("/home/u/.codex/sessions/2026/06/26/rollout-2026-06-26T15-23-18-uuid.jsonl")
+        );
+    }
+
+    #[test]
+    fn payload_fields_none_when_absent_or_unparseable() {
+        // Absent fields → None (call site fails closed to project_root()).
+        assert_eq!(cwd_from_payload(r#"{"session_id":"x"}"#), None);
+        assert_eq!(transcript_path_from_payload(r#"{"session_id":"x"}"#), None);
+        // Empty string is treated as absent.
+        assert_eq!(cwd_from_payload(r#"{"cwd":""}"#), None);
+        // Unparseable stdin → None, never a panic.
+        assert_eq!(cwd_from_payload("not json"), None);
+        assert_eq!(cwd_from_payload(""), None);
+        assert_eq!(transcript_path_from_payload(""), None);
+    }
+
+    // --- config mtime is in the SAME (local-naive) frame as the transcript ts [Fix 1] ---
+    //
+    // The launch-generation guard compares the rollout filename's LOCAL-naive wall-clock against
+    // config.toml's mtime. The mtime is a true UTC epoch, so codex_config_mtime_ms MUST shift it by
+    // the local UTC offset into the local-naive frame — otherwise the comparison is off by the
+    // offset (east-of-UTC: a config written after launch spuriously passes the guard).
+    #[test]
+    fn config_mtime_is_local_naive_frame() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Pick a fixed UTC instant and stamp a temp file's mtime to it.
+        let utc_secs: i64 = 1_750_000_000; // some 2025 instant
+        let path = std::env::temp_dir().join(format!(
+            "zlauder_a2_mtime_test_{}_{}.toml",
+            std::process::id(),
+            utc_secs
+        ));
+        std::fs::write(&path, b"model_provider = \"zlauder\"\n").expect("write temp config");
+        let target = UNIX_EPOCH + Duration::from_secs(utc_secs as u64);
+        // Set the file's mtime to the known UTC instant.
+        filetime_set(&path, target);
+
+        let got = codex_config_mtime_ms(&path);
+        let _ = std::fs::remove_file(&path);
+
+        // Expected: the UTC ms shifted into local-naive by the local offset at that instant.
+        let offset_ms = local_utc_offset_secs(utc_secs) * 1000;
+        let expected_local_naive_ms = utc_secs * 1000 + offset_ms;
+        assert_eq!(
+            got, expected_local_naive_ms,
+            "config mtime must be expressed in the local-naive frame (UTC + local offset)"
+        );
+
+        // And critically: it must compare correctly against a same-instant transcript ts that
+        // EXPRESSES that local wall-clock in its filename. Build such a filename from the local
+        // civil components of `target` and assert the guard sees them as equal-at-launch.
+        let p = rollout_path_for_local_naive_ms(expected_local_naive_ms);
+        let ss = session_start_ms_from_transcript(&p).expect("rollout parses");
+        assert_eq!(
+            ss, got,
+            "a config saved at the SAME instant the session launched must read equal, not offset"
+        );
+        assert!(
+            launch_generation_ok(Some(&p), got),
+            "equal mtime == session-start is 'present at launch'"
+        );
+    }
+
+    /// Stamp `path`'s mtime to `when` via std's cross-platform `FileTimes` (no filetime crate).
+    fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
+        let times = std::fs::FileTimes::new().set_modified(when);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for times");
+        f.set_times(times).expect("set_times");
+    }
+
+    /// Build a `rollout-<local-ISO>-uuid.jsonl` filename whose encoded wall-clock equals the given
+    /// local-naive ms serial (the same serial `session_start_ms_from_transcript` will parse back).
+    fn rollout_path_for_local_naive_ms(local_naive_ms: i64) -> String {
+        let secs = local_naive_ms / 1000;
+        let day = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+        let (y, mo, d) = civil_from_days(day);
+        format!(
+            "/sessions/rollout-{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}-deadbeef.jsonl"
+        )
+    }
+
+    /// Inverse of the civil→days math in `civil_to_epoch_ms`: days-since-epoch → (Y, M, D).
+    fn civil_from_days(mut days: i64) -> (i64, u32, u32) {
+        let mut year: i64 = 1970;
+        loop {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            let dy = if leap { 366 } else { 365 };
+            if days >= dy {
+                days -= dy;
+                year += 1;
+            } else if days < 0 {
+                year -= 1;
+                let leap2 = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+                days += if leap2 { 366 } else { 365 };
+            } else {
+                break;
+            }
+        }
+        let dim = |m: u32| -> i64 {
+            match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 => {
+                    if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 { 29 } else { 28 }
+                }
+                _ => 0,
+            }
+        };
+        let mut month: u32 = 1;
+        while days >= dim(month) {
+            days -= dim(month);
+            month += 1;
+        }
+        (year, month, (days + 1) as u32)
     }
 }
 
