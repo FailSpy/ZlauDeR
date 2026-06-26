@@ -916,19 +916,19 @@ fn codex_disable_merge(current: &str, id: &str) -> CodexMergeOutcome {
         doc.remove("model_providers");
     }
 
-    // Restore the top-level model_provider.
-    match saved_prior {
-        Some(prior) => {
-            doc["model_provider"] = toml_edit::value(prior);
-        }
-        None => {
-            // No saved prior: drop our top-level key only if it still points at us.
-            let points_at_us = doc
-                .get("model_provider")
-                .and_then(|i| i.as_value())
-                .and_then(|v| v.as_str())
-                == Some(id);
-            if points_at_us {
+    // Restore the top-level model_provider — but ONLY if it STILL points at us. If the user changed
+    // `model_provider` to a different provider AFTER enabling (a newer selection), do NOT clobber it
+    // with the stale prior we saved; leave their choice untouched.
+    let currently_ours = doc
+        .get("model_provider")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        == Some(id);
+    if currently_ours {
+        match saved_prior {
+            // It still points at us: restore the prior we recorded, or drop the key if none saved.
+            Some(prior) => doc["model_provider"] = toml_edit::value(prior),
+            None => {
                 doc.remove("model_provider");
             }
         }
@@ -937,24 +937,29 @@ fn codex_disable_merge(current: &str, id: &str) -> CodexMergeOutcome {
     CodexMergeOutcome::Changed(doc.to_string())
 }
 
-/// The two Codex hook events we wire (SessionStart + UserPromptSubmit) paired with the basename of
-/// the wrapper script that handles each. Ownership on disable is determined by matching a hook
-/// command against these basenames — so removing OUR entries never touches a user's own hooks.
+/// The two Codex hook events we wire (SessionStart + UserPromptSubmit) paired with the script name
+/// of the wrapper that handles each. Ownership on disable is determined by matching a hook command
+/// against the trailing `scripts/<name>` path components (see `codex_hook_command_is_ours`) — so
+/// removing OUR entries never touches a user's own hooks.
 const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("SessionStart", "codex-session-start.sh"),
     ("UserPromptSubmit", "codex-user-prompt-submit.sh"),
 ];
 
-/// Does `command` reference one of OUR hook scripts (by basename)? A user hook with a different
-/// command basename is foreign and must be preserved. The match is on the trailing path component
-/// so it is robust to whatever absolute `hooks-dir` the plugin resolved.
+/// Does `command` reference one of OUR hook scripts? Ownership is a PATH-COMPONENT match on the
+/// trailing `scripts/<script>` (the last two components must be exactly `scripts` then `<script>`),
+/// robust to whatever absolute `hooks-dir` the plugin resolved (enable always writes
+/// `<hooks_dir>/<script>` with `hooks_dir` ending in `/scripts`). A user hook with a different name,
+/// a bare command, or one under a directory merely *ending* in "scripts" is foreign and preserved.
 fn codex_hook_command_is_ours(command: &str, script: &str) -> bool {
-    command
-        .rsplit(['/', '\\'])
-        .next()
-        .map(|base| base == script)
-        .unwrap_or(false)
-        || command == script
+    // PATH-COMPONENT match: the command's last two path components must be exactly `scripts` then
+    // `<script>` (split on either separator). `enable` always writes `<hooks_dir>/<script>` with
+    // hooks_dir ending in `/scripts`, so our own entries always match. This rejects a bare `<script>`
+    // (no `scripts` parent) AND a user hook under a directory whose basename merely ENDS in "scripts"
+    // (e.g. `/home/u/user-scripts/<script>`) — a plain `ends_with("scripts/<script>")` would
+    // false-claim that as ours and let enable rewrite / disable delete a foreign user hook.
+    let mut comps = command.rsplit(['/', '\\']);
+    comps.next() == Some(script) && comps.next() == Some("scripts")
 }
 
 /// PURE [hooks]-merge for ENABLE: given the current config text and the absolute `hooks_dir`,
@@ -1142,25 +1147,55 @@ fn codex_hooks_disable_merge(current: &str) -> (String, bool) {
         let Some(arr) = hooks_tbl.get_mut(event).and_then(|i| i.as_array_of_tables_mut()) else {
             continue;
         };
-        // Drop any group whose inner hooks reference OUR script basename.
-        arr.retain(|grp| {
-            let is_ours = grp
-                .get("hooks")
-                .and_then(|i| i.as_array())
-                .map(|inner| {
-                    inner.iter().any(|h| {
-                        h.as_inline_table()
-                            .and_then(|t| t.get("command"))
-                            .and_then(|v| v.as_str())
-                            .map(|c| codex_hook_command_is_ours(c, script))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if is_ours {
-                changed = true;
+        // Remove ONLY our hook entries from each group's `hooks` list, preserving any co-located
+        // USER hooks. Do NOT drop a whole MatcherGroup just because it also contains one of ours —
+        // that would delete a user hook sharing the group. The inner `hooks` may be either an inline
+        // array (`hooks = [ {..} ]`, the form `enable` writes) OR an array-of-tables
+        // (`[[..hooks]]`, a valid user-authored shape) — handle both.
+        for grp in arr.iter_mut() {
+            let Some(item) = grp.get_mut("hooks") else {
+                continue;
+            };
+            if let Some(inner) = item.as_array_mut() {
+                let before = inner.len();
+                inner.retain(|h| {
+                    !h.as_inline_table()
+                        .and_then(|t| t.get("command"))
+                        .and_then(|v| v.as_str())
+                        .map(|c| codex_hook_command_is_ours(c, script))
+                        .unwrap_or(false)
+                });
+                if inner.len() != before {
+                    changed = true;
+                }
+            } else if let Some(inner) = item.as_array_of_tables_mut() {
+                let before = inner.len();
+                inner.retain(|t| {
+                    !t.get("command")
+                        .and_then(|v| v.as_value())
+                        .and_then(|v| v.as_str())
+                        .map(|c| codex_hook_command_is_ours(c, script))
+                        .unwrap_or(false)
+                });
+                if inner.len() != before {
+                    changed = true;
+                }
             }
-            !is_ours
+        }
+        // Drop groups whose `hooks` list is now empty (ours was the only entry); keep groups that
+        // still hold user hooks, and groups with no `hooks` key (an untouched user shape).
+        arr.retain(|grp| {
+            grp.get("hooks")
+                .map(|i| {
+                    if let Some(a) = i.as_array() {
+                        !a.is_empty()
+                    } else if let Some(a) = i.as_array_of_tables() {
+                        !a.is_empty()
+                    } else {
+                        true // unknown shape → keep (do not silently drop a user's group)
+                    }
+                })
+                .unwrap_or(true)
         });
         // Drop the now-empty event array.
         if arr.is_empty() {
@@ -2453,7 +2488,7 @@ mod codex_session_start_tests {
 mod codex_config_tests {
     use super::{
         CODEX_DEFAULT_PROVIDER_ID, CodexMergeOutcome, codex_disable_merge, codex_enable_merge,
-        codex_hooks_disable_merge, codex_hooks_enable_merge,
+        codex_hook_command_is_ours, codex_hooks_disable_merge, codex_hooks_enable_merge,
     };
 
     const URL: &str = "http://127.0.0.1:18920/v1";
@@ -2672,7 +2707,11 @@ mod codex_config_tests {
     // ---- [hooks]-merge: ownership-aware SessionStart + UserPromptSubmit wiring ----
 
     /// Count MatcherGroups under `[hooks.<event>]` whose inner command basename equals `script`.
+    /// Inspects BOTH inner-hooks shapes (inline array `hooks = [{..}]` and array-of-tables
+    /// `[[..hooks]]`) so the count is meaningful regardless of how the group was authored.
     fn count_our_hook(d: &toml_edit::DocumentMut, event: &str, script: &str) -> usize {
+        // Use the PRODUCTION ownership matcher so the count can never silently diverge from it.
+        let is_ours = |c: &str| codex_hook_command_is_ours(c, script);
         d.get("hooks")
             .and_then(|h| h.as_table_like())
             .and_then(|h| h.get(event))
@@ -2681,18 +2720,32 @@ mod codex_config_tests {
                 groups
                     .iter()
                     .filter(|grp| {
-                        grp.get("hooks")
+                        let item = grp.get("hooks");
+                        let inline = item
                             .and_then(|i| i.as_array())
                             .map(|inner| {
                                 inner.iter().any(|h| {
                                     h.as_inline_table()
                                         .and_then(|t| t.get("command"))
                                         .and_then(|v| v.as_str())
-                                        .map(|c| c.rsplit('/').next() == Some(script))
+                                        .map(|c| is_ours(c))
                                         .unwrap_or(false)
                                 })
                             })
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        let aot = item
+                            .and_then(|i| i.as_array_of_tables())
+                            .map(|inner| {
+                                inner.iter().any(|t| {
+                                    t.get("command")
+                                        .and_then(|v| v.as_value())
+                                        .and_then(|v| v.as_str())
+                                        .map(|c| is_ours(c))
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false);
+                        inline || aot
                     })
                     .count()
             })
@@ -2951,6 +3004,99 @@ mod codex_config_tests {
         // A second disable is a no-op.
         let (_again, ch2) = codex_hooks_disable_merge(&disabled);
         assert!(!ch2, "disable on a config with no hooks must be a no-op");
+    }
+
+    // CUMULATIVE-GATE HIGH: a user hook MANUALLY co-located with ours in the SAME MatcherGroup must
+    // survive disable (remove only OUR entry from the group's hooks array, never the whole group).
+    #[test]
+    fn hooks_disable_preserves_user_hook_co_located_in_same_group() {
+        let co_located = format!(
+            "[[hooks.SessionStart]]\n\
+             matcher = \"*\"\n\
+             [[hooks.SessionStart.hooks]]\n\
+             type = \"command\"\n\
+             command = \"/home/me/user-hook.sh\"\n\
+             [[hooks.SessionStart.hooks]]\n\
+             type = \"command\"\n\
+             command = \"{HOOKS_DIR}/codex-session-start.sh\"\n"
+        );
+        let (disabled, ch) = codex_hooks_disable_merge(&co_located);
+        assert!(ch, "disable must remove our co-located entry");
+        let d = doc(&disabled);
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            0,
+            "our entry must be removed from the shared group:\n{disabled}"
+        );
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            1,
+            "the shared group must SURVIVE (it still holds the user hook):\n{disabled}"
+        );
+        assert!(
+            disabled.contains("/home/me/user-hook.sh"),
+            "KILL: user hook co-located with ours was deleted on disable:\n{disabled}"
+        );
+    }
+
+    // CUMULATIVE-GATE HIGH: ownership is the trailing `scripts/<name>` path, NOT a bare basename —
+    // a user's own hook that merely shares our FILENAME elsewhere must NOT be treated as ours.
+    #[test]
+    fn hook_ownership_requires_scripts_path_not_bare_basename() {
+        assert!(!codex_hook_command_is_ours(
+            "/home/u/codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        assert!(!codex_hook_command_is_ours(
+            "/home/u/bin/codex-user-prompt-submit.sh",
+            "codex-user-prompt-submit.sh"
+        ));
+        // PATH-COMPONENT boundary: a dir whose basename merely ENDS in "scripts" is NOT a `scripts`
+        // path component, so a same-named user hook under it must NOT be claimed as ours.
+        assert!(!codex_hook_command_is_ours(
+            "/home/me/user-scripts/codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        assert!(!codex_hook_command_is_ours(
+            "/home/me/myscripts/codex-user-prompt-submit.sh",
+            "codex-user-prompt-submit.sh"
+        ));
+        // A bare command (no `scripts` parent) is not ours either.
+        assert!(!codex_hook_command_is_ours(
+            "codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        // Ours, written under the plugin's scripts/ dir, IS recognized (abs + relative).
+        assert!(codex_hook_command_is_ours(
+            "/opt/p/codex-zlauder-plugin/scripts/codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        assert!(codex_hook_command_is_ours(
+            "scripts/codex-user-prompt-submit.sh",
+            "codex-user-prompt-submit.sh"
+        ));
+    }
+
+    // CUMULATIVE-GATE MED: disable must NOT restore the saved prior model_provider over a NEWER user
+    // selection (the user switched model_provider away from us after enabling).
+    #[test]
+    fn disable_does_not_clobber_newer_user_provider() {
+        let enabled = changed(codex_enable_merge("model_provider = \"openai\"\n", ID, URL));
+        let switched = enabled.replace(
+            "model_provider = \"zlauder\"",
+            "model_provider = \"anthropic\"",
+        );
+        assert!(
+            switched.contains("model_provider = \"anthropic\""),
+            "setup: provider switched away from us"
+        );
+        let out = changed(codex_disable_merge(&switched, ID));
+        let d = doc(&out);
+        assert_eq!(
+            provider_of(&d),
+            Some("anthropic"),
+            "disable must NOT clobber the user's newer model_provider with the saved prior:\n{out}"
+        );
     }
 }
 

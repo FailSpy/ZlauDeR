@@ -7,29 +7,32 @@
 # gate: it BLOCKs an unrouted prompt and ALLOWs (optionally with a non-blocking
 # override-warn) a confirmed-routed one.
 #
-# DEGRADE-TO-ALLOW (documented limitation): the fail-closed gate lives in the
-# SUBCOMMAND, which needs the binary to run. When zlauder-hooks cannot be
-# resolved AT ALL, this wrapper cannot compute the gate, so it prints `{}` (ALLOW)
-# and exits 0 rather than wedging the session. The fail-closed BLOCK only applies
-# when the binary IS available; a session with no zlauder install therefore
-# degrades to ALLOW. Diagnostics go to stderr; stdout must stay valid hook JSON.
+# FAIL-CLOSED (security boundary): the gate proper lives in the SUBCOMMAND, but the
+# SECURITY DEFAULT does NOT depend on it. When zlauder-hooks cannot be resolved AT
+# ALL, this wrapper cannot confirm the prompt is routed through the masking proxy,
+# so it emits a hard BLOCK ({"decision":"block","reason":...}) — it must NOT degrade
+# to ALLOW, or an unconfigured session would egress PII unmasked. The block reason
+# tells the user how to recover (restore the plugin/binary, or remove the zlauder
+# [hooks] from $CODEX_HOME/config.toml to opt out). stdout stays valid hook JSON.
 set -euo pipefail
+
+# The fail-closed block payload (non-empty reason — codex drops a block with an empty reason).
+ZL_BLOCK='{"decision":"block","reason":"ZlauDeR intake gate unavailable (the plugin binary could not be resolved) — this Codex prompt cannot be confirmed routed through the masking proxy, so it is blocked to avoid egressing PII unmasked. Restore the zlauder plugin/binary on PATH, or remove the zlauder [hooks] from $CODEX_HOME/config.toml to opt out."}'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_resolve-bins.sh
-# Guard the source itself: if _resolve-bins.sh is missing/unreadable or errors at
-# its own top-level under set -e, degrade-to-ALLOW with valid hook JSON rather than
-# exiting non-zero having printed nothing (same degrade-to-ALLOW limitation as a
-# fully-unresolvable binary).
+# Guard the source itself: if _resolve-bins.sh is missing/unreadable or errors at its
+# own top-level under set -e, FAIL CLOSED (block) with valid hook JSON rather than
+# exiting non-zero having printed nothing (or, worse, allowing).
 if ! { [ -r "$SCRIPT_DIR/_resolve-bins.sh" ] && . "$SCRIPT_DIR/_resolve-bins.sh"; }; then
-  printf '%s\n' "ZlauDeR: could not source resolver; intake gate degraded to ALLOW." >&2
-  printf '{}\n'
+  printf '%s\n' "ZlauDeR: could not source resolver; FAIL-CLOSED (blocking this prompt)." >&2
+  printf '%s\n' "$ZL_BLOCK"
   exit 0
 fi
 
 if ! zlauder_resolve_bins; then
-  printf '%s\n' "ZlauDeR: could not resolve zlauder-hooks; intake gate degraded to ALLOW." >&2
-  printf '{}\n'
+  printf '%s\n' "ZlauDeR: could not resolve zlauder-hooks; FAIL-CLOSED (blocking this prompt)." >&2
+  printf '%s\n' "$ZL_BLOCK"
   exit 0
 fi
 
