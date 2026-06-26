@@ -36,6 +36,12 @@ const MAX_TRACKED_CONVERSATIONS: usize = 1024;
 /// should hold a whole session's distinct values), oldest-evicted past it — a real
 /// bound, logged when it trips, never a silent truncation.
 const MAX_SESSION_TOKENS: usize = 5000;
+/// Default "recent inbound" window (ms) for the per-session inbound observability
+/// endpoint. A session whose newest recorded inbound is older than this is reported
+/// as NOT routed-recently — long enough to cover a normal lull between turns, short
+/// enough that a `-c`/`-p` provider override (which sends ZERO inbound for the id)
+/// stops reading as routed within minutes.
+pub(crate) const ROUTED_RECENTLY_WINDOW_MS: u128 = 10 * 60 * 1000;
 
 /// Domain-level failure of a state mutation keyed by request id. The web layer
 /// maps this to an HTTP status; the state layer stays framework-free.
@@ -169,6 +175,37 @@ impl Monitor {
             approval_timeout_secs: APPROVAL_TIMEOUT_SECS,
             session_tokens,
         }
+    }
+
+    /// READ-ONLY observability: has inbound for `conversation_id` reached this proxy
+    /// within `window` ms? Returns `(routed_recently, last_seen_ms)`:
+    ///   * `last_seen_ms` is the timestamp of the conversation's newest recorded
+    ///     inbound, or `None` if the proxy has never seen this id.
+    ///   * `routed_recently` is `true` IFF a `last_seen` entry exists AND is within the
+    ///     window of now.
+    ///
+    /// This reflects ONLY actual recorded inbound — it is NEVER driven by proxy
+    /// liveness or config-on-disk. A `-c`/`-p` provider override (config says zlauder
+    /// but traffic went straight to the upstream) records ZERO inbound for the id, so
+    /// this correctly reports `(false, None)`. It performs no mutation and must never
+    /// block a request or drive a masking claim.
+    pub fn routed_recently(&self, conversation_id: &str, window: u128) -> (bool, Option<u128>) {
+        let inner = self.inner.lock().expect("monitor mutex poisoned");
+        let last_seen = inner.last_seen.get(conversation_id).copied();
+        let recent = match last_seen {
+            Some(ts) => now_ms().saturating_sub(ts) <= window,
+            None => false,
+        };
+        (recent, last_seen)
+    }
+
+    /// Test-only: directly seed a `last_seen` entry for `conversation_id`. Mirrors the
+    /// single write the inbound recording path performs, without driving a full request,
+    /// so the observability accessor + endpoint can be tested in isolation.
+    #[cfg(test)]
+    pub(crate) fn seed_last_seen(&self, conversation_id: &str, ts_ms: u128) {
+        let mut inner = self.inner.lock().expect("monitor mutex poisoned");
+        inner.last_seen.insert(conversation_id.to_string(), ts_ms);
     }
 
     /// Fold a request's masking manifest into the durable session-token ledger.
@@ -1752,6 +1789,30 @@ mod tests {
             .expect("session token survives record eviction");
         assert_eq!(entry.value, "alice@example.com");
         assert!(entry.peekable);
+    }
+
+    #[test]
+    fn routed_recently_reflects_only_recorded_inbound_within_window() {
+        let m = Monitor::new();
+
+        // Never-seen id: not routed, no last_seen.
+        let (recent, ts) = m.routed_recently("never-seen", ROUTED_RECENTLY_WINDOW_MS);
+        assert!(!recent, "an id with no inbound must not read as routed");
+        assert_eq!(ts, None, "no inbound → last_seen_ms is None");
+
+        // Inbound recorded just now: routed, with a timestamp.
+        let now = now_ms();
+        m.seed_last_seen("codex-sess", now);
+        let (recent, ts) = m.routed_recently("codex-sess", ROUTED_RECENTLY_WINDOW_MS);
+        assert!(recent, "inbound within the window → routed_recently");
+        assert_eq!(ts, Some(now));
+
+        // Stale inbound (older than the window): last_seen exists but NOT routed-recently.
+        let stale = now.saturating_sub(ROUTED_RECENTLY_WINDOW_MS + 1);
+        m.seed_last_seen("stale-sess", stale);
+        let (recent, ts) = m.routed_recently("stale-sess", ROUTED_RECENTLY_WINDOW_MS);
+        assert!(!recent, "inbound older than the window must not read as routed");
+        assert_eq!(ts, Some(stale), "but the last_seen timestamp is still reported");
     }
 
     #[test]

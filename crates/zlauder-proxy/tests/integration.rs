@@ -1596,3 +1596,100 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A8: READ-ONLY per-session inbound observability. `GET /zlauder/session/{id}/routed`
+// reports `routed_recently:false` for an id with no inbound, flips to `true` after a
+// real inbound (keyed off Codex's `session-id` header — the override-detection case),
+// and is key-gated like the rest of the control plane.
+#[tokio::test]
+async fn session_routed_reflects_inbound_and_is_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "obs-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // The Codex session id (sent as the `session-id`/`thread-id` headers — Codex never
+    // sends `x-zlauder-conversation`).
+    let sid = "019f0504-a6af-7253-8f6e-b6a41e31d7c4";
+
+    // 1) No inbound yet for this id → routed_recently:false, last_seen_ms:null.
+    let before: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/session/{sid}/routed"))
+        .header("x-zlauder-key", "obs-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["routed_recently"], serde_json::json!(false));
+    assert_eq!(before["last_seen_ms"], serde_json::Value::Null);
+
+    // 2) Drive a real inbound carrying ONLY the Codex `session-id`/`thread-id` headers.
+    // This proves the proxy reads the Codex header into the conversation key — without
+    // that, the inbound would key as missing and the endpoint could never attribute it.
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-api-key", "sk-secret-123")
+        .header("anthropic-version", "2023-06-01")
+        .header("session-id", sid)
+        .header("thread-id", sid)
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hello"}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    // 3) The endpoint now attributes that inbound to the session id.
+    let after: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/session/{sid}/routed"))
+        .header("x-zlauder-key", "obs-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["routed_recently"],
+        serde_json::json!(true),
+        "inbound keyed by Codex session-id must read as routed_recently"
+    );
+    assert!(
+        after["last_seen_ms"].as_u64().is_some(),
+        "last_seen_ms must be a timestamp after inbound: {after}"
+    );
+
+    // A different, never-seen id is still not routed (no false positive on liveness).
+    let other: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/session/never-seen-id/routed"))
+        .header("x-zlauder-key", "obs-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(other["routed_recently"], serde_json::json!(false));
+    assert_eq!(other["last_seen_ms"], serde_json::Value::Null);
+
+    // 4) Key-gated: no `x-zlauder-key` → 403, exactly like the rest of the control plane.
+    let unauth = client
+        .get(format!("http://{proxy_addr}/zlauder/session/{sid}/routed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), reqwest::StatusCode::FORBIDDEN);
+}
