@@ -197,6 +197,21 @@ enum Cmd {
     /// and the context is silently DROPPED, so we emit NO `env` key. Diagnostics go to stderr;
     /// exit is always 0 in non-error paths (an empty stdout is a valid no-op).
     CodexSessionStart,
+    /// Codex UserPromptSubmit hook delegate: the fail-CLOSED Codex intake gate. Reads the
+    /// UserPromptSubmit payload on stdin and BLOCKS (`{"decision":"block","reason":<non-empty>}`) an
+    /// unmasked Codex prompt UNLESS the session is confirmed routed through OUR live proxy
+    /// (config-selects-zlauder-loopback AND /healthz identity AND launch-generation), OR the project
+    /// is opted out, OR the `ZLAUDER_NO_INTAKE_GATE` escape hatch is truthy, OR the prompt is a
+    /// byte-0 `/zlauder:` control command.
+    ///
+    /// Unlike the Claude gate, an UNCONFIGURED Codex session (no zlauder provider) BLOCKs — its PII
+    /// would egress unmasked, so there is NO `plumbed` term; `route_confirmed == false ⇒ BLOCK`. The
+    /// BLOCK decision is computed entirely from facts checkable AT INTAKE without egress (no A8/inbound
+    /// conjunct — that would deadlock turn 1). On an ALLOW it ALSO emits a NON-blocking
+    /// `additionalContext` override-warn from the 2nd+ allowed prompt when A8 reports zero inbound for
+    /// the session (a likely `-c`/`-p` provider override) — detect+warn only, never a block, and
+    /// gracefully absent when A8 is unreachable.
+    CodexUserPromptSubmit,
 }
 
 #[derive(Subcommand)]
@@ -431,6 +446,7 @@ fn main() -> Result<()> {
         Cmd::CodexAuthCheck { json } => codex_auth_check_cmd(json),
         Cmd::CodexConfig { action } => codex_config_cmd(action),
         Cmd::CodexSessionStart => codex_session_start_cmd(),
+        Cmd::CodexUserPromptSubmit => codex_user_prompt_submit_cmd(),
     }
 }
 
@@ -1406,6 +1422,331 @@ fn codex_session_start_cmd() -> Result<()> {
 /// Print the schema-valid SessionStart hook output for `verdict` to stdout (single line of JSON).
 fn emit_verdict(verdict: SessionStartVerdict) {
     println!("{}", session_start_output_json(verdict));
+}
+
+// ===========================================================================
+// codex-user-prompt-submit (A7): the fail-CLOSED Codex intake gate
+// ===========================================================================
+
+/// The non-empty BLOCK reason — codex's `parse_user_prompt_submit` DROPS a block with an
+/// empty/absent reason (invalid_block_reason → fail-OPEN), so this MUST stay non-empty.
+const CODEX_INTAKE_BLOCK_REASON: &str = "ZlauDeR: this Codex session is not confirmed routed \
+    through the masking proxy (not enabled / proxy down / not restarted since enable) — your PII \
+    would egress UNMASKED. Run the zlauder-openai enable skill and restart codex, or /zlauder:verify. \
+    To send anyway, set ZLAUDER_NO_INTAKE_GATE=1.";
+
+/// The non-blocking override-warn additionalContext — emitted ALONGSIDE an ALLOW (no `decision`
+/// field) when the config selects the proxy but A8 sees no traffic from this session (a likely
+/// `-c`/`-p` provider override defeating the route).
+const CODEX_OVERRIDE_WARN: &str = "ZlauDeR: this Codex session's config selects the masking proxy, \
+    but no traffic from this session has reached it — if you launched codex with -p/-c overriding \
+    the provider, your PII is NOT being masked. Restart without the override, or run /zlauder:verify.";
+
+/// The NEW Codex intake predicate — distinct from the CLAUDE `intake_should_block_verified`, which
+/// ALLOWs whenever `plumbed == false`. For Codex the goal is the OPPOSITE: an UNCONFIGURED session
+/// (no zlauder provider ⇒ `route_confirmed == false`) must BLOCK its PII. There is NO `plumbed` term
+/// — its absence IS the fix. BLOCK iff not escape-hatched, not opted out, and the route is NOT
+/// confirmed. Every ALLOW path (route confirmed, opted out, escape hatch) returns false here; the
+/// `/zlauder:` passthrough is handled at the call site (not a predicate input).
+fn codex_intake_should_block(opted_out: bool, route_confirmed: bool, escape_hatch: bool) -> bool {
+    !escape_hatch && !opted_out && !route_confirmed
+}
+
+/// `route_confirmed` — computed from the SAME three facts A2's SessionStart gathers, ALL checkable
+/// at intake WITHOUT egress: (a) config selects our zlauder loopback `/v1` provider, (b) the
+/// `/healthz` nonce identity probe confirms OUR live proxy on that port, (c) launch-generation (the
+/// session was launched AFTER the route was written). There is deliberately NO `not-overridden` and
+/// NO A8-inbound conjunct — both would deadlock turn 1 (the intake hook fires BEFORE the first prompt
+/// egresses, so requiring a prior inbound to ALLOW never bootstraps). Pure for testing.
+fn codex_route_confirmed(
+    config_selects_loopback: bool,
+    identity_ok: bool,
+    launch_generation_ok: bool,
+) -> bool {
+    config_selects_loopback && identity_ok && launch_generation_ok
+}
+
+/// FIRST-TURN DISCRIMINATOR for the override-warn (pure). A8 reports `routed_recently == false` on
+/// the FIRST UserPromptSubmit of EVERY session (routed or not), because the intake hook fires before
+/// the first prompt egresses. So warn ONLY when a PRIOR prompt of this session was ALLOWED by the
+/// gate (`prior_allowed_count >= 1`) AND A8 STILL reports no inbound (`!a8_routed_recently`). The
+/// marker advances ONLY on an ALLOW (a blocked prompt never egressed), so it never over-warns a
+/// correctly-routed session's first prompt.
+fn should_emit_override_warn(prior_allowed_count: u32, a8_routed_recently: bool) -> bool {
+    prior_allowed_count >= 1 && !a8_routed_recently
+}
+
+/// The HARD-block hook output: exactly `{"decision":"block","reason":<non-empty>}`. The reason MUST
+/// be non-empty (codex drops an empty-reason block → fail-open).
+fn codex_block_output_json(reason: &str) -> Value {
+    json!({ "decision": "block", "reason": reason })
+}
+
+/// The non-blocking override-warn hook output: a warn-alongside-ALLOW with NO `decision` field —
+/// `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":<string>}}`.
+fn codex_override_warn_output_json(context: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    })
+}
+
+/// Per-session ALLOWED-prompt counter path (`<state_dir>/codex-intake/<conversation>.json`). Reuses
+/// the same state-dir machinery as the Claude session-status delta, in a DISTINCT subdir so it never
+/// collides with the MaskState records. `None` if the state dir can't be resolved/created.
+fn codex_intake_marker_path(conversation: &str) -> Option<PathBuf> {
+    let dir = zlauder_state::state_dir().ok()?.join("codex-intake");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{conversation}.json")))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CodexIntakeMarker {
+    /// Count of prompts this session that the gate ALLOWED (route_confirmed). Advances ONLY on an
+    /// ALLOW — a blocked prompt never egressed, so it must not count as a prior egress-capable turn.
+    allowed_count: u32,
+}
+
+/// Read this session's prior ALLOWED-prompt count (0 if absent/unreadable — fail-closed toward
+/// NOT warning on the first turn).
+fn read_codex_allowed_count(conversation: &str) -> u32 {
+    codex_intake_marker_path(conversation)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<CodexIntakeMarker>(&raw).ok())
+        .map(|m| m.allowed_count)
+        .unwrap_or(0)
+}
+
+/// Persist an incremented ALLOWED count for this session (best-effort — never fails the hook).
+fn bump_codex_allowed_count(conversation: &str, prior: u32) {
+    if let Some(path) = codex_intake_marker_path(conversation) {
+        let next = CodexIntakeMarker { allowed_count: prior.saturating_add(1) };
+        if let Ok(raw) = serde_json::to_string(&next) {
+            let _ = std::fs::write(path, raw);
+        }
+    }
+}
+
+/// Query A8's authenticated `GET /zlauder/session/{session_id}/routed` on the proxy port. Returns
+/// `Some(routed_recently)` on a successful authed read, `None` when A8 is UNAVAILABLE (no verified
+/// proxy / no admin key / unreachable / non-2xx / unparseable). The override-warn degrades to ABSENT
+/// on `None` — it NEVER blocks and never errors the hook. Identity is single-sourced through
+/// `verified_proxy_rec` so the admin key is only ever handed to OUR nonce-verified proxy. `raw_session_id`
+/// is the UNSANITIZED UUID codex sends as the session/thread header (the key A8 indexes `last_seen` by).
+fn a8_routed_recently(port: u16, root: &str, raw_session_id: &str) -> Option<bool> {
+    let client = reqwest::blocking::Client::builder().build().ok()?;
+    let timeout = Duration::from_millis(600);
+    // Reuse the gate's identity probe to (a) confirm OUR proxy and (b) get its admin key.
+    let rec = verified_proxy_rec(port, root, &client, timeout)?;
+    let resp = client
+        .get(format!(
+            "http://127.0.0.1:{port}/zlauder/session/{raw_session_id}/routed"
+        ))
+        .timeout(timeout)
+        .header("x-zlauder-key", &rec.admin_key)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?;
+    let v: Value = resp.json().ok()?;
+    v.get("routed_recently").and_then(Value::as_bool)
+}
+
+/// `zlauder-hooks codex-user-prompt-submit`. Reads the UserPromptSubmit payload on stdin, computes
+/// the fail-CLOSED route_confirmed gate, and either BLOCKs (non-empty reason) or ALLOWs — emitting a
+/// secondary non-blocking override-warn on the 2nd+ allowed prompt when A8 shows no inbound. Exit is
+/// always 0 in the non-error path; diagnostics go to stderr.
+fn codex_user_prompt_submit_cmd() -> Result<()> {
+    // Drain stdin (the UserPromptSubmit payload) so the pipe never blocks. A malformed/empty payload
+    // degrades to an empty prompt + absent fields → no command match, route_confirmed false → BLOCK
+    // (fail-closed), never a panic on this safety path.
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let prompt = prompt_from_hook_payload(&stdin).unwrap_or_default();
+    // The RAW session_id UUID (A8 keys last_seen by it) and the filename-safe marker key.
+    let raw_session_id = string_field_from_payload(&stdin, "session_id");
+    let conversation = conversation_id_from_hook_payload(&stdin);
+    let transcript_path = transcript_path_from_payload(&stdin);
+    let session_cwd = cwd_from_payload(&stdin);
+    let root = canonical(&session_cwd.map(PathBuf::from).unwrap_or_else(project_root));
+
+    // --- gather facts (all LOCAL/short-bounded; the BLOCK never depends on A8) ----------------
+    let id = CODEX_DEFAULT_PROVIDER_ID;
+    let opted_out =
+        zlauder_state::registry_get(&root) == Some(zlauder_state::PlumbState::Optout);
+    // VALUE-aware escape hatch (mirrors the Claude path): only an explicitly truthy value opens the
+    // hatch — `=0` does NOT (it disables a fail-CLOSED security control).
+    let escape_hatch = std::env::var("ZLAUDER_NO_INTAKE_GATE")
+        .map(|v| is_truthy_flag(&v))
+        .unwrap_or(false);
+
+    // route_confirmed = config-selects-zlauder-loopback AND identity_ok AND launch_generation_ok.
+    let config_path = codex_config_path();
+    let route = config_path
+        .as_ref()
+        .ok()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .and_then(|text| codex_route_from_config(&text, id));
+    let config_selects_loopback = route.is_some();
+    let identity_ok = route
+        .as_ref()
+        .is_some_and(|(_url, port)| intake_identity_ok(*port, &root));
+    let launch_gen_ok = match config_path.as_ref() {
+        Ok(p) => launch_generation_ok(transcript_path.as_deref(), codex_config_mtime_ms(p)),
+        Err(_) => false,
+    };
+    let route_confirmed =
+        codex_route_confirmed(config_selects_loopback, identity_ok, launch_gen_ok);
+
+    // --- the fail-CLOSED decision (independent of A8) -----------------------------------------
+    // BLOCK iff the gate fires AND the prompt isn't a `/zlauder:` control-plane command — the
+    // recovery levers must never be trapped inside the gate they'd release. A `/zlauder:` byte-0
+    // command is ZlauDeR's own command text (no zlauder command takes a PII arg), so passing it
+    // through widens nothing.
+    if codex_intake_should_block(opted_out, route_confirmed, escape_hatch)
+        && !prompt_is_zlauder_command(&prompt)
+    {
+        eprintln!(
+            "ZlauDeR: BLOCKED this Codex prompt — route not confirmed (config_selects_loopback={}, \
+             identity_ok={}, launch_generation_ok={}).",
+            config_selects_loopback, identity_ok, launch_gen_ok
+        );
+        // Hard block with a NON-EMPTY reason (an empty reason is dropped by codex → fail-open).
+        println!("{}", codex_block_output_json(CODEX_INTAKE_BLOCK_REASON));
+        return Ok(());
+    }
+
+    // --- ALLOW ---------------------------------------------------------------------------------
+    // The override-warn is the SECONDARY, non-blocking layer. It only applies on a route-confirmed
+    // ALLOW (an opt-out / escape-hatch / `/zlauder:` ALLOW has no proxy route to compare against).
+    // The marker advances ONLY here (route_confirmed ALLOW), so the first-turn discriminator can
+    // tell a genuine first prompt from a 2nd+ prompt that still shows zero inbound.
+    if route_confirmed && let Some(conv) = conversation.as_deref() {
+        let prior_allowed = read_codex_allowed_count(conv);
+        // Query A8 (best-effort, fail-graceful). The warn is ABSENT when A8 is unavailable.
+        let port = route.as_ref().map(|(_u, p)| *p);
+        let a8 = match (port, raw_session_id.as_deref()) {
+            (Some(p), Some(sid)) => a8_routed_recently(p, &root, sid),
+            _ => None,
+        };
+        if let Some(routed_recently) = a8
+            && should_emit_override_warn(prior_allowed, routed_recently)
+        {
+            println!(
+                "{}",
+                codex_override_warn_output_json(CODEX_OVERRIDE_WARN)
+            );
+        }
+        // Advance the per-session ALLOWED counter (this prompt is route-confirmed → egress-capable).
+        bump_codex_allowed_count(conv, prior_allowed);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod codex_user_prompt_submit_tests {
+    use super::{
+        CODEX_INTAKE_BLOCK_REASON, CODEX_OVERRIDE_WARN, codex_block_output_json,
+        codex_intake_should_block, codex_override_warn_output_json, codex_route_confirmed,
+        should_emit_override_warn,
+    };
+    use serde_json::Value;
+
+    // --- codex_intake_should_block: full 8-row truth table -----------------------
+    // BLOCK iff !escape_hatch && !opted_out && !route_confirmed.
+    #[test]
+    fn intake_should_block_truth_table() {
+        for opted_out in [false, true] {
+            for route_confirmed in [false, true] {
+                for escape_hatch in [false, true] {
+                    let expected = !escape_hatch && !opted_out && !route_confirmed;
+                    assert_eq!(
+                        codex_intake_should_block(opted_out, route_confirmed, escape_hatch),
+                        expected,
+                        "opted_out={opted_out} route_confirmed={route_confirmed} escape_hatch={escape_hatch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unconfigured_session_blocks() {
+        // THE central FINDING-1 case: nothing opted out, no route, no hatch ⇒ BLOCK (the opposite
+        // of the Claude predicate, which ALLOWs when plumbed==false).
+        assert!(codex_intake_should_block(false, false, false));
+    }
+
+    #[test]
+    fn allow_paths_do_not_block() {
+        // route confirmed ⇒ allow
+        assert!(!codex_intake_should_block(false, true, false));
+        // opted out ⇒ allow
+        assert!(!codex_intake_should_block(true, false, false));
+        // escape-hatched ⇒ allow (even when not routed)
+        assert!(!codex_intake_should_block(false, false, true));
+    }
+
+    // --- codex_route_confirmed composition ---------------------------------------
+    #[test]
+    fn route_confirmed_requires_all_three() {
+        assert!(codex_route_confirmed(true, true, true));
+        // any single false ⇒ not confirmed
+        assert!(!codex_route_confirmed(false, true, true)); // config not selecting our loopback
+        assert!(!codex_route_confirmed(true, false, true)); // identity probe failed
+        assert!(!codex_route_confirmed(true, true, false)); // launched before route written
+        assert!(!codex_route_confirmed(false, false, false));
+    }
+
+    // --- BLOCK output shape ------------------------------------------------------
+    #[test]
+    fn block_output_is_decision_block_with_nonempty_reason() {
+        let v = codex_block_output_json(CODEX_INTAKE_BLOCK_REASON);
+        assert_eq!(v.get("decision").and_then(Value::as_str), Some("block"));
+        let reason = v.get("reason").and_then(Value::as_str).expect("reason present");
+        assert!(!reason.is_empty(), "reason MUST be non-empty (codex drops empty-reason blocks)");
+        // exactly two keys, no extras.
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2);
+        assert!(obj.contains_key("decision") && obj.contains_key("reason"));
+    }
+
+    // --- override-warn output shape (warn alongside ALLOW, NO decision key) -------
+    #[test]
+    fn override_warn_output_has_no_decision_key() {
+        let v = codex_override_warn_output_json(CODEX_OVERRIDE_WARN);
+        assert!(v.get("decision").is_none(), "a warn must NOT carry a decision (would block)");
+        let hso = v.get("hookSpecificOutput").expect("hookSpecificOutput present");
+        assert_eq!(
+            hso.get("hookEventName").and_then(Value::as_str),
+            Some("UserPromptSubmit")
+        );
+        let ctx = hso
+            .get("additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext present");
+        assert!(!ctx.is_empty());
+    }
+
+    // --- first-turn discriminator ------------------------------------------------
+    #[test]
+    fn override_warn_suppressed_on_first_allowed_prompt() {
+        // First allowed prompt (count 0): A8 ALWAYS reports false here (hook fires pre-egress) →
+        // must NOT warn, regardless of a8.
+        assert!(!should_emit_override_warn(0, false));
+        assert!(!should_emit_override_warn(0, true));
+    }
+
+    #[test]
+    fn override_warn_only_on_second_plus_with_no_inbound() {
+        // 2nd+ allowed prompt AND A8 still shows no inbound ⇒ warn.
+        assert!(should_emit_override_warn(1, false));
+        assert!(should_emit_override_warn(5, false));
+        // A8 confirms inbound ⇒ no warn (the route is working).
+        assert!(!should_emit_override_warn(1, true));
+        assert!(!should_emit_override_warn(5, true));
+    }
 }
 
 #[cfg(test)]
