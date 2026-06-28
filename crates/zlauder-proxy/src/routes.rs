@@ -70,6 +70,13 @@ pub fn router(state: AppState) -> Router {
             "/zlauder/session/{conversation}/v1/responses",
             post(openai_responses::responses_session),
         )
+        // READ-ONLY per-session inbound observability (key-gated): reports whether
+        // inbound for this conversation id reached the proxy recently — detects a
+        // `-c`/`-p` provider override (config says zlauder, traffic went elsewhere).
+        .route(
+            "/zlauder/session/{conversation}/routed",
+            get(admin::session_routed),
+        )
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/chat/completions", post(openai_chat::chat_completions))

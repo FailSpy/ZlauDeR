@@ -36,21 +36,86 @@ pub use model::{
     TokenClass, TokenLedgerEntry, TokenPreview, TokenRef, TurnDelta,
 };
 pub use store::{CompletionGuard, Monitor, ReviewTicket};
+pub(crate) use store::ROUTED_RECENTLY_WINDOW_MS;
 pub use ui::ui;
 
 use ::http::HeaderMap;
 use uuid::Uuid;
 
-/// Conversation id from the `x-zlauder-conversation` header fallback.
+/// Conversation id from the request headers.
+///
+/// Precedence:
+///   1. `x-zlauder-conversation` — the Claude/`zlauder` path (UserPromptSubmit hook).
+///   2. `session-id` — Codex's per-session header (it never sends
+///      `x-zlauder-conversation`); A0-verified to carry the same id the
+///      UserPromptSubmit hook reports as `session_id`.
+///   3. `thread-id` — Codex's fallback, byte-identical to `session-id`.
+///
+/// Without the Codex `session-id`/`thread-id` fallback every Codex inbound would key
+/// as missing in the monitor's `last_seen`, leaving the per-session inbound
+/// observability endpoint unable to ever attribute Codex traffic to a session.
 pub fn conversation_from_headers(hdrs: &HeaderMap) -> Option<String> {
-    hdrs.get("x-zlauder-conversation")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    for name in ["x-zlauder-conversation", "session-id", "thread-id"] {
+        if let Some(id) = hdrs
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// A fresh random conversation id (used when no session id is supplied).
 pub fn random_conversation_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::http::HeaderValue;
+
+    #[test]
+    fn conversation_from_headers_precedence_and_codex_fallback() {
+        // x-zlauder-conversation wins when present (even if Codex headers also set).
+        let mut h = HeaderMap::new();
+        h.insert("x-zlauder-conversation", HeaderValue::from_static("zl-conv"));
+        h.insert("session-id", HeaderValue::from_static("codex-sess"));
+        h.insert("thread-id", HeaderValue::from_static("codex-thread"));
+        assert_eq!(conversation_from_headers(&h).as_deref(), Some("zl-conv"));
+
+        // Codex request (no x-zlauder-conversation): keys by `session-id`.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "session-id",
+            HeaderValue::from_static("019f0504-a6af-7253-8f6e-b6a41e31d7c4"),
+        );
+        h.insert(
+            "thread-id",
+            HeaderValue::from_static("019f0504-a6af-7253-8f6e-b6a41e31d7c4"),
+        );
+        assert_eq!(
+            conversation_from_headers(&h).as_deref(),
+            Some("019f0504-a6af-7253-8f6e-b6a41e31d7c4")
+        );
+
+        // session-id absent → falls back to thread-id.
+        let mut h = HeaderMap::new();
+        h.insert("thread-id", HeaderValue::from_static("only-thread"));
+        assert_eq!(conversation_from_headers(&h).as_deref(), Some("only-thread"));
+
+        // An empty / whitespace x-zlauder-conversation is rejected, then falls through.
+        let mut h = HeaderMap::new();
+        h.insert("x-zlauder-conversation", HeaderValue::from_static("   "));
+        h.insert("session-id", HeaderValue::from_static("codex-sess"));
+        assert_eq!(conversation_from_headers(&h).as_deref(), Some("codex-sess"));
+
+        // Absent-all → None.
+        let h = HeaderMap::new();
+        assert_eq!(conversation_from_headers(&h), None);
+    }
 }

@@ -25,6 +25,7 @@ use zlauder_engine::{AllowList, BrokerPolicy, EngineConfig, MlStatus, Profile};
 
 use crate::config;
 use crate::ml::reconcile_ml;
+use crate::monitor;
 use crate::state::AppState;
 
 /// Allow-list in its raw, serializable form (the live [`AllowList`] holds compiled
@@ -625,6 +626,35 @@ pub async fn diag_mask(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes)
             &format!("mask failed: {e}"),
         ),
     }
+}
+
+/// `GET /zlauder/session/{conversation_id}/routed` (key-gated): READ-ONLY per-session
+/// inbound observability. Reports whether inbound for `conversation_id` reached THIS
+/// proxy recently — the only signal that can detect a `-c`/`-p` provider override
+/// (config says zlauder but traffic went straight to the upstream), under which the
+/// proxy sees ZERO inbound for the id.
+///
+/// Response 200 `{"routed_recently": bool, "last_seen_ms": u128|null}`. `routed_recently`
+/// is true IFF the proxy has actually recorded inbound for this id within
+/// [`monitor::ROUTED_RECENTLY_WINDOW_MS`]. It reflects ONLY recorded inbound — never
+/// proxy liveness or config-on-disk — and never blocks a request or drives a masking
+/// claim. Key-gated (same `x-zlauder-key` as every other admin route): a public
+/// per-session-inbound endpoint would be an information leak.
+pub async fn session_routed(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let (routed_recently, last_seen_ms) = st
+        .monitor
+        .routed_recently(&conversation_id, monitor::ROUTED_RECENTLY_WINDOW_MS);
+    json_ok(&json!({
+        "routed_recently": routed_recently,
+        "last_seen_ms": last_seen_ms,
+    }))
 }
 
 // --- small response helpers (mirrors routes.rs style) -----------------------

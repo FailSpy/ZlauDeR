@@ -152,6 +152,116 @@ enum Cmd {
         #[command(subcommand)]
         action: SettingsAction,
     },
+    /// Codex preflight: detect whether a usable OpenAI API key is reachable for the masking
+    /// proxy's custom provider, and REFUSE (non-zero exit) when not.
+    ///
+    /// The zlauder Codex plugin routes Codex's OpenAI provider through the local masking proxy
+    /// by configuring a custom provider with `env_key = "OPENAI_API_KEY"`. A custom provider's
+    /// `api_key()` reads ONLY the `OPENAI_API_KEY` ENV var and hard-errors when it is absent or
+    /// empty — it does NOT fall back to a ChatGPT-subscription token or to `auth.json`. So if a
+    /// user only has ChatGPT-subscription auth (or an API key sitting in `auth.json` but NOT
+    /// exported to the env), every Codex request fails at provider construction — nothing is
+    /// sent, therefore nothing is masked. This subcommand detects that up front.
+    ///
+    /// Exit 0 iff a usable env key is present (mode=apikey); non-zero otherwise, with a clear
+    /// refusal on stderr. `--json` prints `{"mode": ..., "route_ok": <bool>}` to stdout.
+    CodexAuthCheck {
+        /// Emit machine-readable JSON (`{"mode": ..., "route_ok": <bool>}`) instead of the
+        /// human refusal/confirmation. The exit code is still set (0 iff route_ok).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Route (or stop routing) Codex's OpenAI traffic through the masking proxy by editing the
+    /// custom-provider block in `$CODEX_HOME/config.toml` (the one writable config layer that
+    /// survives Codex's project-config denylist). A format-preserving, atomic, reversible
+    /// toml_edit merge — NEVER a `toml::Value` round-trip (that drops the user's comments and
+    /// formatting). The block is marked `zlauder_managed = true`; a same-id block WITHOUT that
+    /// marker is user-owned and is never overwritten/removed. Exit codes mirror `SettingsAction`:
+    /// 0 = changed, 3 = no-op (already in the target state), non-zero = error/refusal on stderr.
+    ///
+    /// NOTE: `enable` writes the `[model_providers.<id>]` block + top-level `model_provider`, and
+    /// — when `--hooks-dir` is given — ALSO the ownership-aware `[hooks]` SessionStart/UserPromptSubmit
+    /// entries pointing at the plugin scripts; `disable` removes only OUR provider block and hook
+    /// entries, preserving any user-owned blocks/hooks.
+    CodexConfig {
+        #[command(subcommand)]
+        action: CodexConfigAction,
+    },
+    /// Codex SessionStart hook delegate: read the SessionStart payload on stdin, verify whether
+    /// THIS Codex session is actually routed through the masking proxy (config route + auth +
+    /// /healthz identity + launch-generation), and emit ONLY a schema-valid
+    /// `hookSpecificOutput.additionalContext` — a NEUTRAL token-handling onboarding when fully
+    /// verified, a warn-only message otherwise, and NEVER an unqualified "masking is active" claim.
+    ///
+    /// SessionStart fires BEFORE any turn egresses, so the effective route is UNOBSERVABLE here;
+    /// the onboarding is the conditional token-contract form, never a live-masking assertion. The
+    /// output schema is `deny_unknown_fields`: emitting a top-level `env` key makes the parse FAIL
+    /// and the context is silently DROPPED, so we emit NO `env` key. Diagnostics go to stderr;
+    /// exit is always 0 in non-error paths (an empty stdout is a valid no-op).
+    CodexSessionStart,
+    /// Codex UserPromptSubmit hook delegate: the fail-CLOSED Codex intake gate. Reads the
+    /// UserPromptSubmit payload on stdin and BLOCKS (`{"decision":"block","reason":<non-empty>}`) an
+    /// unmasked Codex prompt UNLESS the session is confirmed routed through OUR live proxy
+    /// (config-selects-zlauder-loopback AND /healthz identity AND launch-generation), OR the project
+    /// is opted out, OR the `ZLAUDER_NO_INTAKE_GATE` escape hatch is truthy, OR the prompt is a
+    /// byte-0 `/zlauder:` control command.
+    ///
+    /// Unlike the Claude gate, an UNCONFIGURED Codex session (no zlauder provider) BLOCKs — its PII
+    /// would egress unmasked, so there is NO `plumbed` term; `route_confirmed == false ⇒ BLOCK`. The
+    /// BLOCK decision is computed entirely from facts checkable AT INTAKE without egress (no A8/inbound
+    /// conjunct — that would deadlock turn 1). On an ALLOW it ALSO emits a NON-blocking
+    /// `additionalContext` override-warn from the 2nd+ allowed prompt when A8 reports zero inbound for
+    /// the session (a likely `-c`/`-p` provider override) — detect+warn only, never a block, and
+    /// gracefully absent when A8 is unreachable.
+    CodexUserPromptSubmit,
+    /// Codex per-session override report (backs the verify skill's A8 line). Performs the
+    /// KEY-BEARING authenticated read of `GET /zlauder/session/{session_id}/routed` on this
+    /// project's verified proxy and prints a one-line human verdict on stdout:
+    ///   - `routed`        — inbound from this session reached the proxy recently;
+    ///   - `not-routed`    — no inbound from this session (possible `-c`/`-p` override / not-yet-routed);
+    ///   - `unavailable`   — A8 endpoint/proxy/key not reachable (older Codex build or proxy down).
+    /// A REPORT only: always exits 0, never blocks. The admin key is resolved internally (via the
+    /// same nonce-verified proxy identity probe the hook uses) so the skill needs no admin key — a
+    /// bare keyless curl would always 403 against this key-gated endpoint.
+    CodexSessionRouted {
+        /// The raw Codex session/thread UUID (the key A8 indexes inbound `last_seen` by).
+        session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodexConfigAction {
+    /// Insert/replace `[model_providers.<id>]` (default id `zlauder`) pointed at `--url` and set
+    /// `model_provider = "<id>"`, preserving the user's PRIOR provider so `disable` can restore
+    /// it. REFUSES (writes nothing, non-zero) if a same-id block exists WITHOUT our marker.
+    Enable {
+        /// Proxy base URL to set as `base_url`, e.g. `http://127.0.0.1:PORT/v1`.
+        #[arg(long)]
+        url: String,
+        /// Provider id (the `[model_providers.<id>]` table key). Defaults to `zlauder`.
+        #[arg(long = "provider-id")]
+        provider_id: Option<String>,
+        /// Absolute path to the plugin's `scripts/` dir. When given, enable ALSO installs the
+        /// `[[hooks.SessionStart]]` / `[[hooks.UserPromptSubmit]]` entries pointing at
+        /// `<hooks-dir>/codex-session-start.sh` and `<hooks-dir>/codex-user-prompt-submit.sh`
+        /// (codex >0.140 fires hooks only from $CODEX_HOME). Ownership-aware: our entries are
+        /// added alongside any user hooks, never clobbering them. Omit to write routing only.
+        #[arg(long = "hooks-dir")]
+        hooks_dir: Option<String>,
+    },
+    /// Remove OUR `[model_providers.<id>]` block (only if it carries `zlauder_managed = true`)
+    /// and restore the saved prior `model_provider` (or drop the top-level key if none saved).
+    Disable {
+        /// Provider id to remove. Defaults to `zlauder`.
+        #[arg(long = "provider-id")]
+        provider_id: Option<String>,
+    },
+    /// Print the effective top-level `model_provider` and `[model_providers.<id>].base_url`.
+    Show {
+        /// Provider id to inspect. Defaults to `zlauder`.
+        #[arg(long = "provider-id")]
+        provider_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -355,6 +465,2638 @@ fn main() -> Result<()> {
             keep_thinking,
         ),
         Cmd::Settings { action } => settings_cmd(action),
+        Cmd::CodexAuthCheck { json } => codex_auth_check_cmd(json),
+        Cmd::CodexConfig { action } => codex_config_cmd(action),
+        Cmd::CodexSessionStart => codex_session_start_cmd(),
+        Cmd::CodexUserPromptSubmit => codex_user_prompt_submit_cmd(),
+        Cmd::CodexSessionRouted { session_id } => codex_session_routed_cmd(&session_id),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex-auth-check — detect a usable OpenAI API key for Codex's masking-proxy
+// custom provider, and REFUSE when not. See `Cmd::CodexAuthCheck` for the
+// failure mechanism this guards.
+// ---------------------------------------------------------------------------
+
+/// Classification of how Codex auth is set up, from the masking-proxy's point of view.
+/// `route_ok` is true ONLY when the custom provider's `env_key="OPENAI_API_KEY"` Bearer
+/// lookup will find a usable value — i.e. an exported `sk-` env key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexAuthMode {
+    /// An `sk-`-shaped `$OPENAI_API_KEY` is exported — the provider will read it. route_ok.
+    ApiKey,
+    /// A ChatGPT subscription (auth_mode=chatgpt / a `tokens` object), or no auth at all.
+    /// The provider has no env key to read → fails at construction. NOT route_ok.
+    Chatgpt,
+    /// An API key is on file in auth.json but NOT exported to the env. The single most
+    /// actionable case: the fix is one `export`. NOT route_ok.
+    KeyNotExported,
+    /// Anything else (personal_access_token, bedrock_api_key, or an unrecognized shape).
+    /// Fail-closed. NOT route_ok.
+    Other,
+}
+
+impl CodexAuthMode {
+    /// The stable string the `--json` form and downstream consumers key on.
+    fn as_str(self) -> &'static str {
+        match self {
+            CodexAuthMode::ApiKey => "apikey",
+            CodexAuthMode::Chatgpt => "chatgpt",
+            CodexAuthMode::KeyNotExported => "key-not-exported",
+            CodexAuthMode::Other => "other",
+        }
+    }
+    /// True iff this mode means the custom provider has a usable env key (only `ApiKey`).
+    /// Used by tests to assert the mode↔route_ok invariant.
+    #[cfg(test)]
+    fn route_ok(self) -> bool {
+        matches!(self, CodexAuthMode::ApiKey)
+    }
+}
+
+/// PURE detection: given the `$OPENAI_API_KEY` env value (if any) and the parsed `auth.json`
+/// (if any, as a `serde_json::Value`), classify the auth situation. No env mutation, no I/O —
+/// directly unit-testable. Returns `(mode, route_ok)`; an optional unmapped-auth_mode note is
+/// surfaced by the caller (see [`detect_codex_auth`]).
+///
+/// Precedence mirrors codex's own `api_key()` lookup: an exported, `sk-`-shaped env key wins
+/// outright (rule 1); otherwise we inspect auth.json and ALWAYS fail closed.
+fn classify_codex_auth(env_key: Option<&str>, auth_json: Option<&Value>) -> (CodexAuthMode, bool) {
+    // Rule 1: an exported, non-empty, sk-shaped env key is exactly what the custom provider's
+    // env_key="OPENAI_API_KEY" Bearer lookup reads. Trim to reject whitespace-only values.
+    if let Some(k) = env_key {
+        let k = k.trim();
+        if !k.is_empty() && k.starts_with("sk-") {
+            return (CodexAuthMode::ApiKey, true);
+        }
+        // present-but-not-sk-shaped (or whitespace-only) → fall through to auth.json.
+    }
+
+    // Rule 2/3: no usable exported env key. Inspect auth.json (fail closed on anything).
+    let Some(auth) = auth_json else {
+        // No auth.json (or it was empty/unparseable) → treat as ChatGPT/none. NOT route_ok.
+        return (CodexAuthMode::Chatgpt, false);
+    };
+
+    let auth_mode = auth
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let has_api_key_field = auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_tokens = auth.get("tokens").map(|t| !t.is_null()).unwrap_or(false);
+    let has_pat = auth
+        .get("personal_access_token")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_bedrock = auth.get("bedrock_api_key").map(|b| !b.is_null()).unwrap_or(false);
+
+    // An API key on file (field present, or auth_mode==apikey) but NOT exported to the env:
+    // the most actionable refusal. The env key was already checked above and is unusable.
+    if has_api_key_field || auth_mode == Some("apikey") {
+        return (CodexAuthMode::KeyNotExported, false);
+    }
+    if auth_mode == Some("chatgpt") || has_tokens {
+        return (CodexAuthMode::Chatgpt, false);
+    }
+    if auth_mode == Some("personal_access_token") || has_pat {
+        return (CodexAuthMode::Other, false);
+    }
+    if auth_mode == Some("bedrock_api_key") || has_bedrock {
+        return (CodexAuthMode::Other, false);
+    }
+
+    // Unrecognized auth_mode / shape the detector cannot classify → fail closed.
+    (CodexAuthMode::Other, false)
+}
+
+/// Was the auth.json's `auth_mode` an UNMAPPED value (one we don't classify by name and that
+/// didn't otherwise match a known field)? The caller surfaces this on stderr so an unexpected
+/// codex auth mode can be reported. Returns the offending string when so.
+fn unmapped_auth_mode(auth_json: Option<&Value>) -> Option<String> {
+    let auth = auth_json?;
+    let am = auth
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    const KNOWN: &[&str] = &[
+        "apikey",
+        "chatgpt",
+        "personal_access_token",
+        "bedrock_api_key",
+    ];
+    if KNOWN.contains(&am) {
+        return None;
+    }
+    // An unknown auth_mode that nevertheless carried a recognized field is already classified
+    // by that field — not "unmapped". Only flag when nothing else matched it.
+    let classifiable_by_field = auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || auth.get("tokens").map(|t| !t.is_null()).unwrap_or(false)
+        || auth
+            .get("personal_access_token")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || auth.get("bedrock_api_key").map(|b| !b.is_null()).unwrap_or(false);
+    if classifiable_by_field {
+        None
+    } else {
+        Some(am.to_string())
+    }
+}
+
+/// Read + parse `$CODEX_HOME/auth.json` (CODEX_HOME defaults to `~/.codex`), non-panicking.
+/// ANY read/parse failure (missing file, bad JSON, no home dir) degrades to `None` — which the
+/// pure classifier treats as the safe REFUSE path.
+fn read_codex_auth_json() -> Option<Value> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".codex")))?;
+    let path = codex_home.join("auth.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
+/// Best-effort home directory from the environment ($HOME on Unix, $USERPROFILE on Windows).
+/// No external crate; returns `None` rather than panicking when unset.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let var = "USERPROFILE";
+    #[cfg(not(windows))]
+    let var = "HOME";
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Run the live detection: read the real `$OPENAI_API_KEY` env + `auth.json`, classify, and
+/// surface any unmapped auth_mode note. Returns `(mode, route_ok, unmapped_note)`.
+fn detect_codex_auth() -> (CodexAuthMode, bool, Option<String>) {
+    let env_key = std::env::var("OPENAI_API_KEY").ok();
+    let auth = read_codex_auth_json();
+    let (mode, route_ok) = classify_codex_auth(env_key.as_deref(), auth.as_ref());
+    let note = unmapped_auth_mode(auth.as_ref());
+    (mode, route_ok, note)
+}
+
+/// The shared refusal text printed to stderr for every `route_ok==false` case. Explains the
+/// REAL mechanism so a user knows why their ChatGPT login won't work and what to do.
+fn codex_refusal_message(mode: CodexAuthMode) -> String {
+    let specific = match mode {
+        CodexAuthMode::KeyNotExported => {
+            "You have an OpenAI API key on file (auth.json) but it is not exported as the \
+             OPENAI_API_KEY environment variable. The Codex custom provider reads the ENV var, \
+             not auth.json — export it (export OPENAI_API_KEY=sk-...) before launching codex, \
+             then re-run enable.\n\n"
+        }
+        CodexAuthMode::Chatgpt => {
+            "Detected a ChatGPT-subscription login (or no OpenAI auth at all).\n\n"
+        }
+        CodexAuthMode::Other => {
+            "Detected an OpenAI auth mode that does not export an OPENAI_API_KEY env var \
+             (e.g. a personal access token or Bedrock key).\n\n"
+        }
+        CodexAuthMode::ApiKey => "", // unreachable for route_ok==false
+    };
+    format!(
+        "{specific}zlauder masking cannot be enabled for Codex with this auth. The masking \
+         proxy routes Codex's OpenAI provider through a custom provider whose \
+         env_key=OPENAI_API_KEY. When that env var has no value, codex fails at provider \
+         construction with a missing-OPENAI_API_KEY env error — it never falls back to your \
+         ChatGPT login — so the session cannot make ANY requests, and nothing is masked because \
+         nothing is sent.\n\n\
+         Fix: set OPENAI_API_KEY to a real OpenAI API key (sk-...) and re-run enable.\n  \
+         export OPENAI_API_KEY=sk-...",
+    )
+}
+
+/// `zlauder-hooks codex-auth-check [--json]`. Exit 0 iff a usable exported env key is present;
+/// non-zero (with a refusal on stderr) otherwise.
+fn codex_auth_check_cmd(json: bool) -> Result<()> {
+    let (mode, route_ok, unmapped) = detect_codex_auth();
+
+    // Always surface an unmapped auth_mode on stderr so it can be reported, regardless of form.
+    if let Some(am) = &unmapped {
+        eprintln!(
+            "note: unrecognized codex auth_mode {am:?} in auth.json — treating as unusable \
+             (fail-closed). Please report this auth_mode."
+        );
+    }
+
+    if json {
+        println!(
+            "{}",
+            json!({ "mode": mode.as_str(), "route_ok": route_ok })
+        );
+        // Belt-and-suspenders: even in --json mode, surface the refusal mechanism on stderr
+        // (stdout stays JSON-only) so anyone running this directly sees WHY route_ok is false.
+        if !route_ok {
+            eprintln!("{}", codex_refusal_message(mode));
+        }
+    } else if route_ok {
+        println!("codex-auth-check: OK (mode=apikey) — OPENAI_API_KEY is exported; the masking proxy can route Codex.");
+    } else {
+        eprintln!("{}", codex_refusal_message(mode));
+    }
+
+    if route_ok {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex-config — route Codex's OpenAI provider through the masking proxy by editing
+// $CODEX_HOME/config.toml. Format-preserving, atomic, reversible (toml_edit, never a
+// toml::Value round-trip). See `Cmd::CodexConfig`.
+// ---------------------------------------------------------------------------
+
+/// Default provider id (the `[model_providers.<id>]` table key) when `--provider-id` is absent.
+const CODEX_DEFAULT_PROVIDER_ID: &str = "zlauder";
+/// The ownership marker key. Only a block carrying `<MARKER> = true` is ours to replace/remove.
+const ZLAUDER_MANAGED_KEY: &str = "zlauder_managed";
+/// Where the prior top-level `model_provider` is stashed (inside our block) so disable restores it.
+const ZLAUDER_PRIOR_KEY: &str = "zlauder_prior_provider";
+
+/// Outcome of the pure `codex_enable_merge` / `codex_disable_merge` transforms, mapped to the
+/// shell exit-code contract: `Changed` => exit 0, `NoOp` => exit 3, `Refused` => non-zero error.
+enum CodexMergeOutcome {
+    /// A change was produced; carries the new full config text to write atomically.
+    Changed(String),
+    /// Already in the target state — write nothing, exit 3.
+    NoOp,
+    /// Refused (a user-owned same-id block blocks us). Carries the stderr message; write nothing.
+    Refused(String),
+}
+
+/// Resolve `$CODEX_HOME` (default `~/.codex`) → its `config.toml`. Mirrors `read_codex_auth_json`'s
+/// CODEX_HOME resolution so auth-check and config write agree on the same home.
+fn codex_config_path() -> Result<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".codex")))
+        .context("cannot resolve $CODEX_HOME (no CODEX_HOME env and no home dir)")?;
+    Ok(codex_home.join("config.toml"))
+}
+
+/// Is `[model_providers.<id>]` present AND carrying our `zlauder_managed = true` marker?
+/// Returns `(present, ours)`: `present` = a table exists under that id at all; `ours` = it
+/// exists and the marker is `true`. An UNMARKED present block is user-owned (`present && !ours`).
+fn codex_block_ownership(doc: &toml_edit::DocumentMut, id: &str) -> (bool, bool) {
+    let Some(providers) = doc.get("model_providers").and_then(|i| i.as_table_like()) else {
+        return (false, false);
+    };
+    let Some(block) = providers.get(id).and_then(|i| i.as_table_like()) else {
+        return (false, false);
+    };
+    let ours = block
+        .get(ZLAUDER_MANAGED_KEY)
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    (true, ours)
+}
+
+/// PURE enable transform: given the current config text + id + url, return the merge outcome.
+/// Refuses if a same-id block exists without our marker; no-ops if already in the exact target
+/// state; otherwise inserts/replaces our block (preserving every other key + comment + format).
+fn codex_enable_merge(current: &str, id: &str, url: &str) -> CodexMergeOutcome {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return CodexMergeOutcome::Refused(format!(
+                "$CODEX_HOME/config.toml is not valid TOML; refusing to overwrite: {e}"
+            ));
+        }
+    };
+
+    let (present, ours) = codex_block_ownership(&doc, id);
+    if present && !ours {
+        return CodexMergeOutcome::Refused(format!(
+            "a [model_providers.{id}] block already exists in $CODEX_HOME/config.toml and is NOT \
+             managed by zlauder. Refusing to overwrite it. Pick a different id with --provider-id, \
+             or remove your existing [model_providers.{id}] block first."
+        ));
+    }
+
+    // Capture the user's PRIOR top-level model_provider BEFORE we change it. Only meaningful when
+    // it exists and differs from <id> AND we have not already stashed one (idempotency: a re-enable
+    // must not clobber a previously-saved prior with our own id).
+    let prior_provider = doc
+        .get("model_provider")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let already_saved_prior = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|p| p.get(id))
+        .and_then(|i| i.as_table_like())
+        .and_then(|b| b.get(ZLAUDER_PRIOR_KEY))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Idempotency: the EXACT target state already present → no-op. We compare the FULL set of
+    // load-bearing keys (not just provider+url): a marked block missing supports_websockets=false
+    // (e.g. written by an older plugin version, or a partial/tampered block) must be RE-WRITTEN,
+    // not no-op'd — otherwise the session would silently use the WebSocket transport that bypasses
+    // the HTTP masking proxy. (zlauder_prior_provider is preserved on a re-enable.)
+    if ours {
+        let cur_provider = doc
+            .get("model_provider")
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str());
+        let block = doc
+            .get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .and_then(|i| i.as_table_like());
+        let block_matches_target = block.is_some_and(|b| {
+            let s = |k: &str| b.get(k).and_then(|i| i.as_value()).and_then(|v| v.as_str());
+            let f = |k: &str| b.get(k).and_then(|i| i.as_value()).and_then(|v| v.as_bool());
+            s("base_url") == Some(url)
+                && s("wire_api") == Some("responses")
+                && s("env_key") == Some("OPENAI_API_KEY")
+                && f("requires_openai_auth") == Some(false)
+                && f("supports_websockets") == Some(false)
+        });
+        if cur_provider == Some(id) && block_matches_target {
+            return CodexMergeOutcome::NoOp;
+        }
+    }
+
+    // Decide which prior to record. Prefer a prior we ALREADY saved (re-enable preserves it);
+    // else the live top-level model_provider when it exists and differs from <id>.
+    let prior_to_record: Option<String> = already_saved_prior.or_else(|| {
+        prior_provider
+            .filter(|p| p != id)
+    });
+
+    // Build the managed block fresh (a replace drops any stale keys the user couldn't have set on
+    // our marked block). Order keys deterministically for the worked-trace test.
+    let mut block = toml_edit::Table::new();
+    block["name"] = toml_edit::value("ZlauDeR Masking Proxy");
+    block["base_url"] = toml_edit::value(url);
+    block["env_key"] = toml_edit::value("OPENAI_API_KEY");
+    block["wire_api"] = toml_edit::value("responses");
+    block["requires_openai_auth"] = toml_edit::value(false);
+    block["supports_websockets"] = toml_edit::value(false);
+    block[ZLAUDER_MANAGED_KEY] = toml_edit::value(true);
+    if let Some(prior) = prior_to_record {
+        block[ZLAUDER_PRIOR_KEY] = toml_edit::value(prior);
+    }
+
+    // Ensure the `[model_providers]` parent table exists, then set our sub-table.
+    if !doc.contains_key("model_providers") {
+        doc["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["model_providers"][id] = toml_edit::Item::Table(block);
+    doc["model_provider"] = toml_edit::value(id);
+
+    CodexMergeOutcome::Changed(doc.to_string())
+}
+
+/// PURE disable transform: remove OUR marked `[model_providers.<id>]` block and restore the saved
+/// prior model_provider (or drop the top-level key if none saved and it equals <id>). A no-op when
+/// there is no marked block (an unmarked user block is left untouched).
+fn codex_disable_merge(current: &str, id: &str) -> CodexMergeOutcome {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return CodexMergeOutcome::Refused(format!(
+                "$CODEX_HOME/config.toml is not valid TOML; refusing to overwrite: {e}"
+            ));
+        }
+    };
+
+    let (_present, ours) = codex_block_ownership(&doc, id);
+    if !ours {
+        // No managed block to remove (absent, or a user-owned unmarked block we must not touch).
+        return CodexMergeOutcome::NoOp;
+    }
+
+    // Pull the saved prior provider out of our block before removing it.
+    let saved_prior = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|p| p.get(id))
+        .and_then(|i| i.as_table_like())
+        .and_then(|b| b.get(ZLAUDER_PRIOR_KEY))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Remove our sub-table.
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(|i| i.as_table_like_mut())
+    {
+        providers.remove(id);
+    }
+    // Drop an emptied `[model_providers]` parent so we don't leave a dangling empty table.
+    let providers_empty = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .map(|t| t.is_empty())
+        .unwrap_or(false);
+    if providers_empty {
+        doc.remove("model_providers");
+    }
+
+    // Restore the top-level model_provider — but ONLY if it STILL points at us. If the user changed
+    // `model_provider` to a different provider AFTER enabling (a newer selection), do NOT clobber it
+    // with the stale prior we saved; leave their choice untouched.
+    let currently_ours = doc
+        .get("model_provider")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        == Some(id);
+    if currently_ours {
+        match saved_prior {
+            // It still points at us: restore the prior we recorded, or drop the key if none saved.
+            Some(prior) => doc["model_provider"] = toml_edit::value(prior),
+            None => {
+                doc.remove("model_provider");
+            }
+        }
+    }
+
+    CodexMergeOutcome::Changed(doc.to_string())
+}
+
+/// The two Codex hook events we wire (SessionStart + UserPromptSubmit) paired with the script name
+/// of the wrapper that handles each. Ownership on disable is determined by matching a hook command
+/// against the trailing `scripts/<name>` path components (see `codex_hook_command_is_ours`) — so
+/// removing OUR entries never touches a user's own hooks.
+const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
+    ("SessionStart", "codex-session-start.sh"),
+    ("UserPromptSubmit", "codex-user-prompt-submit.sh"),
+];
+
+/// Does `command` reference one of OUR hook scripts? Ownership is a PATH-COMPONENT match on the
+/// trailing `scripts/<script>` (the last two components must be exactly `scripts` then `<script>`),
+/// robust to whatever absolute `hooks-dir` the plugin resolved (enable always writes
+/// `<hooks_dir>/<script>` with `hooks_dir` ending in `/scripts`). A user hook with a different name,
+/// a bare command, or one under a directory merely *ending* in "scripts" is foreign and preserved.
+fn codex_hook_command_is_ours(command: &str, script: &str) -> bool {
+    // PATH-COMPONENT match: the command's last two path components must be exactly `scripts` then
+    // `<script>` (split on either separator). `enable` always writes `<hooks_dir>/<script>` with
+    // hooks_dir ending in `/scripts`, so our own entries always match. This rejects a bare `<script>`
+    // (no `scripts` parent) AND a user hook under a directory whose basename merely ENDS in "scripts"
+    // (e.g. `/home/u/user-scripts/<script>`) — a plain `ends_with("scripts/<script>")` would
+    // false-claim that as ours and let enable rewrite / disable delete a foreign user hook.
+    let mut comps = command.rsplit(['/', '\\']);
+    comps.next() == Some(script) && comps.next() == Some("scripts")
+}
+
+/// PURE [hooks]-merge for ENABLE: given the current config text and the absolute `hooks_dir`,
+/// idempotently add a `[[hooks.SessionStart]]` / `[[hooks.UserPromptSubmit]]` MatcherGroup whose
+/// single command is `<hooks_dir>/<script>`, ONLY when no existing entry for that event already
+/// carries OUR command (by basename). User hook entries are preserved untouched. Returns the new
+/// full config text and whether anything changed. Text in → (text, changed) out, for unit testing
+/// without a real $CODEX_HOME.
+fn codex_hooks_enable_merge(current: &str, hooks_dir: &str) -> (String, bool) {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        // An unparseable doc is handled (refused) by the provider merge that runs first; if we ever
+        // reach here on bad TOML, make no change rather than panic.
+        Err(_) => return (current.to_string(), false),
+    };
+    let dir = hooks_dir.trim_end_matches(['/', '\\']);
+    let mut changed = false;
+
+    if !doc.contains_key("hooks") {
+        // Lazily created only if we actually add something below; defer until first insert.
+    }
+
+    for (event, script) in CODEX_HOOK_SCRIPTS {
+        let command = format!("{dir}/{script}");
+
+        // NORMALIZE a present-but-wrong-shape event value into an array-of-tables BEFORE we reconcile
+        // or append. TOML lets the user write this event two equivalent ways:
+        //   [[hooks.SessionStart]]            (toml_edit: ArrayOfTables — what we emit)
+        //   SessionStart = [ { ... } ]        (toml_edit: an inline Array of inline tables)
+        // Both are valid Codex config, but `as_array_of_tables_mut()` returns None for the second.
+        // Without this step the reconcile loop below never sees the user's inline entries (found_ours
+        // stays false) AND the append guard short-circuits (`contains_key(event)` is true, yet
+        // `as_array_of_tables_mut()` is None) — so OUR hook is silently dropped while `changed` may
+        // already be true from the other event/provider, making enable.sh report a success/restart
+        // for a hook that was never installed. Rewriting the inline array as an array-of-tables
+        // preserves every user entry and lets both the reconcile and append paths operate on it.
+        if let Some(hooks_tbl) = doc.get_mut("hooks").and_then(|h| h.as_table_mut()) {
+            let needs_normalize = hooks_tbl
+                .get(event)
+                .map(|i| i.as_array().is_some() && i.as_array_of_tables().is_none())
+                .unwrap_or(false);
+            if needs_normalize {
+                let mut normalized = toml_edit::ArrayOfTables::new();
+                if let Some(arr) = hooks_tbl.get(event).and_then(|i| i.as_array()) {
+                    for v in arr.iter() {
+                        // Re-home each inline table as a standalone table; skip any non-table member
+                        // (a malformed entry Codex would itself reject) rather than fail the merge.
+                        if let Some(it) = v.as_inline_table() {
+                            normalized.push(it.clone().into_table());
+                        }
+                    }
+                }
+                hooks_tbl.insert(event, toml_edit::Item::ArrayOfTables(normalized));
+            }
+        }
+
+        // Reconcile any EXISTING entry that carries OUR script (by basename). Two cases:
+        //   - its command already equals our DESIRED absolute path  → already correct, skip;
+        //   - it carries our basename but a DIFFERENT (stale) path   → UPDATE it in place to the new
+        //     path and mark changed. This is the re-install case (a versioned/content-addressed
+        //     CLAUDE_PLUGIN_ROOT changes the absolute dir): a basename-only "already ours → continue"
+        //     would silently leave the stale, now-nonexistent path wired, so the hooks stop firing.
+        let mut found_ours = false;
+        let mut updated = false;
+        if let Some(arr) = doc
+            .get_mut("hooks")
+            .and_then(|h| h.as_table_mut())
+            .and_then(|h| h.get_mut(event))
+            .and_then(|i| i.as_array_of_tables_mut())
+        {
+            for grp in arr.iter_mut() {
+                let Some(inner) = grp.get_mut("hooks").and_then(|i| i.as_array_mut()) else {
+                    continue;
+                };
+                for h in inner.iter_mut() {
+                    let Some(t) = h.as_inline_table_mut() else {
+                        continue;
+                    };
+                    let is_ours = t
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|c| codex_hook_command_is_ours(c, script))
+                        .unwrap_or(false);
+                    if !is_ours {
+                        continue;
+                    }
+                    found_ours = true;
+                    let current_cmd = t.get("command").and_then(|v| v.as_str());
+                    if current_cmd != Some(command.as_str()) {
+                        t.insert("command", command.clone().into());
+                        updated = true;
+                    }
+                }
+            }
+        }
+        if found_ours {
+            // Our entry already exists; we either left it (correct path) or rewrote its command.
+            changed |= updated;
+            continue;
+        }
+
+        // Build our MatcherGroup: { matcher = "*", hooks = [{ type = "command", command = ... }] }.
+        let mut hook = toml_edit::InlineTable::new();
+        hook.insert("type", "command".into());
+        hook.insert("command", command.into());
+        let mut inner = toml_edit::Array::new();
+        inner.push(toml_edit::Value::InlineTable(hook));
+        let mut group = toml_edit::Table::new();
+        group["matcher"] = toml_edit::value("*");
+        group["hooks"] = toml_edit::value(inner);
+
+        // Ensure [hooks] exists, then append to (or create) the event's array-of-tables.
+        if !doc.contains_key("hooks") {
+            doc["hooks"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let hooks_tbl = doc["hooks"].as_table_mut().expect("hooks is a table");
+        if !hooks_tbl.contains_key(event) {
+            hooks_tbl.insert(event, toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+        }
+        if let Some(arr) = hooks_tbl.get_mut(event).and_then(|i| i.as_array_of_tables_mut()) {
+            arr.push(group);
+            changed = true;
+        }
+    }
+
+    if changed {
+        (doc.to_string(), true)
+    } else {
+        (current.to_string(), false)
+    }
+}
+
+/// PURE [hooks]-merge for DISABLE: remove ONLY the MatcherGroups whose command references one of
+/// OUR scripts (matched by basename), preserving every user hook entry. If removing our group
+/// empties an event's array, drop the now-empty array; if that empties `[hooks]`, drop it too.
+/// Returns the new full config text and whether anything changed.
+fn codex_hooks_disable_merge(current: &str) -> (String, bool) {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return (current.to_string(), false),
+    };
+    let mut changed = false;
+
+    for (event, script) in CODEX_HOOK_SCRIPTS {
+        let Some(hooks_tbl) = doc.get_mut("hooks").and_then(|i| i.as_table_mut()) else {
+            continue;
+        };
+        // Mirror enable's normalization so disable also reaches OUR entry when the event is written
+        // as an inline `SessionStart = [ {...} ]` array instead of `[[hooks.SessionStart]]`. Only
+        // normalize when OUR script is actually present in that inline array — otherwise we'd rewrite
+        // a purely-user inline array and spuriously report `changed` for a no-op disable.
+        let inline_has_ours = hooks_tbl
+            .get(event)
+            .filter(|i| i.as_array_of_tables().is_none())
+            .and_then(|i| i.as_array())
+            .map(|arr| {
+                arr.iter().any(|v| {
+                    v.as_inline_table()
+                        .and_then(|t| t.get("hooks"))
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|h| {
+                                h.as_inline_table()
+                                    .and_then(|t| t.get("command"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|c| codex_hook_command_is_ours(c, script))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if inline_has_ours {
+            let mut normalized = toml_edit::ArrayOfTables::new();
+            if let Some(arr) = hooks_tbl.get(event).and_then(|i| i.as_array()) {
+                for v in arr.iter() {
+                    if let Some(it) = v.as_inline_table() {
+                        normalized.push(it.clone().into_table());
+                    }
+                }
+            }
+            hooks_tbl.insert(event, toml_edit::Item::ArrayOfTables(normalized));
+        }
+        let Some(arr) = hooks_tbl.get_mut(event).and_then(|i| i.as_array_of_tables_mut()) else {
+            continue;
+        };
+        // Remove ONLY our hook entries from each group's `hooks` list, preserving any co-located
+        // USER hooks. Do NOT drop a whole MatcherGroup just because it also contains one of ours —
+        // that would delete a user hook sharing the group. The inner `hooks` may be either an inline
+        // array (`hooks = [ {..} ]`, the form `enable` writes) OR an array-of-tables
+        // (`[[..hooks]]`, a valid user-authored shape) — handle both.
+        for grp in arr.iter_mut() {
+            let Some(item) = grp.get_mut("hooks") else {
+                continue;
+            };
+            if let Some(inner) = item.as_array_mut() {
+                let before = inner.len();
+                inner.retain(|h| {
+                    !h.as_inline_table()
+                        .and_then(|t| t.get("command"))
+                        .and_then(|v| v.as_str())
+                        .map(|c| codex_hook_command_is_ours(c, script))
+                        .unwrap_or(false)
+                });
+                if inner.len() != before {
+                    changed = true;
+                }
+            } else if let Some(inner) = item.as_array_of_tables_mut() {
+                let before = inner.len();
+                inner.retain(|t| {
+                    !t.get("command")
+                        .and_then(|v| v.as_value())
+                        .and_then(|v| v.as_str())
+                        .map(|c| codex_hook_command_is_ours(c, script))
+                        .unwrap_or(false)
+                });
+                if inner.len() != before {
+                    changed = true;
+                }
+            }
+        }
+        // Drop groups whose `hooks` list is now empty (ours was the only entry); keep groups that
+        // still hold user hooks, and groups with no `hooks` key (an untouched user shape).
+        arr.retain(|grp| {
+            grp.get("hooks")
+                .map(|i| {
+                    if let Some(a) = i.as_array() {
+                        !a.is_empty()
+                    } else if let Some(a) = i.as_array_of_tables() {
+                        !a.is_empty()
+                    } else {
+                        true // unknown shape → keep (do not silently drop a user's group)
+                    }
+                })
+                .unwrap_or(true)
+        });
+        // Drop the now-empty event array.
+        if arr.is_empty() {
+            hooks_tbl.remove(event);
+        }
+    }
+
+    // Drop an emptied [hooks] parent.
+    let hooks_empty = doc
+        .get("hooks")
+        .and_then(|i| i.as_table_like())
+        .map(|t| t.is_empty())
+        .unwrap_or(false);
+    if hooks_empty {
+        doc.remove("hooks");
+    }
+
+    if changed {
+        (doc.to_string(), true)
+    } else {
+        (current.to_string(), false)
+    }
+}
+
+/// Atomically write `text` to `path` via a same-dir temp + rename (mirrors `atomic_write_json`'s
+/// durability contract for the TOML target). Creates the parent dir if absent.
+fn atomic_write_text(path: &Path, text: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(".config.toml.tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
+}
+
+/// `zlauder-hooks codex-config {enable,disable,show}`. Exit 0 = changed, 3 = no-op, non-zero =
+/// error/refusal. The merges are pure (`codex_enable_merge`/`codex_disable_merge`); this only does
+/// the I/O (read CODEX_HOME, apply, atomic write) + the exit-code mapping.
+fn codex_config_cmd(action: CodexConfigAction) -> Result<()> {
+    match action {
+        CodexConfigAction::Enable {
+            url,
+            provider_id,
+            hooks_dir,
+        } => {
+            let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
+            let path = codex_config_path()?;
+            // Distinguish "no file yet" (enable creates one) from an UNREADABLE existing file
+            // (permission error / invalid UTF-8). Swallowing the latter to an empty doc would let
+            // the atomic write replace — and silently destroy — the user's real config, violating
+            // the non-destructive-merge contract. Mirror the Disable path below.
+            let current = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            // Provider merge first (it owns the unparseable-TOML refusal). Then layer the hooks
+            // merge onto the resulting text. A run that changes EITHER the provider block or the
+            // [hooks] entries is Changed (exit 0); only an all-no-op run is exit 3.
+            let (after_provider, provider_changed) = match codex_enable_merge(&current, id, &url) {
+                CodexMergeOutcome::Changed(out) => (out, true),
+                CodexMergeOutcome::NoOp => (current.clone(), false),
+                CodexMergeOutcome::Refused(msg) => bail!(msg),
+            };
+            let (final_text, hooks_changed) = match hooks_dir {
+                Some(ref dir) => codex_hooks_enable_merge(&after_provider, dir),
+                None => (after_provider, false),
+            };
+            if provider_changed || hooks_changed {
+                atomic_write_text(&path, &final_text)?;
+                Ok(())
+            } else {
+                std::process::exit(3)
+            }
+        }
+        CodexConfigAction::Disable { provider_id } => {
+            let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
+            let path = codex_config_path()?;
+            let current = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No file → nothing to disable.
+                    std::process::exit(3);
+                }
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            // Remove the provider block (owns the unparseable refusal), then strip OUR hook
+            // entries. Changed if EITHER changed; an all-no-op run is exit 3.
+            let (after_provider, provider_changed) = match codex_disable_merge(&current, id) {
+                CodexMergeOutcome::Changed(out) => (out, true),
+                CodexMergeOutcome::NoOp => (current.clone(), false),
+                CodexMergeOutcome::Refused(msg) => bail!(msg),
+            };
+            let (final_text, hooks_changed) = codex_hooks_disable_merge(&after_provider);
+            if provider_changed || hooks_changed {
+                atomic_write_text(&path, &final_text)?;
+                Ok(())
+            } else {
+                std::process::exit(3)
+            }
+        }
+        CodexConfigAction::Show { provider_id } => {
+            let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
+            let path = codex_config_path()?;
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            let doc = current
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap_or_else(|_| toml_edit::DocumentMut::new());
+            let provider = doc
+                .get("model_provider")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unset)");
+            let base_url = doc
+                .get("model_providers")
+                .and_then(|i| i.as_table_like())
+                .and_then(|p| p.get(id))
+                .and_then(|i| i.as_table_like())
+                .and_then(|b| b.get("base_url"))
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unset)");
+            println!("model_provider = {provider}");
+            println!("model_providers.{id}.base_url = {base_url}");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex-session-start — the SessionStart hook verification delegate. Verifies the
+// config route + auth + /healthz identity + launch-generation, and emits ONLY a
+// schema-valid `hookSpecificOutput.additionalContext`: a NEUTRAL token-handling
+// onboarding when fully verified, a warn-only message otherwise — NEVER an
+// unqualified active-masking claim (SessionStart precedes egress, so the effective
+// route is unobservable). See `Cmd::CodexSessionStart`.
+//
+// The pure helpers below (`codex_route_from_config`, `session_start_ms_from_transcript`,
+// `launch_generation_ok`, `codex_session_start_verdict`, `session_start_output_json`) are
+// factored small + side-effect-free so the A7 intake-gate atomic can reuse them.
+// ---------------------------------------------------------------------------
+
+/// The loopback route this Codex session is configured for: `(base_url, port)`, returned IFF the
+/// effective top-level `model_provider` == `id` AND its `base_url` is exactly `http://127.0.0.1:<port>/v1`.
+/// Any other shape (foreign provider, non-loopback host, missing `/v1`, unparseable port) → `None`
+/// = NOT routed through us. Pure: parses the supplied config text, no I/O.
+fn codex_route_from_config(config_text: &str, id: &str) -> Option<(String, u16)> {
+    let doc = config_text.parse::<toml_edit::DocumentMut>().ok()?;
+    let sel = doc
+        .get("model_provider")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())?;
+    if sel != id {
+        return None;
+    }
+    let base_url = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|p| p.get(id))
+        .and_then(|i| i.as_table_like())
+        .and_then(|b| b.get("base_url"))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())?;
+    let port = loopback_v1_port(base_url)?;
+    Some((base_url.to_string(), port))
+}
+
+/// Parse `http://127.0.0.1:<port>/v1` → `<port>`. Requires the exact loopback host, an http scheme,
+/// and a `/v1` suffix (trailing slash tolerated). Anything else → `None`.
+fn loopback_v1_port(base_url: &str) -> Option<u16> {
+    let rest = base_url.strip_prefix("http://127.0.0.1:")?;
+    // Tolerate a trailing slash on the path.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let port_str = rest.strip_suffix("/v1")?;
+    // The port segment must be all digits (no extra path before /v1).
+    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port_str.parse::<u16>().ok()
+}
+
+/// Days in each (1-based) month of `year` (Gregorian, with leap years).
+fn days_in_month(year: i64, month: u32) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+/// The local timezone's offset from UTC, in seconds, for the instant `epoch_secs` (east-of-UTC
+/// positive). This is what reconciles the two launch-generation comparands: the Codex rollout
+/// filename encodes LOCAL naive wall-clock time, while a filesystem mtime is a true UTC epoch — so
+/// the two only compare correctly once the mtime is shifted into the same local-naive frame (see
+/// `config_mtime_local_naive_ms`). On unix we read `localtime_r(...).tm_gmtoff`; on non-unix
+/// (where the Codex hook does not run) we conservatively return `0` (treat local == UTC).
+#[cfg(unix)]
+fn local_utc_offset_secs(epoch_secs: i64) -> i64 {
+    // SAFETY: localtime_r writes into a caller-owned, zeroed `tm`; `t` is a valid pointer to a
+    // local time_t. No aliasing, no retained pointers past the call.
+    unsafe {
+        let t = epoch_secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset_secs(_epoch_secs: i64) -> i64 {
+    0
+}
+
+/// Civil (Y-M-D H:M:S) → ms serial, treating the components as a naive wall-clock (a deterministic
+/// civil→serial conversion, no timezone DB). The Codex rollout filename is LOCAL naive time, so the
+/// result is a LOCAL-NAIVE serial; the launch-generation guard compares it against a config mtime
+/// shifted into the same local-naive frame (see `codex_config_mtime_ms`). Returns `None` on an
+/// out-of-range field.
+fn civil_to_epoch_ms(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {
+    if !(1..=12).contains(&mo) || mi > 59 || s > 59 || h > 23 {
+        return None;
+    }
+    let dim = days_in_month(y, mo);
+    if d < 1 || (d as i64) > dim {
+        return None;
+    }
+    // Days from the Unix epoch (1970-01-01) to the start of this Y-M-D.
+    let mut days: i64 = 0;
+    if y >= 1970 {
+        for yr in 1970..y {
+            days += if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+        }
+    } else {
+        for yr in y..1970 {
+            days -= if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+        }
+    }
+    for m in 1..mo {
+        days += days_in_month(y, m);
+    }
+    days += (d as i64) - 1;
+    let secs = days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (s as i64);
+    Some(secs * 1_000)
+}
+
+/// Parse the SESSION-START timestamp from a Codex transcript (rollout) path. The filename encodes
+/// it as `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl` (the time fields dash-separated). Returns a
+/// LOCAL-NAIVE ms serial (the filename is local wall-clock; see `launch_generation_ok`). `None` for any
+/// path whose basename isn't a parseable `rollout-<ISO>` (fail-closed at the call site).
+fn session_start_ms_from_transcript(transcript_path: &str) -> Option<i64> {
+    // Basename only (tolerate both separators).
+    let base = transcript_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(transcript_path);
+    let stem = base.strip_prefix("rollout-")?;
+    // stem = "YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl". Split on 'T' into date and the rest.
+    let (date, rest) = stem.split_once('T')?;
+    let mut dparts = date.split('-');
+    let y: i64 = dparts.next()?.parse().ok()?;
+    let mo: u32 = dparts.next()?.parse().ok()?;
+    let d: u32 = dparts.next()?.parse().ok()?;
+    if dparts.next().is_some() {
+        return None; // more than 3 date parts → not our shape
+    }
+    // rest = "HH-MM-SS-<uuid>.jsonl"; the first three dash fields are the time.
+    let mut tparts = rest.splitn(4, '-');
+    let h: u32 = tparts.next()?.parse().ok()?;
+    let mi: u32 = tparts.next()?.parse().ok()?;
+    let s: u32 = tparts.next()?.parse().ok()?;
+    // REQUIRE the "<uuid>.jsonl" tail — fail closed on a truncated/ambiguous path. A real rollout
+    // name always carries the uuid + .jsonl suffix; A7's security gate reuses this helper for
+    // launch-generation evidence, so a permissive shape-match here is a narrow fail-open.
+    let tail = tparts.next()?;
+    if !tail.ends_with(".jsonl") || tail.len() <= ".jsonl".len() {
+        return None;
+    }
+    civil_to_epoch_ms(y, mo, d, h, mi, s)
+}
+
+/// LAUNCH-GENERATION guard. Codex resolves its provider AT LAUNCH; a config written DURING a
+/// running session does not route it. `true` IFF a session-start ts was parsed from the transcript
+/// AND `config_mtime_ms <= session_start_ms` (the route was present at launch). FAIL-CLOSED: an
+/// absent/unparseable transcript, or a config mtime NEWER than session-start (written this
+/// session), → `false` → the caller emits the restart/warn variant, never the onboarding.
+fn launch_generation_ok(transcript_path: Option<&str>, config_mtime_ms: i64) -> bool {
+    match transcript_path.and_then(session_start_ms_from_transcript) {
+        Some(session_start_ms) => config_mtime_ms <= session_start_ms,
+        None => false,
+    }
+}
+
+/// Which SessionStart additionalContext variant to emit, decided purely from the four verified
+/// signals. `route` is the parsed loopback route (None ⇒ not configured to route through us).
+/// The ordering is a fail-closed cascade: a failure at any earlier stage short-circuits to its
+/// warn-only variant, and ONLY the fully-verified path reaches `NeutralOnboarding`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionStartVerdict {
+    /// Not configured to route through us → warn-only, no masking claim, no additionalContext-as-claim.
+    NotRouted,
+    /// Configured but no usable exported OpenAI key → requests fail, nothing masked → warn-only.
+    AuthFail,
+    /// Auth ok but the /healthz identity probe couldn't confirm OUR proxy → warn-only.
+    ProxyDown,
+    /// Verified, but the config was written THIS session (not live until restart) → warn-only.
+    RestartNeeded,
+    /// Fully verified at launch → the NEUTRAL token-contract onboarding (NOT an active-masking claim).
+    NeutralOnboarding,
+}
+
+/// PURE decision logic. Returns WHICH variant to emit. The cascade is fail-closed: each stage
+/// gates the next, so a false at any stage degrades to that stage's warn-only verdict and the
+/// onboarding is reachable only when every signal is positively verified.
+fn codex_session_start_verdict(
+    routed: bool,
+    auth_ok: bool,
+    identity_ok: bool,
+    launch_gen_ok: bool,
+) -> SessionStartVerdict {
+    if !routed {
+        return SessionStartVerdict::NotRouted;
+    }
+    if !auth_ok {
+        return SessionStartVerdict::AuthFail;
+    }
+    if !identity_ok {
+        return SessionStartVerdict::ProxyDown;
+    }
+    if !launch_gen_ok {
+        return SessionStartVerdict::RestartNeeded;
+    }
+    SessionStartVerdict::NeutralOnboarding
+}
+
+/// The NEUTRAL token-contract onboarding. Conditional, NOT an unqualified active-masking claim:
+/// it never asserts "masking is active right now" / "your data is hidden", because SessionStart
+/// cannot observe the effective route. It frames the token contract and the per-prompt-verified
+/// caveat, and reminds the model that masking hides data from the PROVIDER, not from the user.
+const CODEX_NEUTRAL_ONBOARDING: &str = "This Codex session is configured to route through ZlauDeR, \
+    a LOCAL PII-masking proxy. If you receive tokens like `[EMAIL_ADDRESS_ab12]` or \
+    `[API_KEY_ab12c3]`, they are tokenized PII placeholders — handle them VERBATIM: do not \
+    over-redact, rewrite, or refuse them. In a routed session the real values are restored locally \
+    before they reach you, so the tokens stand in for the original data. Masking hides data from \
+    the PROVIDER, NOT from the user — never tell the user their data is hidden or redacted from \
+    them. Whether any individual prompt is actually routed is verified separately at send time.";
+
+/// The warn-only additionalContext for a given non-onboarding verdict. Each is explicit that
+/// NOTHING is assumed masked, and tells the user the concrete fix. NotRouted/error paths return
+/// their own copy at the call site (NotRouted still warns; it just isn't reached via this fn for
+/// the onboarding). NEVER an unqualified masking claim.
+fn session_start_warn_text(verdict: SessionStartVerdict) -> &'static str {
+    match verdict {
+        SessionStartVerdict::NotRouted => {
+            "ZlauDeR is installed but this Codex session is NOT routed through the masking proxy. \
+             Run the zlauder-openai enable skill, then restart codex. Do NOT assume any PII is \
+             masked in this session."
+        }
+        SessionStartVerdict::AuthFail => {
+            "ZlauDeR is configured for this Codex session, but no usable OpenAI API key is exported \
+             — Codex requests will FAIL at provider construction and nothing is masked because \
+             nothing is sent. Set OPENAI_API_KEY (sk-...) in your environment and restart codex. \
+             Do NOT assume PII is masked."
+        }
+        SessionStartVerdict::ProxyDown => {
+            "ZlauDeR is configured for this Codex session, but the masking proxy could not be \
+             reached/verified (it may be down, or a foreign listener holds the port). Until the \
+             proxy is confirmed, do NOT assume PII is masked — re-run the zlauder-openai enable \
+             skill or restart codex."
+        }
+        SessionStartVerdict::RestartNeeded => {
+            "ZlauDeR is configured, but this Codex session was started BEFORE routing was enabled \
+             (the config was written after launch). Codex resolves its provider at launch, so this \
+             session is NOT yet routed — restart codex once to activate masking. Until then, do \
+             NOT assume PII is masked."
+        }
+        // The onboarding verdict has no warn text; callers use CODEX_NEUTRAL_ONBOARDING.
+        SessionStartVerdict::NeutralOnboarding => CODEX_NEUTRAL_ONBOARDING,
+    }
+}
+
+/// Build the schema-valid SessionStart hook output for a verdict: exactly
+/// `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"<text>"}}` with NO
+/// top-level `env` key (which would make codex's deny_unknown_fields parse FAIL and silently drop
+/// the context). The `additionalContext` is the neutral onboarding for `NeutralOnboarding`, else
+/// the verdict's warn-only text — never an unqualified masking claim.
+fn session_start_output_json(verdict: SessionStartVerdict) -> Value {
+    let context = if verdict == SessionStartVerdict::NeutralOnboarding {
+        CODEX_NEUTRAL_ONBOARDING
+    } else {
+        session_start_warn_text(verdict)
+    };
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    })
+}
+
+/// Read `$CODEX_HOME/config.toml`'s mtime as a LOCAL-NAIVE epoch-ms comparand for the
+/// launch-generation guard. The mtime is a true UTC epoch, but `session_start_ms_from_transcript`
+/// returns the rollout filename's LOCAL naive wall-clock interpreted as a serial (via
+/// `civil_to_epoch_ms`). To compare in ONE frame, we shift the UTC mtime by the local UTC offset so
+/// it, too, is expressed as local-naive ms. (Without this shift the comparison is off by the local
+/// offset — east-of-UTC, a config written AFTER launch could spuriously pass the guard and yield a
+/// false NeutralOnboarding for an unrouted session.) On ANY failure (missing file, no mtime,
+/// clock-before-epoch, overflow) returns `i64::MAX` — the FAIL-CLOSED value forcing
+/// `launch_generation_ok` to false (restart variant), so an unreadable mtime can never produce a
+/// false onboarding.
+fn codex_config_mtime_ms(path: &Path) -> i64 {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => match mtime.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => {
+                let utc_ms = match i64::try_from(d.as_millis()) {
+                    Ok(ms) => ms,
+                    Err(_) => return i64::MAX,
+                };
+                // Shift UTC → local-naive: add the local offset at this instant (saturating keeps
+                // the fail-closed sentinel intact).
+                let offset_ms = local_utc_offset_secs(utc_ms / 1_000).saturating_mul(1_000);
+                utc_ms.saturating_add(offset_ms)
+            }
+            Err(_) => i64::MAX,
+        },
+        Err(_) => i64::MAX,
+    }
+}
+
+/// Extract `transcript_path` from the SessionStart stdin payload (best-effort). Absent/unparseable
+/// stdin → `None`, which the launch-generation guard treats as fail-closed.
+fn transcript_path_from_payload(stdin: &str) -> Option<String> {
+    string_field_from_payload(stdin, "transcript_path")
+}
+
+/// Extract the SessionStart payload's `cwd` (the Codex session's project directory) — the root that
+/// `ensure_up` / `intake_identity_ok` must run against, NOT the hook process CWD. Absent/unparseable
+/// stdin → `None`; the call site falls back to `project_root()` (fail-closed).
+fn cwd_from_payload(stdin: &str) -> Option<String> {
+    string_field_from_payload(stdin, "cwd")
+}
+
+/// Pull a non-empty top-level string field out of the SessionStart stdin payload (best-effort).
+fn string_field_from_payload(stdin: &str, field: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(stdin.trim()).ok()?;
+    v.get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `zlauder-hooks codex-session-start`. Reads the SessionStart payload on stdin, runs the
+/// config-route / auth / identity / launch-generation verification, and prints the schema-valid
+/// hook output. Exit is always 0 in the non-error path; diagnostics go to stderr.
+fn codex_session_start_cmd() -> Result<()> {
+    // Drain stdin (the SessionStart payload) so the pipe never blocks. Best-effort: an empty or
+    // unparseable payload degrades to a fail-closed (transcript-absent) verdict.
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let transcript_path = transcript_path_from_payload(&stdin);
+    // The SessionStart payload carries the Codex session's project dir as `cwd`. ensure_up /
+    // intake_identity_ok MUST run against THAT root, not the hook process CWD (CLAUDE_PROJECT_DIR is
+    // a Claude-Code var and is unlikely to be set under a Codex hook). Fail closed: fall back to
+    // project_root() only when `cwd` is absent/unparseable.
+    let session_cwd = cwd_from_payload(&stdin);
+
+    let id = CODEX_DEFAULT_PROVIDER_ID;
+    let config_path = match codex_config_path() {
+        Ok(p) => p,
+        Err(e) => {
+            // Can't even resolve CODEX_HOME → not routed; warn, never claim masking.
+            eprintln!("ZlauDeR: cannot resolve $CODEX_HOME ({e}); treating this Codex session as NOT routed.");
+            emit_verdict(SessionStartVerdict::NotRouted);
+            return Ok(());
+        }
+    };
+    let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    // STEP 1/2 — config route. Not our provider / not a loopback /v1 URL → NOT routed.
+    let Some((_base_url, port)) = codex_route_from_config(&config_text, id) else {
+        eprintln!(
+            "ZlauDeR: this Codex session is NOT routed through the masking proxy (no zlauder \
+             loopback provider in {}).",
+            config_path.display()
+        );
+        emit_verdict(SessionStartVerdict::NotRouted);
+        return Ok(());
+    };
+
+    // STEP 3 — auth reachability (the SAME classifier codex-auth-check uses). No usable exported
+    // sk- key → requests fail at provider construction → nothing masked.
+    let (_mode, auth_ok, _unmapped) = detect_codex_auth();
+    if !auth_ok {
+        eprintln!(
+            "ZlauDeR: this Codex session is configured to route, but no usable OPENAI_API_KEY is \
+             exported — requests will fail and nothing is masked."
+        );
+        emit_verdict(SessionStartVerdict::AuthFail);
+        return Ok(());
+    }
+
+    // STEP 4 — warm the proxy, then the 600ms /healthz nonce identity probe (reused unchanged).
+    let root = canonical(&session_cwd.map(PathBuf::from).unwrap_or_else(project_root));
+    match ensure_up(&root, None, &default_proxy_bin()) {
+        Ok(EnsureOutcome::Ours { .. }) => {}
+        Ok(EnsureOutcome::Failed { diag }) => {
+            eprintln!("ZlauDeR: could not bring the masking proxy up — {diag}");
+        }
+        Err(e) => {
+            eprintln!("ZlauDeR: could not bring the masking proxy up: {e}");
+        }
+    }
+    let identity_ok = intake_identity_ok(port, &root);
+    if !identity_ok {
+        eprintln!(
+            "ZlauDeR: configured to route on :{port}, but the masking proxy could not be \
+             identity-verified (down or a foreign listener) — making NO masking claim."
+        );
+        emit_verdict(SessionStartVerdict::ProxyDown);
+        return Ok(());
+    }
+
+    // STEP 5 — launch-generation: a config written DURING this session does not route it. Compare
+    // the session-start timestamp (from the transcript rollout filename) to config.toml's mtime.
+    let config_mtime_ms = codex_config_mtime_ms(&config_path);
+    let launch_gen_ok = launch_generation_ok(transcript_path.as_deref(), config_mtime_ms);
+    if !launch_gen_ok {
+        eprintln!(
+            "ZlauDeR: routing config is present but this Codex session predates it (or the \
+             session-start timestamp could not be parsed) — restart codex once to activate \
+             masking. Making NO masking claim for this session."
+        );
+    }
+
+    let verdict = codex_session_start_verdict(true, true, true, launch_gen_ok);
+    emit_verdict(verdict);
+    Ok(())
+}
+
+/// Print the schema-valid SessionStart hook output for `verdict` to stdout (single line of JSON).
+fn emit_verdict(verdict: SessionStartVerdict) {
+    println!("{}", session_start_output_json(verdict));
+}
+
+// ===========================================================================
+// codex-user-prompt-submit (A7): the fail-CLOSED Codex intake gate
+// ===========================================================================
+
+/// The non-empty BLOCK reason — codex's `parse_user_prompt_submit` DROPS a block with an
+/// empty/absent reason (invalid_block_reason → fail-OPEN), so this MUST stay non-empty.
+const CODEX_INTAKE_BLOCK_REASON: &str = "ZlauDeR: this Codex session is not confirmed routed \
+    through the masking proxy (not enabled / proxy down / not restarted since enable) — your PII \
+    would egress UNMASKED. Run the zlauder-openai enable skill and restart codex, or /zlauder:verify. \
+    To send anyway, set ZLAUDER_NO_INTAKE_GATE=1.";
+
+/// The non-blocking override-warn additionalContext — emitted ALONGSIDE an ALLOW (no `decision`
+/// field) when the config selects the proxy but A8 sees no traffic from this session (a likely
+/// `-c`/`-p` provider override defeating the route).
+const CODEX_OVERRIDE_WARN: &str = "ZlauDeR: this Codex session's config selects the masking proxy, \
+    but no traffic from this session has reached it — if you launched codex with -p/-c overriding \
+    the provider, your PII is NOT being masked. Restart without the override, or run /zlauder:verify.";
+
+/// The NEW Codex intake predicate — distinct from the CLAUDE `intake_should_block_verified`, which
+/// ALLOWs whenever `plumbed == false`. For Codex the goal is the OPPOSITE: an UNCONFIGURED session
+/// (no zlauder provider ⇒ `route_confirmed == false`) must BLOCK its PII. There is NO `plumbed` term
+/// — its absence IS the fix. BLOCK iff not escape-hatched, not opted out, and the route is NOT
+/// confirmed. Every ALLOW path (route confirmed, opted out, escape hatch) returns false here; the
+/// `/zlauder:` passthrough is handled at the call site (not a predicate input).
+fn codex_intake_should_block(opted_out: bool, route_confirmed: bool, escape_hatch: bool) -> bool {
+    !escape_hatch && !opted_out && !route_confirmed
+}
+
+/// `route_confirmed` — computed from the SAME three facts A2's SessionStart gathers, ALL checkable
+/// at intake WITHOUT egress: (a) config selects our zlauder loopback `/v1` provider, (b) the
+/// `/healthz` nonce identity probe confirms OUR live proxy on that port, (c) launch-generation (the
+/// session was launched AFTER the route was written). There is deliberately NO `not-overridden` and
+/// NO A8-inbound conjunct — both would deadlock turn 1 (the intake hook fires BEFORE the first prompt
+/// egresses, so requiring a prior inbound to ALLOW never bootstraps). Pure for testing.
+fn codex_route_confirmed(
+    config_selects_loopback: bool,
+    identity_ok: bool,
+    launch_generation_ok: bool,
+) -> bool {
+    config_selects_loopback && identity_ok && launch_generation_ok
+}
+
+/// FIRST-TURN DISCRIMINATOR for the override-warn (pure). A8 reports `routed_recently == false` on
+/// the FIRST UserPromptSubmit of EVERY session (routed or not), because the intake hook fires before
+/// the first prompt egresses. So warn ONLY when a PRIOR prompt of this session was ALLOWED by the
+/// gate (`prior_allowed_count >= 1`) AND A8 STILL reports no inbound (`!a8_routed_recently`). The
+/// marker advances ONLY on an ALLOW (a blocked prompt never egressed), so it never over-warns a
+/// correctly-routed session's first prompt.
+fn should_emit_override_warn(prior_allowed_count: u32, a8_routed_recently: bool) -> bool {
+    prior_allowed_count >= 1 && !a8_routed_recently
+}
+
+/// The HARD-block hook output: exactly `{"decision":"block","reason":<non-empty>}`. The reason MUST
+/// be non-empty (codex drops an empty-reason block → fail-open).
+fn codex_block_output_json(reason: &str) -> Value {
+    json!({ "decision": "block", "reason": reason })
+}
+
+/// The non-blocking override-warn hook output: a warn-alongside-ALLOW with NO `decision` field —
+/// `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":<string>}}`.
+fn codex_override_warn_output_json(context: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    })
+}
+
+/// Per-session ALLOWED-prompt counter path (`<state_dir>/codex-intake/<conversation>.json`). Reuses
+/// the same state-dir machinery as the Claude session-status delta, in a DISTINCT subdir so it never
+/// collides with the MaskState records. `None` if the state dir can't be resolved/created.
+fn codex_intake_marker_path(conversation: &str) -> Option<PathBuf> {
+    let dir = zlauder_state::state_dir().ok()?.join("codex-intake");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{conversation}.json")))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CodexIntakeMarker {
+    /// Count of prompts this session that the gate ALLOWED (route_confirmed). Advances ONLY on an
+    /// ALLOW — a blocked prompt never egressed, so it must not count as a prior egress-capable turn.
+    allowed_count: u32,
+}
+
+/// Read this session's prior ALLOWED-prompt count (0 if absent/unreadable — fail-closed toward
+/// NOT warning on the first turn).
+fn read_codex_allowed_count(conversation: &str) -> u32 {
+    codex_intake_marker_path(conversation)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<CodexIntakeMarker>(&raw).ok())
+        .map(|m| m.allowed_count)
+        .unwrap_or(0)
+}
+
+/// Persist an incremented ALLOWED count for this session (best-effort — never fails the hook).
+fn bump_codex_allowed_count(conversation: &str, prior: u32) {
+    if let Some(path) = codex_intake_marker_path(conversation) {
+        let next = CodexIntakeMarker { allowed_count: prior.saturating_add(1) };
+        if let Ok(raw) = serde_json::to_string(&next) {
+            let _ = std::fs::write(path, raw);
+        }
+    }
+}
+
+/// Query A8's authenticated `GET /zlauder/session/{session_id}/routed` on the proxy port. Returns
+/// `Some(routed_recently)` on a successful authed read, `None` when A8 is UNAVAILABLE (no verified
+/// proxy / no admin key / unreachable / non-2xx / unparseable). The override-warn degrades to ABSENT
+/// on `None` — it NEVER blocks and never errors the hook. Identity is single-sourced through
+/// `verified_proxy_rec` so the admin key is only ever handed to OUR nonce-verified proxy. `raw_session_id`
+/// is the UNSANITIZED UUID codex sends as the session/thread header (the key A8 indexes `last_seen` by).
+fn a8_routed_recently(port: u16, root: &str, raw_session_id: &str) -> Option<bool> {
+    let client = reqwest::blocking::Client::builder().build().ok()?;
+    let timeout = Duration::from_millis(600);
+    // Reuse the gate's identity probe to (a) confirm OUR proxy and (b) get its admin key.
+    let rec = verified_proxy_rec(port, root, &client, timeout)?;
+    let resp = client
+        .get(format!(
+            "http://127.0.0.1:{port}/zlauder/session/{raw_session_id}/routed"
+        ))
+        .timeout(timeout)
+        .header("x-zlauder-key", &rec.admin_key)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?;
+    let v: Value = resp.json().ok()?;
+    v.get("routed_recently").and_then(Value::as_bool)
+}
+
+/// `zlauder-hooks codex-session-routed <session_id>` — the KEY-BEARING per-session override report
+/// for the verify skill. Resolves this project's proxy port from the live `$CODEX_HOME` route (the
+/// same source the intake hook uses), then performs the authenticated A8 read via [`a8_routed_recently`]
+/// (which supplies the admin key from the nonce-verified proxy identity). Prints a single human line
+/// and ALWAYS exits 0 — it is a report, never a gate. A bare keyless curl from the skill would always
+/// 403 against this key-gated endpoint; this subcommand is the only way the skill can read it.
+fn codex_session_routed_cmd(session_id: &str) -> Result<()> {
+    let root = canonical(&project_root());
+    // Resolve our loopback port from the codex config route (matches the hook's port source).
+    let port = codex_config_path()
+        .ok()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .and_then(|text| codex_route_from_config(&text, CODEX_DEFAULT_PROVIDER_ID))
+        .map(|(_url, port)| port);
+
+    let verdict = match port {
+        Some(p) => a8_routed_recently(p, &root, session_id),
+        None => None,
+    };
+    match verdict {
+        Some(true) => println!("routed"),
+        Some(false) => println!("not-routed"),
+        None => println!("unavailable"),
+    }
+    Ok(())
+}
+
+/// `zlauder-hooks codex-user-prompt-submit`. Reads the UserPromptSubmit payload on stdin, computes
+/// the fail-CLOSED route_confirmed gate, and either BLOCKs (non-empty reason) or ALLOWs — emitting a
+/// secondary non-blocking override-warn on the 2nd+ allowed prompt when A8 shows no inbound. Exit is
+/// always 0 in the non-error path; diagnostics go to stderr.
+fn codex_user_prompt_submit_cmd() -> Result<()> {
+    // Drain stdin (the UserPromptSubmit payload) so the pipe never blocks. A malformed/empty payload
+    // degrades to an empty prompt + absent fields → no command match, route_confirmed false → BLOCK
+    // (fail-closed), never a panic on this safety path.
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let prompt = prompt_from_hook_payload(&stdin).unwrap_or_default();
+    // The RAW session_id UUID (A8 keys last_seen by it) and the filename-safe marker key.
+    let raw_session_id = string_field_from_payload(&stdin, "session_id");
+    let conversation = conversation_id_from_hook_payload(&stdin);
+    let transcript_path = transcript_path_from_payload(&stdin);
+    let session_cwd = cwd_from_payload(&stdin);
+    let root = canonical(&session_cwd.map(PathBuf::from).unwrap_or_else(project_root));
+
+    // --- gather facts (all LOCAL/short-bounded; the BLOCK never depends on A8) ----------------
+    let id = CODEX_DEFAULT_PROVIDER_ID;
+    let opted_out =
+        zlauder_state::registry_get(&root) == Some(zlauder_state::PlumbState::Optout);
+    // VALUE-aware escape hatch (mirrors the Claude path): only an explicitly truthy value opens the
+    // hatch — `=0` does NOT (it disables a fail-CLOSED security control).
+    let escape_hatch = std::env::var("ZLAUDER_NO_INTAKE_GATE")
+        .map(|v| is_truthy_flag(&v))
+        .unwrap_or(false);
+
+    // route_confirmed = config-selects-zlauder-loopback AND identity_ok AND launch_generation_ok.
+    let config_path = codex_config_path();
+    let route = config_path
+        .as_ref()
+        .ok()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .and_then(|text| codex_route_from_config(&text, id));
+    let config_selects_loopback = route.is_some();
+    let identity_ok = route
+        .as_ref()
+        .is_some_and(|(_url, port)| intake_identity_ok(*port, &root));
+    let launch_gen_ok = match config_path.as_ref() {
+        Ok(p) => launch_generation_ok(transcript_path.as_deref(), codex_config_mtime_ms(p)),
+        Err(_) => false,
+    };
+    let route_confirmed =
+        codex_route_confirmed(config_selects_loopback, identity_ok, launch_gen_ok);
+
+    // --- the fail-CLOSED decision (independent of A8) -----------------------------------------
+    // BLOCK iff the gate fires AND the prompt isn't a `/zlauder:` control-plane command — the
+    // recovery levers must never be trapped inside the gate they'd release. A `/zlauder:` byte-0
+    // command is ZlauDeR's own command text (no zlauder command takes a PII arg), so passing it
+    // through widens nothing.
+    if codex_intake_should_block(opted_out, route_confirmed, escape_hatch)
+        && !prompt_is_zlauder_command(&prompt)
+    {
+        eprintln!(
+            "ZlauDeR: BLOCKED this Codex prompt — route not confirmed (config_selects_loopback={}, \
+             identity_ok={}, launch_generation_ok={}).",
+            config_selects_loopback, identity_ok, launch_gen_ok
+        );
+        // Hard block with a NON-EMPTY reason (an empty reason is dropped by codex → fail-open).
+        println!("{}", codex_block_output_json(CODEX_INTAKE_BLOCK_REASON));
+        return Ok(());
+    }
+
+    // --- ALLOW ---------------------------------------------------------------------------------
+    // The override-warn is the SECONDARY, non-blocking layer. It only applies on a route-confirmed
+    // ALLOW (an opt-out / escape-hatch / `/zlauder:` ALLOW has no proxy route to compare against).
+    // The marker advances ONLY here (route_confirmed ALLOW), so the first-turn discriminator can
+    // tell a genuine first prompt from a 2nd+ prompt that still shows zero inbound.
+    if route_confirmed && let Some(conv) = conversation.as_deref() {
+        let prior_allowed = read_codex_allowed_count(conv);
+        // Query A8 (best-effort, fail-graceful). The warn is ABSENT when A8 is unavailable.
+        let port = route.as_ref().map(|(_u, p)| *p);
+        let a8 = match (port, raw_session_id.as_deref()) {
+            (Some(p), Some(sid)) => a8_routed_recently(p, &root, sid),
+            _ => None,
+        };
+        if let Some(routed_recently) = a8
+            && should_emit_override_warn(prior_allowed, routed_recently)
+        {
+            println!(
+                "{}",
+                codex_override_warn_output_json(CODEX_OVERRIDE_WARN)
+            );
+        }
+        // Advance the per-session ALLOWED counter (this prompt is route-confirmed → egress-capable).
+        bump_codex_allowed_count(conv, prior_allowed);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod codex_user_prompt_submit_tests {
+    use super::{
+        CODEX_INTAKE_BLOCK_REASON, CODEX_OVERRIDE_WARN, codex_block_output_json,
+        codex_intake_should_block, codex_override_warn_output_json, codex_route_confirmed,
+        should_emit_override_warn,
+    };
+    use serde_json::Value;
+
+    // --- codex_intake_should_block: full 8-row truth table -----------------------
+    // BLOCK iff !escape_hatch && !opted_out && !route_confirmed.
+    #[test]
+    fn intake_should_block_truth_table() {
+        for opted_out in [false, true] {
+            for route_confirmed in [false, true] {
+                for escape_hatch in [false, true] {
+                    let expected = !escape_hatch && !opted_out && !route_confirmed;
+                    assert_eq!(
+                        codex_intake_should_block(opted_out, route_confirmed, escape_hatch),
+                        expected,
+                        "opted_out={opted_out} route_confirmed={route_confirmed} escape_hatch={escape_hatch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unconfigured_session_blocks() {
+        // THE central FINDING-1 case: nothing opted out, no route, no hatch ⇒ BLOCK (the opposite
+        // of the Claude predicate, which ALLOWs when plumbed==false).
+        assert!(codex_intake_should_block(false, false, false));
+    }
+
+    #[test]
+    fn allow_paths_do_not_block() {
+        // route confirmed ⇒ allow
+        assert!(!codex_intake_should_block(false, true, false));
+        // opted out ⇒ allow
+        assert!(!codex_intake_should_block(true, false, false));
+        // escape-hatched ⇒ allow (even when not routed)
+        assert!(!codex_intake_should_block(false, false, true));
+    }
+
+    // --- codex_route_confirmed composition ---------------------------------------
+    #[test]
+    fn route_confirmed_requires_all_three() {
+        assert!(codex_route_confirmed(true, true, true));
+        // any single false ⇒ not confirmed
+        assert!(!codex_route_confirmed(false, true, true)); // config not selecting our loopback
+        assert!(!codex_route_confirmed(true, false, true)); // identity probe failed
+        assert!(!codex_route_confirmed(true, true, false)); // launched before route written
+        assert!(!codex_route_confirmed(false, false, false));
+    }
+
+    // --- BLOCK output shape ------------------------------------------------------
+    #[test]
+    fn block_output_is_decision_block_with_nonempty_reason() {
+        let v = codex_block_output_json(CODEX_INTAKE_BLOCK_REASON);
+        assert_eq!(v.get("decision").and_then(Value::as_str), Some("block"));
+        let reason = v.get("reason").and_then(Value::as_str).expect("reason present");
+        assert!(!reason.is_empty(), "reason MUST be non-empty (codex drops empty-reason blocks)");
+        // exactly two keys, no extras.
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2);
+        assert!(obj.contains_key("decision") && obj.contains_key("reason"));
+    }
+
+    // --- override-warn output shape (warn alongside ALLOW, NO decision key) -------
+    #[test]
+    fn override_warn_output_has_no_decision_key() {
+        let v = codex_override_warn_output_json(CODEX_OVERRIDE_WARN);
+        assert!(v.get("decision").is_none(), "a warn must NOT carry a decision (would block)");
+        let hso = v.get("hookSpecificOutput").expect("hookSpecificOutput present");
+        assert_eq!(
+            hso.get("hookEventName").and_then(Value::as_str),
+            Some("UserPromptSubmit")
+        );
+        let ctx = hso
+            .get("additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext present");
+        assert!(!ctx.is_empty());
+    }
+
+    // --- first-turn discriminator ------------------------------------------------
+    #[test]
+    fn override_warn_suppressed_on_first_allowed_prompt() {
+        // First allowed prompt (count 0): A8 ALWAYS reports false here (hook fires pre-egress) →
+        // must NOT warn, regardless of a8.
+        assert!(!should_emit_override_warn(0, false));
+        assert!(!should_emit_override_warn(0, true));
+    }
+
+    #[test]
+    fn override_warn_only_on_second_plus_with_no_inbound() {
+        // 2nd+ allowed prompt AND A8 still shows no inbound ⇒ warn.
+        assert!(should_emit_override_warn(1, false));
+        assert!(should_emit_override_warn(5, false));
+        // A8 confirms inbound ⇒ no warn (the route is working).
+        assert!(!should_emit_override_warn(1, true));
+        assert!(!should_emit_override_warn(5, true));
+    }
+}
+
+#[cfg(test)]
+mod codex_session_start_tests {
+    use super::{
+        CODEX_DEFAULT_PROVIDER_ID, CODEX_NEUTRAL_ONBOARDING, SessionStartVerdict,
+        codex_config_mtime_ms, codex_route_from_config, codex_session_start_verdict,
+        cwd_from_payload, launch_generation_ok, local_utc_offset_secs,
+        session_start_ms_from_transcript, session_start_output_json, transcript_path_from_payload,
+    };
+    use serde_json::Value;
+
+    const ID: &str = CODEX_DEFAULT_PROVIDER_ID;
+
+    // --- codex_route_from_config -------------------------------------------------
+
+    #[test]
+    fn route_matches_our_loopback_v1_provider() {
+        let cfg = "model_provider = \"zlauder\"\n\
+                   [model_providers.zlauder]\n\
+                   base_url = \"http://127.0.0.1:18920/v1\"\n";
+        assert_eq!(
+            codex_route_from_config(cfg, ID),
+            Some(("http://127.0.0.1:18920/v1".to_string(), 18920))
+        );
+    }
+
+    #[test]
+    fn route_none_when_provider_is_foreign() {
+        // Our block exists but the selected provider is someone else's → NOT routed.
+        let cfg = "model_provider = \"openai\"\n\
+                   [model_providers.zlauder]\n\
+                   base_url = \"http://127.0.0.1:18920/v1\"\n";
+        assert_eq!(codex_route_from_config(cfg, ID), None);
+    }
+
+    #[test]
+    fn route_none_when_base_url_not_loopback_v1() {
+        // Selected as our provider, but the URL is not a loopback /v1 endpoint.
+        for url in [
+            "https://api.openai.com/v1",
+            "http://10.0.0.1:18920/v1",
+            "http://127.0.0.1:18920",       // missing /v1
+            "http://127.0.0.1:abc/v1",      // non-numeric port
+            "http://127.0.0.1:18920/extra/v1", // extra path segment
+        ] {
+            let cfg = format!(
+                "model_provider = \"zlauder\"\n[model_providers.zlauder]\nbase_url = \"{url}\"\n"
+            );
+            assert_eq!(codex_route_from_config(&cfg, ID), None, "url={url}");
+        }
+    }
+
+    #[test]
+    fn route_tolerates_trailing_slash() {
+        let cfg = "model_provider = \"zlauder\"\n\
+                   [model_providers.zlauder]\n\
+                   base_url = \"http://127.0.0.1:7777/v1/\"\n";
+        assert_eq!(
+            codex_route_from_config(cfg, ID).map(|(_, p)| p),
+            Some(7777)
+        );
+    }
+
+    // --- session_start_ms_from_transcript ---------------------------------------
+
+    #[test]
+    fn transcript_ts_parses_rollout_filename() {
+        let p = "/home/u/.codex/sessions/2026/06/26/rollout-2026-06-26T15-23-18-2f9c0b1a-1111-2222-3333-444455556666.jsonl";
+        // Expected: 2026-06-26T15:23:18 as epoch ms (civil-as-UTC).
+        // Days from 1970-01-01 to 2026-06-26 computed by the same algorithm.
+        let got = session_start_ms_from_transcript(p).expect("should parse");
+        // Sanity: it must be a positive, second-granular ms value matching the civil time.
+        // Reconstruct via the public helper to avoid hard-coding the constant.
+        assert!(got > 0);
+        assert_eq!(got % 1000, 0, "second granularity");
+        // 15:23:18 within its day = 15*3600 + 23*60 + 18 = 55398 s.
+        let within_day_ms = got - day_floor_ms(got);
+        assert_eq!(within_day_ms, 55_398 * 1000);
+    }
+
+    // Floor an epoch-ms to the start of its UTC day.
+    fn day_floor_ms(ms: i64) -> i64 {
+        let day = 86_400_000;
+        (ms / day) * day
+    }
+
+    #[test]
+    fn transcript_ts_none_for_non_rollout_path() {
+        assert_eq!(session_start_ms_from_transcript("/tmp/notes.txt"), None);
+        assert_eq!(
+            session_start_ms_from_transcript("/x/rollout-not-a-time-uuid.jsonl"),
+            None
+        );
+        assert_eq!(session_start_ms_from_transcript(""), None);
+    }
+
+    #[test]
+    fn transcript_ts_fails_closed_on_truncated_or_tailless_path() {
+        // A truncated rollout name with the time but NO uuid/.jsonl tail must NOT parse — fail
+        // closed (A7's gate reuses this for launch-generation evidence; a permissive parse there
+        // would be a narrow fail-open).
+        assert_eq!(
+            session_start_ms_from_transcript("rollout-2026-06-26T15-23-18"),
+            None,
+            "truncated path (no uuid/.jsonl tail) must fail closed"
+        );
+        // uuid present but wrong suffix → still rejected.
+        assert_eq!(
+            session_start_ms_from_transcript("rollout-2026-06-26T15-23-18-abcd.txt"),
+            None
+        );
+        // empty tail before suffix (just ".jsonl") → rejected.
+        assert_eq!(
+            session_start_ms_from_transcript("rollout-2026-06-26T15-23-18-.jsonl"),
+            None
+        );
+        // the genuine shape still parses.
+        assert!(
+            session_start_ms_from_transcript(
+                "rollout-2026-06-26T15-23-18-2f9c0b1a-1111-2222-3333-444455556666.jsonl"
+            )
+            .is_some()
+        );
+    }
+
+    // --- launch_generation_ok ----------------------------------------------------
+
+    #[test]
+    fn launch_gen_true_when_config_older_than_session_start() {
+        let p = "rollout-2026-06-26T15-23-18-uuid.jsonl";
+        let ss = session_start_ms_from_transcript(p).unwrap();
+        // config written one second BEFORE session start → present at launch → ok.
+        assert!(launch_generation_ok(Some(p), ss - 1000));
+        // Equal mtime is also "present at launch".
+        assert!(launch_generation_ok(Some(p), ss));
+    }
+
+    #[test]
+    fn launch_gen_false_when_config_newer_than_session_start() {
+        let p = "rollout-2026-06-26T15-23-18-uuid.jsonl";
+        let ss = session_start_ms_from_transcript(p).unwrap();
+        // config written AFTER session start → written this session → not yet routing.
+        assert!(!launch_generation_ok(Some(p), ss + 1000));
+    }
+
+    #[test]
+    fn launch_gen_false_when_transcript_unparseable_or_absent() {
+        assert!(!launch_generation_ok(None, 0));
+        assert!(!launch_generation_ok(Some("/tmp/notes.txt"), 0));
+    }
+
+    // --- codex_session_start_verdict (the truth table) ---------------------------
+
+    #[test]
+    fn verdict_truth_table() {
+        use SessionStartVerdict::*;
+        // not routed → NotRouted (the other signals are irrelevant)
+        assert_eq!(codex_session_start_verdict(false, true, true, true), NotRouted);
+        assert_eq!(codex_session_start_verdict(false, false, false, false), NotRouted);
+        // routed + auth_ok=false → AuthFail
+        assert_eq!(codex_session_start_verdict(true, false, true, true), AuthFail);
+        // routed + auth ok + identity_ok=false → ProxyDown
+        assert_eq!(codex_session_start_verdict(true, true, false, true), ProxyDown);
+        // routed + auth ok + identity ok + launch_gen_ok=false → RestartNeeded
+        assert_eq!(codex_session_start_verdict(true, true, true, false), RestartNeeded);
+        // fully verified → NeutralOnboarding
+        assert_eq!(codex_session_start_verdict(true, true, true, true), NeutralOnboarding);
+    }
+
+    // --- emitted JSON shape (schema-valid; NO top-level env key) ------------------
+
+    #[test]
+    fn emitted_json_is_schema_valid_for_every_variant() {
+        use SessionStartVerdict::*;
+        for v in [AuthFail, ProxyDown, RestartNeeded, NeutralOnboarding, NotRouted] {
+            let out = session_start_output_json(v);
+            // Re-parse to be sure it's valid JSON and inspect top-level keys.
+            let parsed: Value = serde_json::from_str(&out.to_string()).unwrap();
+            let obj = parsed.as_object().expect("top-level object");
+            // The ONLY top-level key must be hookSpecificOutput (no env key — that re-introduces
+            // the parse-drop bug under codex's deny_unknown_fields).
+            assert_eq!(obj.len(), 1, "exactly one top-level key for {v:?}: {obj:?}");
+            assert!(obj.contains_key("hookSpecificOutput"), "{v:?}");
+            assert!(!obj.contains_key("env"), "no top-level env key for {v:?}");
+            let hso = obj["hookSpecificOutput"].as_object().expect("hso object");
+            assert_eq!(
+                hso.get("hookEventName").and_then(Value::as_str),
+                Some("SessionStart"),
+                "{v:?}"
+            );
+            assert!(
+                hso.get("additionalContext").and_then(Value::as_str).is_some(),
+                "additionalContext present for {v:?}"
+            );
+        }
+    }
+
+    // --- the onboarding text carries NO unqualified active-masking assertion ------
+
+    #[test]
+    fn neutral_onboarding_makes_no_unqualified_masking_claim() {
+        let text = CODEX_NEUTRAL_ONBOARDING.to_lowercase();
+        // Banned unqualified active-masking phrasings.
+        for banned in [
+            "masking is active",
+            "your data is hidden",
+            "is masking this project",
+            "data is hidden from you",
+            "your data is masked",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "onboarding must not assert {banned:?}: {CODEX_NEUTRAL_ONBOARDING}"
+            );
+        }
+        // The token-handling guidance MUST be present.
+        assert!(text.contains("verbatim"), "token-verbatim guidance present");
+        assert!(
+            text.contains("placeholder"),
+            "token-placeholder guidance present"
+        );
+        // And the provider-not-user caveat must be present.
+        assert!(
+            text.contains("from the provider, not from the user"),
+            "provider-not-user caveat present"
+        );
+    }
+
+    // The same banned-phrase guard, applied to the EMITTED onboarding additionalContext.
+    #[test]
+    fn emitted_onboarding_additional_context_has_no_masking_claim() {
+        let out = session_start_output_json(SessionStartVerdict::NeutralOnboarding);
+        let ctx = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        for banned in ["masking is active", "your data is hidden", "is masking this project"] {
+            assert!(!ctx.contains(banned), "emitted context asserts {banned:?}");
+        }
+    }
+
+    // --- payload field extraction (cwd + transcript_path) [Fix 2] ----------------
+
+    #[test]
+    fn payload_extracts_cwd_and_transcript_path() {
+        let payload = r#"{
+            "session_id": "2f9c0b1a-1111-2222-3333-444455556666",
+            "transcript_path": "/home/u/.codex/sessions/2026/06/26/rollout-2026-06-26T15-23-18-uuid.jsonl",
+            "cwd": "/home/u/Projects/myproj",
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        }"#;
+        assert_eq!(
+            cwd_from_payload(payload).as_deref(),
+            Some("/home/u/Projects/myproj"),
+            "cwd is the Codex session project dir — must drive root, not the hook CWD"
+        );
+        assert_eq!(
+            transcript_path_from_payload(payload).as_deref(),
+            Some("/home/u/.codex/sessions/2026/06/26/rollout-2026-06-26T15-23-18-uuid.jsonl")
+        );
+    }
+
+    #[test]
+    fn payload_fields_none_when_absent_or_unparseable() {
+        // Absent fields → None (call site fails closed to project_root()).
+        assert_eq!(cwd_from_payload(r#"{"session_id":"x"}"#), None);
+        assert_eq!(transcript_path_from_payload(r#"{"session_id":"x"}"#), None);
+        // Empty string is treated as absent.
+        assert_eq!(cwd_from_payload(r#"{"cwd":""}"#), None);
+        // Unparseable stdin → None, never a panic.
+        assert_eq!(cwd_from_payload("not json"), None);
+        assert_eq!(cwd_from_payload(""), None);
+        assert_eq!(transcript_path_from_payload(""), None);
+    }
+
+    // --- config mtime is in the SAME (local-naive) frame as the transcript ts [Fix 1] ---
+    //
+    // The launch-generation guard compares the rollout filename's LOCAL-naive wall-clock against
+    // config.toml's mtime. The mtime is a true UTC epoch, so codex_config_mtime_ms MUST shift it by
+    // the local UTC offset into the local-naive frame — otherwise the comparison is off by the
+    // offset (east-of-UTC: a config written after launch spuriously passes the guard).
+    #[test]
+    fn config_mtime_is_local_naive_frame() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Pick a fixed UTC instant and stamp a temp file's mtime to it.
+        let utc_secs: i64 = 1_750_000_000; // some 2025 instant
+        let path = std::env::temp_dir().join(format!(
+            "zlauder_a2_mtime_test_{}_{}.toml",
+            std::process::id(),
+            utc_secs
+        ));
+        std::fs::write(&path, b"model_provider = \"zlauder\"\n").expect("write temp config");
+        let target = UNIX_EPOCH + Duration::from_secs(utc_secs as u64);
+        // Set the file's mtime to the known UTC instant.
+        filetime_set(&path, target);
+
+        let got = codex_config_mtime_ms(&path);
+        let _ = std::fs::remove_file(&path);
+
+        // Expected: the UTC ms shifted into local-naive by the local offset at that instant.
+        let offset_ms = local_utc_offset_secs(utc_secs) * 1000;
+        let expected_local_naive_ms = utc_secs * 1000 + offset_ms;
+        assert_eq!(
+            got, expected_local_naive_ms,
+            "config mtime must be expressed in the local-naive frame (UTC + local offset)"
+        );
+
+        // And critically: it must compare correctly against a same-instant transcript ts that
+        // EXPRESSES that local wall-clock in its filename. Build such a filename from the local
+        // civil components of `target` and assert the guard sees them as equal-at-launch.
+        let p = rollout_path_for_local_naive_ms(expected_local_naive_ms);
+        let ss = session_start_ms_from_transcript(&p).expect("rollout parses");
+        assert_eq!(
+            ss, got,
+            "a config saved at the SAME instant the session launched must read equal, not offset"
+        );
+        assert!(
+            launch_generation_ok(Some(&p), got),
+            "equal mtime == session-start is 'present at launch'"
+        );
+    }
+
+    /// Stamp `path`'s mtime to `when` via std's cross-platform `FileTimes` (no filetime crate).
+    fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
+        let times = std::fs::FileTimes::new().set_modified(when);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for times");
+        f.set_times(times).expect("set_times");
+    }
+
+    /// Build a `rollout-<local-ISO>-uuid.jsonl` filename whose encoded wall-clock equals the given
+    /// local-naive ms serial (the same serial `session_start_ms_from_transcript` will parse back).
+    fn rollout_path_for_local_naive_ms(local_naive_ms: i64) -> String {
+        let secs = local_naive_ms / 1000;
+        let day = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+        let (y, mo, d) = civil_from_days(day);
+        format!(
+            "/sessions/rollout-{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}-deadbeef.jsonl"
+        )
+    }
+
+    /// Inverse of the civil→days math in `civil_to_epoch_ms`: days-since-epoch → (Y, M, D).
+    fn civil_from_days(mut days: i64) -> (i64, u32, u32) {
+        let mut year: i64 = 1970;
+        loop {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            let dy = if leap { 366 } else { 365 };
+            if days >= dy {
+                days -= dy;
+                year += 1;
+            } else if days < 0 {
+                year -= 1;
+                let leap2 = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+                days += if leap2 { 366 } else { 365 };
+            } else {
+                break;
+            }
+        }
+        let dim = |m: u32| -> i64 {
+            match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 => {
+                    if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 { 29 } else { 28 }
+                }
+                _ => 0,
+            }
+        };
+        let mut month: u32 = 1;
+        while days >= dim(month) {
+            days -= dim(month);
+            month += 1;
+        }
+        (year, month, (days + 1) as u32)
+    }
+}
+
+#[cfg(test)]
+mod codex_config_tests {
+    use super::{
+        CODEX_DEFAULT_PROVIDER_ID, CodexMergeOutcome, codex_disable_merge, codex_enable_merge,
+        codex_hook_command_is_ours, codex_hooks_disable_merge, codex_hooks_enable_merge,
+    };
+
+    const URL: &str = "http://127.0.0.1:18920/v1";
+    const ID: &str = CODEX_DEFAULT_PROVIDER_ID;
+    const HOOKS_DIR: &str = "/opt/zlauder/codex-zlauder-plugin/scripts";
+
+    fn changed(out: CodexMergeOutcome) -> String {
+        match out {
+            CodexMergeOutcome::Changed(s) => s,
+            CodexMergeOutcome::NoOp => panic!("expected Changed, got NoOp"),
+            CodexMergeOutcome::Refused(m) => panic!("expected Changed, got Refused: {m}"),
+        }
+    }
+
+    /// Parse to a `toml_edit::DocumentMut` purely for semantic assertions (and to prove the
+    /// emitted text is valid TOML). We use toml_edit (already a dep) rather than pulling in `toml`.
+    fn doc(text: &str) -> toml_edit::DocumentMut {
+        text.parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|e| panic!("output is not valid TOML: {e}\n---\n{text}"))
+    }
+
+    /// Top-level `model_provider` as a str (None if absent/non-string).
+    fn provider_of(d: &toml_edit::DocumentMut) -> Option<&str> {
+        d.get("model_provider")
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+    }
+
+    /// A key inside `[model_providers.<id>]` as a str.
+    fn block_str<'a>(d: &'a toml_edit::DocumentMut, id: &str, key: &str) -> Option<&'a str> {
+        d.get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .and_then(|i| i.as_table_like())
+            .and_then(|b| b.get(key))
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+    }
+
+    /// A key inside `[model_providers.<id>]` as a bool.
+    fn block_bool(d: &toml_edit::DocumentMut, id: &str, key: &str) -> Option<bool> {
+        d.get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .and_then(|i| i.as_table_like())
+            .and_then(|b| b.get(key))
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_bool())
+    }
+
+    /// Is `[model_providers.<id>]` present at all?
+    fn has_block(d: &toml_edit::DocumentMut, id: &str) -> bool {
+        d.get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .is_some()
+    }
+
+    // GATE CASE 1 — worked trace: empty config + url → exact target block, enable would exit 0.
+    #[test]
+    fn enable_on_empty_writes_exact_target_block() {
+        let out = changed(codex_enable_merge("", ID, URL));
+        let d = doc(&out);
+        assert_eq!(provider_of(&d), Some("zlauder"));
+        assert_eq!(block_str(&d, ID, "base_url"), Some(URL));
+        assert_eq!(block_str(&d, ID, "name"), Some("ZlauDeR Masking Proxy"));
+        assert_eq!(block_str(&d, ID, "env_key"), Some("OPENAI_API_KEY"));
+        assert_eq!(block_str(&d, ID, "wire_api"), Some("responses"));
+        assert_eq!(block_bool(&d, ID, "requires_openai_auth"), Some(false));
+        assert_eq!(block_bool(&d, ID, "supports_websockets"), Some(false));
+        assert_eq!(block_bool(&d, ID, "zlauder_managed"), Some(true));
+        // No prior to record on an empty config.
+        assert_eq!(block_str(&d, ID, "zlauder_prior_provider"), None);
+    }
+
+    // GATE CASE 2 — idempotency: a second enable with the same url is a no-op (exit-3 semantics),
+    // and produces no duplicate table.
+    #[test]
+    fn second_enable_same_url_is_noop() {
+        let once = changed(codex_enable_merge("", ID, URL));
+        match codex_enable_merge(&once, ID, URL) {
+            CodexMergeOutcome::NoOp => {}
+            CodexMergeOutcome::Changed(s) => panic!("second enable should no-op, got change:\n{s}"),
+            CodexMergeOutcome::Refused(m) => panic!("second enable should no-op, got refusal: {m}"),
+        }
+        // exactly one occurrence of our table header.
+        assert_eq!(once.matches("[model_providers.zlauder]").count(), 1, "{once}");
+    }
+
+    // GATE CASE 3 — round-trip falsifier: prior model_provider, an unrelated acme block, and a
+    // top-level comment all survive enable→disable; no zlauder table remains; provider restored.
+    #[test]
+    fn round_trip_preserves_comment_acme_and_restores_provider() {
+        let original = "# top-level comment the user wrote\n\
+            model_provider = \"openai\"\n\
+            \n\
+            [model_providers.acme]\n\
+            name = \"Acme\"\n\
+            base_url = \"https://acme.example/v1\"\n";
+        let enabled = changed(codex_enable_merge(original, ID, URL));
+        // After enable: provider points at us, prior is recorded, acme + comment intact.
+        let ev = doc(&enabled);
+        assert_eq!(provider_of(&ev), Some("zlauder"));
+        assert_eq!(block_str(&ev, ID, "zlauder_prior_provider"), Some("openai"));
+        assert!(enabled.contains("# top-level comment the user wrote"), "comment lost on enable:\n{enabled}");
+        assert!(has_block(&ev, "acme"));
+
+        let disabled = changed(codex_disable_merge(&enabled, ID));
+        let dv = doc(&disabled);
+        // provider restored to openai; no zlauder block; acme + comment intact.
+        assert_eq!(provider_of(&dv), Some("openai"));
+        assert!(
+            !has_block(&dv, ID),
+            "zlauder block must be gone:\n{disabled}"
+        );
+        assert!(
+            has_block(&dv, "acme"),
+            "KILL: acme block was dropped — destructive merge:\n{disabled}"
+        );
+        assert!(
+            disabled.contains("# top-level comment the user wrote"),
+            "KILL: top-level comment was dropped — destructive merge:\n{disabled}"
+        );
+    }
+
+    // GATE CASE 4 — ownership-marker falsifier.
+    #[test]
+    fn enable_refuses_unmarked_user_block() {
+        let user_owned = "[model_providers.zlauder]\n\
+            name = \"My Own Thing\"\n\
+            base_url = \"https://mine.example/v1\"\n";
+        match codex_enable_merge(user_owned, ID, URL) {
+            CodexMergeOutcome::Refused(_) => {}
+            other => panic!(
+                "enable must REFUSE an unmarked same-id user block, got {}",
+                match other {
+                    CodexMergeOutcome::Changed(s) => format!("Changed:\n{s}"),
+                    CodexMergeOutcome::NoOp => "NoOp".to_string(),
+                    CodexMergeOutcome::Refused(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn disable_removes_our_marked_block_and_restores_prior() {
+        let enabled = changed(codex_enable_merge(
+            "model_provider = \"openai\"\n",
+            ID,
+            URL,
+        ));
+        let disabled = changed(codex_disable_merge(&enabled, ID));
+        let dv = doc(&disabled);
+        assert_eq!(provider_of(&dv), Some("openai"));
+        assert!(!has_block(&dv, ID));
+    }
+
+    #[test]
+    fn disable_is_noop_on_unmarked_user_block() {
+        let user_owned = "model_provider = \"zlauder\"\n\
+            \n\
+            [model_providers.zlauder]\n\
+            name = \"My Own Thing\"\n\
+            base_url = \"https://mine.example/v1\"\n";
+        match codex_disable_merge(user_owned, ID) {
+            CodexMergeOutcome::NoOp => {}
+            CodexMergeOutcome::Changed(s) => {
+                panic!("disable must NOT touch an unmarked user block, got change:\n{s}")
+            }
+            CodexMergeOutcome::Refused(m) => panic!("unexpected refusal: {m}"),
+        }
+    }
+
+    // Prior-provider preservation across a re-enable: a re-enable that changes the url must NOT
+    // clobber the previously-saved prior with our own id.
+    #[test]
+    fn re_enable_preserves_saved_prior() {
+        let enabled = changed(codex_enable_merge("model_provider = \"openai\"\n", ID, URL));
+        let new_url = "http://127.0.0.1:29999/v1";
+        let re = changed(codex_enable_merge(&enabled, ID, new_url));
+        let rv = doc(&re);
+        assert_eq!(
+            block_str(&rv, ID, "zlauder_prior_provider"),
+            Some("openai"),
+            "re-enable must preserve the original prior provider, not overwrite it with our id:\n{re}"
+        );
+        assert_eq!(block_str(&rv, ID, "base_url"), Some(new_url));
+    }
+
+    #[test]
+    fn stale_marked_block_with_wrong_ws_is_rewritten_not_noop() {
+        // A zlauder-managed block whose URL matches but whose supports_websockets is WRONG (true,
+        // e.g. an older plugin version or a partial write) must be RE-WRITTEN, not idempotently
+        // no-op'd — a no-op would leave the WebSocket transport that bypasses the HTTP masking proxy.
+        let stale = format!(
+            "model_provider = \"{ID}\"\n\
+             [model_providers.{ID}]\n\
+             name = \"ZlauDeR Masking Proxy\"\n\
+             base_url = \"{URL}\"\n\
+             env_key = \"OPENAI_API_KEY\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = false\n\
+             supports_websockets = true\n\
+             zlauder_managed = true\n"
+        );
+        // `changed` panics on NoOp, so this asserts the stale block was NOT idempotently skipped.
+        let out = changed(codex_enable_merge(&stale, ID, URL));
+        let d = doc(&out);
+        assert_eq!(
+            block_bool(&d, ID, "supports_websockets"),
+            Some(false),
+            "re-write must heal supports_websockets back to false:\n{out}"
+        );
+    }
+
+    // ---- [hooks]-merge: ownership-aware SessionStart + UserPromptSubmit wiring ----
+
+    /// Count MatcherGroups under `[hooks.<event>]` whose inner command basename equals `script`.
+    /// Inspects BOTH inner-hooks shapes (inline array `hooks = [{..}]` and array-of-tables
+    /// `[[..hooks]]`) so the count is meaningful regardless of how the group was authored.
+    fn count_our_hook(d: &toml_edit::DocumentMut, event: &str, script: &str) -> usize {
+        // Use the PRODUCTION ownership matcher so the count can never silently diverge from it.
+        let is_ours = |c: &str| codex_hook_command_is_ours(c, script);
+        d.get("hooks")
+            .and_then(|h| h.as_table_like())
+            .and_then(|h| h.get(event))
+            .and_then(|a| a.as_array_of_tables())
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter(|grp| {
+                        let item = grp.get("hooks");
+                        let inline = item
+                            .and_then(|i| i.as_array())
+                            .map(|inner| {
+                                inner.iter().any(|h| {
+                                    h.as_inline_table()
+                                        .and_then(|t| t.get("command"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|c| is_ours(c))
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false);
+                        let aot = item
+                            .and_then(|i| i.as_array_of_tables())
+                            .map(|inner| {
+                                inner.iter().any(|t| {
+                                    t.get("command")
+                                        .and_then(|v| v.as_value())
+                                        .and_then(|v| v.as_str())
+                                        .map(|c| is_ours(c))
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false);
+                        inline || aot
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Total MatcherGroups under `[hooks.<event>]` (ours + user's).
+    fn count_event_groups(d: &toml_edit::DocumentMut, event: &str) -> usize {
+        d.get("hooks")
+            .and_then(|h| h.as_table_like())
+            .and_then(|h| h.get(event))
+            .and_then(|a| a.as_array_of_tables())
+            .map(|g| g.len())
+            .unwrap_or(0)
+    }
+
+    // GATE — enable on an empty config writes both event entries pointing at the hooks-dir scripts.
+    #[test]
+    fn hooks_enable_on_empty_writes_both_events() {
+        let (out, ch) = codex_hooks_enable_merge("", HOOKS_DIR);
+        assert!(ch, "enable on empty must change");
+        let d = doc(&out);
+        assert_eq!(count_our_hook(&d, "SessionStart", "codex-session-start.sh"), 1);
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1
+        );
+        // commands carry the absolute hooks-dir.
+        assert!(
+            out.contains(&format!("{HOOKS_DIR}/codex-session-start.sh")),
+            "absolute session-start path missing:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{HOOKS_DIR}/codex-user-prompt-submit.sh")),
+            "absolute user-prompt-submit path missing:\n{out}"
+        );
+    }
+
+    // GATE — a second enable is idempotent (no duplicate MatcherGroups).
+    #[test]
+    fn hooks_enable_is_idempotent() {
+        let (once, _) = codex_hooks_enable_merge("", HOOKS_DIR);
+        let (twice, ch2) = codex_hooks_enable_merge(&once, HOOKS_DIR);
+        assert!(!ch2, "second enable must be a no-op (no change)");
+        let d = doc(&twice);
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            1,
+            "no duplicate SessionStart group:\n{twice}"
+        );
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1,
+            "no duplicate UserPromptSubmit group:\n{twice}"
+        );
+    }
+
+    // GATE — enable PRESERVES a pre-existing user [[hooks.SessionStart]] entry (adds ours alongside).
+    #[test]
+    fn hooks_enable_preserves_user_session_start() {
+        let user = "[[hooks.SessionStart]]\n\
+            matcher = \"*\"\n\
+            [[hooks.SessionStart.hooks]]\n\
+            type = \"command\"\n\
+            command = \"/home/me/my-own-hook.sh\"\n";
+        let (out, ch) = codex_hooks_enable_merge(user, HOOKS_DIR);
+        assert!(ch);
+        let d = doc(&out);
+        // The user's SessionStart group survives, and ours is added alongside → 2 groups total.
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            2,
+            "user entry must be preserved alongside ours:\n{out}"
+        );
+        assert_eq!(count_our_hook(&d, "SessionStart", "codex-session-start.sh"), 1);
+        assert!(
+            out.contains("/home/me/my-own-hook.sh"),
+            "user hook command lost:\n{out}"
+        );
+        // UserPromptSubmit (which the user had none of) gets ours.
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1
+        );
+    }
+
+    // GATE (FIX) — enable must NOT silently no-op when the event is written as an INLINE array
+    // (`SessionStart = [ {...} ]`) rather than `[[hooks.SessionStart]]`. The old code keyed solely on
+    // `as_array_of_tables_mut()` (None for an inline array) → reconcile skipped + append guard
+    // short-circuited → our hook dropped while `changed` could be true from the other event. After the
+    // fix the inline array is normalized to an array-of-tables, the user entry is preserved, and ours
+    // is appended.
+    #[test]
+    fn hooks_enable_normalizes_inline_array_event() {
+        // User wrote SessionStart as an inline array of inline tables (valid TOML, different shape).
+        let user = "[hooks]\n\
+            SessionStart = [ { matcher = \"*\", hooks = [ { type = \"command\", command = \"/home/me/my-own-hook.sh\" } ] } ]\n";
+        // Sanity: this really IS the inline-array shape that returns None from as_array_of_tables.
+        {
+            let d = doc(user);
+            assert!(
+                d.get("hooks")
+                    .and_then(|h| h.as_table_like())
+                    .and_then(|h| h.get("SessionStart"))
+                    .map(|i| i.as_array().is_some() && i.as_array_of_tables().is_none())
+                    .unwrap_or(false),
+                "fixture must be an inline array (not array-of-tables)"
+            );
+        }
+        let (out, ch) = codex_hooks_enable_merge(user, HOOKS_DIR);
+        assert!(ch, "enable against an inline-array event MUST change (install ours)");
+        let d = doc(&out);
+        // Our hook is actually installed (the bug dropped it).
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            1,
+            "KILL: our SessionStart hook was dropped on an inline-array config:\n{out}"
+        );
+        // The user's pre-existing entry is preserved (re-homed, not destroyed).
+        assert!(
+            out.contains("/home/me/my-own-hook.sh"),
+            "user inline hook lost on normalization:\n{out}"
+        );
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            2,
+            "user entry + ours = 2 groups after normalization:\n{out}"
+        );
+        // And it round-trips: a second enable is now a clean no-op.
+        let (_again, ch2) = codex_hooks_enable_merge(&out, HOOKS_DIR);
+        assert!(!ch2, "re-enable after normalization must be a no-op:\n{_again}");
+    }
+
+    // GATE (FIX) — disable must also reach OUR entry when it lives in an inline-array event, removing
+    // ours while preserving the user's inline entry.
+    #[test]
+    fn hooks_disable_handles_inline_array_event() {
+        // Inline array carrying BOTH a user hook and ours.
+        let user = format!(
+            "[hooks]\n\
+             SessionStart = [ \
+             {{ matcher = \"*\", hooks = [ {{ type = \"command\", command = \"/home/me/my-own-hook.sh\" }} ] }}, \
+             {{ matcher = \"*\", hooks = [ {{ type = \"command\", command = \"{HOOKS_DIR}/codex-session-start.sh\" }} ] }} ]\n"
+        );
+        let (disabled, ch) = codex_hooks_disable_merge(&user);
+        assert!(ch, "disable must change (it removed our inline entry)");
+        let d = doc(&disabled);
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            0,
+            "our SessionStart entry must be removed from the inline array:\n{disabled}"
+        );
+        assert!(
+            disabled.contains("/home/me/my-own-hook.sh"),
+            "KILL: user inline hook removed on disable:\n{disabled}"
+        );
+        // A purely-user inline array (no entry of ours) must be a clean no-op (not a spurious rewrite).
+        let user_only = "[hooks]\n\
+            SessionStart = [ { matcher = \"*\", hooks = [ { type = \"command\", command = \"/home/me/my-own-hook.sh\" } ] } ]\n";
+        let (out2, ch2) = codex_hooks_disable_merge(user_only);
+        assert!(!ch2, "disable on a user-only inline array must be a no-op:\n{out2}");
+    }
+
+    // GATE (FIX #2) — re-enable from a DIFFERENT hooks-dir UPDATES our stale command in place
+    // (versioned/content-addressed CLAUDE_PLUGIN_ROOT case). A basename-only "already ours →
+    // continue" would leave the old, now-nonexistent path wired and the hooks would stop firing.
+    #[test]
+    fn hooks_enable_from_new_dir_updates_stale_command() {
+        const OLD_DIR: &str = "/opt/zlauder/v1/codex-zlauder-plugin/scripts";
+        const NEW_DIR: &str = "/opt/zlauder/v2/codex-zlauder-plugin/scripts";
+        let (v1, _) = codex_hooks_enable_merge("", OLD_DIR);
+        assert!(v1.contains(&format!("{OLD_DIR}/codex-session-start.sh")));
+
+        let (v2, ch) = codex_hooks_enable_merge(&v1, NEW_DIR);
+        assert!(ch, "re-enable from a new dir must change (stale path rewritten)");
+        let d = doc(&v2);
+        // Still exactly ONE of each (updated in place, NOT duplicated).
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            1,
+            "must not duplicate on re-enable from a new dir:\n{v2}"
+        );
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1,
+            "must not duplicate on re-enable from a new dir:\n{v2}"
+        );
+        // The NEW path is wired and the OLD (now-nonexistent) path is GONE.
+        assert!(
+            v2.contains(&format!("{NEW_DIR}/codex-session-start.sh")),
+            "new SessionStart path must be wired:\n{v2}"
+        );
+        assert!(
+            v2.contains(&format!("{NEW_DIR}/codex-user-prompt-submit.sh")),
+            "new UserPromptSubmit path must be wired:\n{v2}"
+        );
+        assert!(
+            !v2.contains(OLD_DIR),
+            "KILL: stale hooks-dir path must be purged on re-enable:\n{v2}"
+        );
+
+        // And a SECOND re-enable from the SAME new dir is now a clean no-op (no spurious change).
+        let (v3, ch3) = codex_hooks_enable_merge(&v2, NEW_DIR);
+        assert!(!ch3, "re-enable from the same dir must be a no-op:\n{v3}");
+    }
+
+    // GATE — disable removes ONLY our entries (by basename) and leaves the user entry intact.
+    #[test]
+    fn hooks_disable_removes_only_ours_preserving_user() {
+        // Start from a user SessionStart hook + our two entries layered on.
+        let user = "[[hooks.SessionStart]]\n\
+            matcher = \"*\"\n\
+            [[hooks.SessionStart.hooks]]\n\
+            type = \"command\"\n\
+            command = \"/home/me/my-own-hook.sh\"\n";
+        let (enabled, _) = codex_hooks_enable_merge(user, HOOKS_DIR);
+        let (disabled, ch) = codex_hooks_disable_merge(&enabled);
+        assert!(ch, "disable must change (it removed our entries)");
+        let d = doc(&disabled);
+        // Ours gone; user's SessionStart survives.
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            0,
+            "our SessionStart entry must be removed:\n{disabled}"
+        );
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            1,
+            "exactly the user's SessionStart group should remain:\n{disabled}"
+        );
+        assert!(
+            disabled.contains("/home/me/my-own-hook.sh"),
+            "KILL: user hook removed on disable:\n{disabled}"
+        );
+        // Our UserPromptSubmit entry (the user had none) is gone AND its empty array is dropped.
+        assert_eq!(count_event_groups(&d, "UserPromptSubmit"), 0);
+        assert!(
+            !disabled.contains("UserPromptSubmit"),
+            "empty UserPromptSubmit array should be dropped:\n{disabled}"
+        );
+    }
+
+    // GATE — disable on a config with only-our entries drops them and the now-empty arrays + [hooks].
+    #[test]
+    fn hooks_disable_only_ours_drops_empty_hooks_table() {
+        let (enabled, _) = codex_hooks_enable_merge("", HOOKS_DIR);
+        let (disabled, ch) = codex_hooks_disable_merge(&enabled);
+        assert!(ch);
+        let d = doc(&disabled);
+        assert_eq!(count_event_groups(&d, "SessionStart"), 0);
+        assert_eq!(count_event_groups(&d, "UserPromptSubmit"), 0);
+        assert!(
+            d.get("hooks").is_none(),
+            "empty [hooks] table must be dropped:\n{disabled}"
+        );
+        // A second disable is a no-op.
+        let (_again, ch2) = codex_hooks_disable_merge(&disabled);
+        assert!(!ch2, "disable on a config with no hooks must be a no-op");
+    }
+
+    // CUMULATIVE-GATE HIGH: a user hook MANUALLY co-located with ours in the SAME MatcherGroup must
+    // survive disable (remove only OUR entry from the group's hooks array, never the whole group).
+    #[test]
+    fn hooks_disable_preserves_user_hook_co_located_in_same_group() {
+        let co_located = format!(
+            "[[hooks.SessionStart]]\n\
+             matcher = \"*\"\n\
+             [[hooks.SessionStart.hooks]]\n\
+             type = \"command\"\n\
+             command = \"/home/me/user-hook.sh\"\n\
+             [[hooks.SessionStart.hooks]]\n\
+             type = \"command\"\n\
+             command = \"{HOOKS_DIR}/codex-session-start.sh\"\n"
+        );
+        let (disabled, ch) = codex_hooks_disable_merge(&co_located);
+        assert!(ch, "disable must remove our co-located entry");
+        let d = doc(&disabled);
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            0,
+            "our entry must be removed from the shared group:\n{disabled}"
+        );
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            1,
+            "the shared group must SURVIVE (it still holds the user hook):\n{disabled}"
+        );
+        assert!(
+            disabled.contains("/home/me/user-hook.sh"),
+            "KILL: user hook co-located with ours was deleted on disable:\n{disabled}"
+        );
+    }
+
+    // CUMULATIVE-GATE HIGH: ownership is the trailing `scripts/<name>` path, NOT a bare basename —
+    // a user's own hook that merely shares our FILENAME elsewhere must NOT be treated as ours.
+    #[test]
+    fn hook_ownership_requires_scripts_path_not_bare_basename() {
+        assert!(!codex_hook_command_is_ours(
+            "/home/u/codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        assert!(!codex_hook_command_is_ours(
+            "/home/u/bin/codex-user-prompt-submit.sh",
+            "codex-user-prompt-submit.sh"
+        ));
+        // PATH-COMPONENT boundary: a dir whose basename merely ENDS in "scripts" is NOT a `scripts`
+        // path component, so a same-named user hook under it must NOT be claimed as ours.
+        assert!(!codex_hook_command_is_ours(
+            "/home/me/user-scripts/codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        assert!(!codex_hook_command_is_ours(
+            "/home/me/myscripts/codex-user-prompt-submit.sh",
+            "codex-user-prompt-submit.sh"
+        ));
+        // A bare command (no `scripts` parent) is not ours either.
+        assert!(!codex_hook_command_is_ours(
+            "codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        // Ours, written under the plugin's scripts/ dir, IS recognized (abs + relative).
+        assert!(codex_hook_command_is_ours(
+            "/opt/p/codex-zlauder-plugin/scripts/codex-session-start.sh",
+            "codex-session-start.sh"
+        ));
+        assert!(codex_hook_command_is_ours(
+            "scripts/codex-user-prompt-submit.sh",
+            "codex-user-prompt-submit.sh"
+        ));
+    }
+
+    // CUMULATIVE-GATE MED: disable must NOT restore the saved prior model_provider over a NEWER user
+    // selection (the user switched model_provider away from us after enabling).
+    #[test]
+    fn disable_does_not_clobber_newer_user_provider() {
+        let enabled = changed(codex_enable_merge("model_provider = \"openai\"\n", ID, URL));
+        let switched = enabled.replace(
+            "model_provider = \"zlauder\"",
+            "model_provider = \"anthropic\"",
+        );
+        assert!(
+            switched.contains("model_provider = \"anthropic\""),
+            "setup: provider switched away from us"
+        );
+        let out = changed(codex_disable_merge(&switched, ID));
+        let d = doc(&out);
+        assert_eq!(
+            provider_of(&d),
+            Some("anthropic"),
+            "disable must NOT clobber the user's newer model_provider with the saved prior:\n{out}"
+        );
     }
 }
 
@@ -5642,5 +8384,150 @@ mod doctor_tests {
         // Status labels are stable (consumed by the JSON output + plugin command).
         assert_eq!(ProbeStatus::Pass.label(), "PASS");
         assert_eq!(ProbeStatus::Fail.label(), "FAIL");
+    }
+}
+
+#[cfg(test)]
+mod codex_auth_check_tests {
+    use super::{CodexAuthMode, classify_codex_auth, unmapped_auth_mode};
+    use serde_json::json;
+
+    // Convenience: assert the PURE classifier returns the expected (mode-string, route_ok).
+    fn check(env: Option<&str>, auth: Option<serde_json::Value>, mode: CodexAuthMode, ok: bool) {
+        let (m, r) = classify_codex_auth(env, auth.as_ref());
+        assert_eq!(m, mode, "mode mismatch for env={env:?} auth={auth:?}");
+        assert_eq!(r, ok, "route_ok mismatch for env={env:?} auth={auth:?}");
+        // route_ok must equal mode.route_ok() and "apikey" must be the only true case.
+        assert_eq!(r, m.route_ok());
+        assert_eq!(r, m.as_str() == "apikey");
+    }
+
+    #[test]
+    fn exported_sk_key_is_apikey_route_ok() {
+        // Rule 1: an exported, sk-shaped env key passes regardless of auth.json.
+        check(Some("sk-real"), None, CodexAuthMode::ApiKey, true);
+        check(
+            Some("sk-real"),
+            Some(json!({ "tokens": { "id_token": "x" } })),
+            CodexAuthMode::ApiKey,
+            true,
+        );
+    }
+
+    #[test]
+    fn chatgpt_tokens_without_env_refuses() {
+        check(
+            None,
+            Some(json!({ "tokens": { "id_token": "x", "access_token": "y" } })),
+            CodexAuthMode::Chatgpt,
+            false,
+        );
+        // auth_mode=="chatgpt" with no tokens object classifies the same.
+        check(
+            None,
+            Some(json!({ "auth_mode": "chatgpt" })),
+            CodexAuthMode::Chatgpt,
+            false,
+        );
+    }
+
+    #[test]
+    fn api_key_on_file_but_not_exported_refuses() {
+        // The actionable case: key in auth.json, nothing exported → key-not-exported.
+        check(
+            None,
+            Some(json!({ "OPENAI_API_KEY": "sk-x" })),
+            CodexAuthMode::KeyNotExported,
+            false,
+        );
+        // auth_mode=="apikey" alone (no field) is also key-not-exported.
+        check(
+            None,
+            Some(json!({ "auth_mode": "apikey" })),
+            CodexAuthMode::KeyNotExported,
+            false,
+        );
+    }
+
+    #[test]
+    fn personal_access_token_is_other() {
+        check(
+            None,
+            Some(json!({ "auth_mode": "personal_access_token", "personal_access_token": "pat-x" })),
+            CodexAuthMode::Other,
+            false,
+        );
+        // A bare personal_access_token field (unrecognized/absent auth_mode) also classifies.
+        check(
+            None,
+            Some(json!({ "personal_access_token": "pat-x" })),
+            CodexAuthMode::Other,
+            false,
+        );
+    }
+
+    #[test]
+    fn bedrock_is_other() {
+        check(
+            None,
+            Some(json!({ "auth_mode": "bedrock_api_key" })),
+            CodexAuthMode::Other,
+            false,
+        );
+        check(
+            None,
+            Some(json!({ "bedrock_api_key": { "key": "abc" } })),
+            CodexAuthMode::Other,
+            false,
+        );
+    }
+
+    #[test]
+    fn unrecognized_auth_mode_fails_closed_to_other() {
+        check(
+            None,
+            Some(json!({ "auth_mode": "some_future_mode" })),
+            CodexAuthMode::Other,
+            false,
+        );
+        // ...and it is surfaced as an unmapped auth_mode for reporting.
+        let auth = json!({ "auth_mode": "some_future_mode" });
+        assert_eq!(unmapped_auth_mode(Some(&auth)).as_deref(), Some("some_future_mode"));
+    }
+
+    #[test]
+    fn env_present_but_empty_or_whitespace_falls_through() {
+        // Empty / whitespace-only env is NOT apikey — it falls through to auth.json.
+        check(Some(""), None, CodexAuthMode::Chatgpt, false);
+        check(Some("   "), None, CodexAuthMode::Chatgpt, false);
+        // Non-sk-shaped env (e.g. a leaked ChatGPT token) is also not apikey.
+        check(Some("not-an-sk-key"), None, CodexAuthMode::Chatgpt, false);
+        // And an empty env still lets auth.json drive the (still-refusing) classification.
+        check(
+            Some(""),
+            Some(json!({ "OPENAI_API_KEY": "sk-x" })),
+            CodexAuthMode::KeyNotExported,
+            false,
+        );
+    }
+
+    #[test]
+    fn no_auth_json_at_all_refuses_as_chatgpt() {
+        check(None, None, CodexAuthMode::Chatgpt, false);
+    }
+
+    #[test]
+    fn known_auth_mode_is_not_flagged_unmapped() {
+        for am in ["apikey", "chatgpt", "personal_access_token", "bedrock_api_key"] {
+            let auth = json!({ "auth_mode": am });
+            assert_eq!(unmapped_auth_mode(Some(&auth)), None, "{am} should be known");
+        }
+        // No auth.json and no auth_mode → nothing to flag.
+        assert_eq!(unmapped_auth_mode(None), None);
+        assert_eq!(unmapped_auth_mode(Some(&json!({}))), None);
+        // An unknown auth_mode that nevertheless carries a recognized field is classified by
+        // that field, not "unmapped".
+        let auth = json!({ "auth_mode": "weird", "tokens": { "id_token": "x" } });
+        assert_eq!(unmapped_auth_mode(Some(&auth)), None);
     }
 }
