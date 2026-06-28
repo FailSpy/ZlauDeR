@@ -140,5 +140,35 @@ done
   esac
 ) || exit 1
 
+# CASE 4 (precedence under conflict): a STALE/foreign CODEX_PLUGIN_ROOT pointing at a dir with
+# NO bins, plus the FRESH injected CLAUDE_PLUGIN_ROOT pointing at the real fake-plugin root. The
+# injected var must WIN — otherwise the stale CODEX_PLUGIN_ROOT shadows it and the resolver (and
+# enable.sh, which writes CODEX_PLUGIN_ROOT/scripts into config.toml) wires the wrong plugin copy.
+(
+  STALE="$(mktemp -d)"            # deliberately empty: no bin/<triple>/ under it
+  unset PLUGIN_ROOT CLAUDE_PLUGIN_ROOT \
+        CODEX_PLUGIN_DATA PLUGIN_DATA CLAUDE_PLUGIN_DATA \
+        ZLAUDER_WORKSPACE ZLAUDER_BIN_DIR 2>/dev/null || true
+  export CODEX_PLUGIN_ROOT="$STALE"     # stale/foreign, inherited from a prior context
+  export CLAUDE_PLUGIN_ROOT="$D"        # fresh, injected by Codex this launch
+  export PATH="$CLEAN_PATH"
+  # shellcheck disable=SC1090
+  . "$SCRIPT"
+  if ! zlauder_resolve_bins --no-build; then
+    rm -rf "$STALE"
+    fail "CASE 4: resolver returned non-zero — injected CLAUDE_PLUGIN_ROOT should have resolved"
+  fi
+  if [ "${ZLAUDER_BIN_DIR:-}" != "$D/bin/$TRIPLE" ]; then
+    rm -rf "$STALE"
+    fail "CASE 4: stale CODEX_PLUGIN_ROOT shadowed injected CLAUDE_PLUGIN_ROOT — ZLAUDER_BIN_DIR='${ZLAUDER_BIN_DIR:-}' != '$D/bin/$TRIPLE'"
+  fi
+  # The normalized canonical var must also hold the injected root, not the stale one.
+  if [ "${CODEX_PLUGIN_ROOT:-}" != "$D" ]; then
+    rm -rf "$STALE"
+    fail "CASE 4: CODEX_PLUGIN_ROOT normalized to '${CODEX_PLUGIN_ROOT:-}' != injected '$D'"
+  fi
+  rm -rf "$STALE"
+) || exit 1
+
 printf 'OK: all _resolve-bins.sh resolver cases passed (triple=%s)\n' "$TRIPLE"
 exit 0
